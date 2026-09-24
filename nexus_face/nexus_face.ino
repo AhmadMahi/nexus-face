@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "1.7.2"
+#define FW_VERSION "2.0.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -113,11 +113,16 @@ unsigned long zikrNext = 0;      // when the next count lands
 #define ZIKR_LONG_MS 9000        // the last one is long, give it room
 
 // ---------------- settings ----------------
-enum { C_BRIGHT = 0, C_SLEEP, C_TURN, C_POPUP, C_EYES, C_HOTSPOT,
-       C_UPDATE, C_REBOOT, C_COUNT };
+enum { C_BRIGHT = 0, C_CONTROL, C_SLEEP, C_TURN, C_POPUP, C_EYES, C_HOTSPOT,
+       C_UPDATE, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
-  { "Brightness", "Sleep after", "Page turn", "Popup time", "Eye style",
-    "Hotspot", "Check update", "Reboot" };
+  { "Brightness", "Control", "Sleep after", "Page turn", "Popup time", "Eye style",
+    "Hotspot", "Check update", "Reboot", "About" };
+
+// Zero is the dimmest the panel goes, not off: the SSD1306 still shows
+// faintly at contrast zero.
+const int BRIGHT_OPTS[] = { 0, 20, 60, 110, 160, 210, 255 };
+const int BRIGHT_N = sizeof(BRIGHT_OPTS) / sizeof(BRIGHT_OPTS[0]);
 
 const int SLEEP_OPTS[] = { 15, 30, 45, 60, 120, 180, 300, 600 };
 const int SLEEP_N = sizeof(SLEEP_OPTS) / sizeof(SLEEP_OPTS[0]);
@@ -137,6 +142,23 @@ const int STYLE_N = sizeof(STYLES) / sizeof(STYLES[0]);
 
 int cfgBright = 160, cfgSleepIdx = 1, cfgPopupIdx = 2, cfgEyes = 0;
 bool cfgAutoTurn = false;                  // pages turn themselves
+// Taps always work. Tilt is something you turn on as well, never instead,
+// so a misread lean can never leave you with no way back.
+bool cfgTilt = false;
+
+// Leaning it about: down for the next thing, up for the one before, left
+// to go in, right to come out, and up held for three seconds for home.
+enum { NC_OFF = 0, NC_HOLD, NC_UP, NC_DOWN, NC_LEFT, NC_RIGHT, NC_INFO };
+int  navCal = NC_OFF;
+bool navCalTeach = false;
+unsigned long navCalStamp = 0;
+bool navLatch = false;
+unsigned long upSince = 0;
+bool upConsumed = false;
+uint32_t nTiltNext = 0, nTiltPrev = 0, nTiltIn = 0, nTiltOut = 0, nTiltHome = 0;
+#define NAV_TILT_ON  0.30f
+#define NAV_TILT_OFF 0.14f
+#define NAV_HOME_MS  3000UL
 String cfgSsid, cfgPass, cfgTz, cfgKey;
 int sleepSecs() { return SLEEP_OPTS[cfgSleepIdx]; }
 int popupSecs() { return POPUP_OPTS[cfgPopupIdx]; }
@@ -977,6 +999,17 @@ static void drawFocus() {
   oled.display();
 }
 
+static void drawAbout() {
+  oled.clearDisplay();
+  titleBar("ABOUT", FW_VERSION);
+  ctr("Developed by Ahmed", 16, 1);
+  oled.drawFastHLine(14, 28, SCRW - 28, SSD1306_WHITE);
+  ctr("linkedin.com/in/", 33, 1);
+  ctr("ahmed-al-imaad", 43, 1);
+  ctr("www.iotcart.in", 54, 1);
+  oled.display();
+}
+
 static void drawSettings() {
   oled.clearDisplay();
   if (depth == 0) {
@@ -986,6 +1019,7 @@ static void drawSettings() {
     oled.display();
     return;
   }
+  if (depth == 2 && itemIdx == C_ABOUT) { drawAbout(); return; }
   bar(depth == 2 ? "CHANGE" : "SETTINGS");
 
   char v[18];
@@ -1000,6 +1034,8 @@ static void drawSettings() {
     at(3, y, C_NAME[i]);
     switch (i) {
       case C_BRIGHT: snprintf(v, sizeof(v), "%d", cfgBright); break;
+      case C_CONTROL:snprintf(v, sizeof(v), "%s", cfgTilt ? "tilt" : "taps"); break;
+      case C_ABOUT:  snprintf(v, sizeof(v), "x2"); break;
       case C_SLEEP:  if (sleepSecs() < 60) snprintf(v, sizeof(v), "%ds", sleepSecs());
                      else snprintf(v, sizeof(v), "%dm", sleepSecs() / 60); break;
       case C_TURN:   snprintf(v, sizeof(v), "%s", cfgAutoTurn ? "auto" : "knock"); break;
@@ -1899,6 +1935,135 @@ static void drawGames() {
   if (depth == 1) { drawGameList(); return; }
   drawGamePlay();
 }
+
+// ================================================================
+//  LEARNING THE LEANS
+// ================================================================
+//  The same mapping the games use, so it is only ever asked for once.
+//  What changes here is the resting position, which moves every time the
+//  thing is picked up and put down, so that part is measured afresh.
+static void navCalBegin(bool teach) {
+  navCal = NC_HOLD;
+  navCalStamp = millis();
+  calAcc[0] = calAcc[1] = calAcc[2] = 0; calN = 0;
+  navCalTeach = teach;
+  if (teach) { mapAxX = mapAxY = -1; }      // asked for, so ask for all four
+}
+static void navCalService() {
+  readSensors();
+  float v[3] = { ax, ay, az };
+
+  switch (navCal) {
+    case NC_HOLD:
+      for (int i = 0; i < 3; i++) calAcc[i] += v[i];
+      calN++;
+      if (millis() - navCalStamp > 1300 && calN > 6) {
+        for (int i = 0; i < 3; i++) restV[i] = calAcc[i] / calN;
+        gravAx = 0;
+        for (int i = 1; i < 3; i++) if (fabsf(restV[i]) > fabsf(restV[gravAx])) gravAx = i;
+        if (!navCalTeach && tiltTaught() && mapAxX != gravAx && mapAxY != gravAx) {
+          navCal = NC_OFF;                  // a boot check: the axes are known
+          navLatch = true;
+        } else {
+          mapAxX = mapAxY = -1;
+          navCal = NC_UP;
+        }
+        navCalStamp = millis();
+      }
+      break;
+
+    case NC_UP: {
+      int best = -1; float bd = 0.30f;
+      for (int i = 0; i < 3; i++) {
+        if (i == gravAx) continue;
+        if (fabsf(v[i] - restV[i]) > bd) { bd = fabsf(v[i] - restV[i]); best = i; }
+      }
+      if (best >= 0) {
+        mapAxY = best;
+        mapSgnY = (v[best] - restV[best]) > 0 ? 1 : -1;
+        navCal = NC_DOWN; navCalStamp = millis();
+      }
+      break;
+    }
+    case NC_DOWN: {
+      if (millis() - navCalStamp < 600) break;
+      float tx, ty; tiltRead(tx, ty);
+      if (ty < -NAV_TILT_ON) { navCal = NC_LEFT; navCalStamp = millis(); }
+      break;
+    }
+    case NC_LEFT: {
+      if (millis() - navCalStamp < 600) break;
+      for (int i = 0; i < 3; i++) {
+        if (i == gravAx || i == mapAxY) continue;
+        float d = v[i] - restV[i];
+        if (fabsf(d) > 0.30f) {
+          mapAxX = i;
+          mapSgnX = d > 0 ? -1 : 1;          // leaning left reads negative
+          navCal = NC_RIGHT; navCalStamp = millis();
+        }
+      }
+      break;
+    }
+    case NC_RIGHT: {
+      if (millis() - navCalStamp < 600) break;
+      float tx, ty; tiltRead(tx, ty);
+      if (tx > NAV_TILT_ON) {
+        saveTiltMap();
+        navCal = NC_INFO; navCalStamp = millis();
+      }
+      break;
+    }
+    case NC_INFO:
+      if (millis() - navCalStamp > 4200) {
+        navCal = NC_OFF;
+        navLatch = true;                     // do not act on the lean you finished with
+        upSince = 0; upConsumed = false;
+      }
+      break;
+  }
+}
+static void drawNavCal() {
+  oled.clearDisplay();
+  if (navCal == NC_INFO) {
+    titleBarC("THIS IS THE WAY");
+    at(6, 15, "Down");  at(52, 15, "next");
+    at(6, 26, "Up");    at(52, 26, "back one");
+    at(6, 37, "Left");  at(52, 37, "go in");
+    at(6, 48, "Right"); at(52, 48, "come out");
+    oled.drawFastVLine(46, 14, 42, SSD1306_WHITE);
+    oled.display();
+    return;
+  }
+  titleBarC(navCal == NC_HOLD ? "HOLD IT STILL" : "SHOW ME HOW YOU LEAN");
+  const char* ask = "";
+  switch (navCal) {
+    case NC_HOLD:  ask = "Keep it steady"; break;
+    case NC_UP:    ask = "Tilt the top away"; break;
+    case NC_DOWN:  ask = "Now tilt it back"; break;
+    case NC_LEFT:  ask = "Now lean it left"; break;
+    default:       ask = "And now right"; break;
+  }
+  ctr(ask, 18, 1);
+  if (navCal == NC_HOLD) {
+    int n = ((millis() - navCalStamp) / 300) % 4;
+    for (int i = 0; i < 3; i++) oled.fillCircle(52 + i * 12, 40, i < n ? 3 : 1, SSD1306_WHITE);
+  } else {
+    int a = (millis() / 300) % 3;
+    for (int i = 0; i <= a; i++) {
+      if (navCal == NC_UP)        { oled.drawLine(58, 46 - i * 6, 64, 40 - i * 6, SSD1306_WHITE); oled.drawLine(70, 46 - i * 6, 64, 40 - i * 6, SSD1306_WHITE); }
+      else if (navCal == NC_DOWN) { oled.drawLine(58, 34 + i * 6, 64, 40 + i * 6, SSD1306_WHITE); oled.drawLine(70, 34 + i * 6, 64, 40 + i * 6, SSD1306_WHITE); }
+      else if (navCal == NC_LEFT) { oled.drawLine(70 - i * 8, 34, 64 - i * 8, 40, SSD1306_WHITE); oled.drawLine(70 - i * 8, 46, 64 - i * 8, 40, SSD1306_WHITE); }
+      else                        { oled.drawLine(58 + i * 8, 34, 64 + i * 8, 40, SSD1306_WHITE); oled.drawLine(58 + i * 8, 46, 64 + i * 8, 40, SSD1306_WHITE); }
+    }
+  }
+  const bool done[4] = { navCal > NC_UP, navCal > NC_DOWN, navCal > NC_LEFT, navCal > NC_RIGHT };
+  for (int i = 0; i < 4; i++) {
+    int x = 40 + i * 13;
+    if (done[i]) oled.fillCircle(x, 57, 3, SSD1306_WHITE);
+    else         oled.drawCircle(x, 57, 3, SSD1306_WHITE);
+  }
+  oled.display();
+}
 // ================================================================
 //  NETWORK
 // ================================================================
@@ -2649,6 +2814,11 @@ static bool inReader() {
   if (screen == S_FAITH) return depth == 3;
   return false;
 }
+static void prevPage() {
+  int p = rdPages();
+  if (p > 0) rdPage = (rdPage + p - 1) % p;
+  rdTurn = millis() + AUTO_TURN_MS;
+}
 static void nextPage() {
   int p = rdPages();
   if (p > 0) rdPage = (rdPage + 1) % p;
@@ -2711,8 +2881,14 @@ static void knockOne() {
   if (screen == S_SETTINGS) {
     if (depth == 1) { itemIdx = (itemIdx + 1) % C_COUNT; return; }
     switch (itemIdx) {
-      case C_BRIGHT: cfgBright += 45; if (cfgBright > 255) cfgBright = 25;
-                     applyBright(); prefs.putInt("bri", cfgBright); break;
+      case C_BRIGHT: { int i = 0;
+                       for (int k = 0; k < BRIGHT_N; k++) if (BRIGHT_OPTS[k] == cfgBright) i = k;
+                       cfgBright = BRIGHT_OPTS[(i + 1) % BRIGHT_N];
+                       applyBright(); prefs.putInt("bri", cfgBright); break; }
+      case C_CONTROL: cfgTilt = !cfgTilt;
+                     prefs.putBool("ctrl", cfgTilt);
+                     if (cfgTilt) navCalBegin(true);        // show how, there and then
+                     break;
       case C_SLEEP:  cfgSleepIdx = (cfgSleepIdx + 1) % SLEEP_N;
                      prefs.putInt("slpi", cfgSleepIdx); break;
       case C_TURN:   cfgAutoTurn = !cfgAutoTurn;
@@ -2720,6 +2896,49 @@ static void knockOne() {
       case C_POPUP:  cfgPopupIdx = (cfgPopupIdx + 1) % POPUP_N;
                      prefs.putInt("popi", cfgPopupIdx); break;
       case C_EYES:   applyEyes(cfgEyes + 1); prefs.putInt("eye", cfgEyes); break;
+      default: break;
+    }
+  }
+}
+
+// The other way round the carousel, and back up a list. Leaning gives
+// this for nothing; knocking never had it.
+static void knockPrev() {
+  if (depth == 0) { screen = (screen + S_COUNT - 1) % S_COUNT; itemIdx = 0; subIdx = 0; return; }
+  if (screen == S_READS) {
+    if (depth == 1) { if (readCount) itemIdx = (itemIdx + readCount - 1) % readCount; return; }
+    prevPage(); return;
+  }
+  if (screen == S_FAITH) {
+    if (depth == 1) { itemIdx = (itemIdx + F_COUNT - 1) % F_COUNT; subIdx = 0; return; }
+    if (depth == 2) {
+      switch (itemIdx) {
+        case F_ZIKR:    return;                                     // it paces itself
+        case F_NAMES:   subIdx = (subIdx + 98) % 99; return;
+        case F_QURAN:   subIdx = (subIdx + 113) % 114; return;
+        case F_MORNING: subIdx = (subIdx + MORNING_N - 1) % MORNING_N; return;
+        default:        subIdx = (subIdx + EVENING_N - 1) % EVENING_N; return;
+      }
+    }
+    prevPage(); return;
+  }
+  if (screen == S_GAMES) {
+    if (depth == 1) itemIdx = (itemIdx + G_COUNT - 1) % G_COUNT;
+    return;
+  }
+  if (screen == S_SETTINGS) {
+    if (depth == 1) { itemIdx = (itemIdx + C_COUNT - 1) % C_COUNT; return; }
+    switch (itemIdx) {
+      case C_BRIGHT: { int i = 0;
+                       for (int k = 0; k < BRIGHT_N; k++) if (BRIGHT_OPTS[k] == cfgBright) i = k;
+                       cfgBright = BRIGHT_OPTS[(i + BRIGHT_N - 1) % BRIGHT_N];
+                       applyBright(); prefs.putInt("bri", cfgBright); break; }
+      case C_SLEEP:  cfgSleepIdx = (cfgSleepIdx + SLEEP_N - 1) % SLEEP_N;
+                     prefs.putInt("slpi", cfgSleepIdx); break;
+      case C_POPUP:  cfgPopupIdx = (cfgPopupIdx + POPUP_N - 1) % POPUP_N;
+                     prefs.putInt("popi", cfgPopupIdx); break;
+      case C_EYES:   applyEyes(cfgEyes - 1); prefs.putInt("eye", cfgEyes); break;
+      case C_TURN:   cfgAutoTurn = !cfgAutoTurn; prefs.putBool("turn", cfgAutoTurn); break;
       default: break;
     }
   }
@@ -2807,6 +3026,40 @@ static void knockFour() {
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
 }
 
+static void navHome() { screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; nTiltHome++; }
+
+// Down for the next thing, up for the one before, left to go in, right to
+// come out, and up held for three seconds for home. Up does double duty,
+// so it only counts as "the one before" once you let it go: holding it
+// past three seconds means you wanted home instead.
+static void tiltNav() {
+  if (!cfgTilt || !tiltTaught()) return;
+  if (navCal != NC_OFF) return;
+  if (alertPhase != AL_NONE) return;
+  if (screen == S_GAMES && depth == 2) return;      // in there, tilt is playing
+
+  float tx, ty;
+  tiltRead(tx, ty);
+  unsigned long now = millis();
+
+  if (ty > NAV_TILT_ON) {
+    if (!upSince) { upSince = now; upConsumed = false; }
+    else if (!upConsumed && now - upSince >= NAV_HOME_MS) {
+      navHome(); upConsumed = true; lastActive = now;
+    }
+  } else if (upSince && fabsf(ty) < NAV_TILT_OFF) {
+    if (!upConsumed) { knockPrev(); nTiltPrev++; lastActive = now; }
+    upSince = 0; upConsumed = false;
+  }
+
+  if (!navLatch) {
+    if (ty < -NAV_TILT_ON)      { knockOne();   nTiltNext++; navLatch = true; lastActive = now; }
+    else if (tx < -NAV_TILT_ON) { knockTwo();   nTiltIn++;   navLatch = true; lastActive = now; }
+    else if (tx >  NAV_TILT_ON) { knockThree(); nTiltOut++;  navLatch = true; lastActive = now; }
+  }
+  if (fabsf(tx) < NAV_TILT_OFF && fabsf(ty) < NAV_TILT_OFF) navLatch = false;
+}
+
 static void onFall() {
   cFall++;
   int keep = screen;
@@ -2870,6 +3123,8 @@ static void input() {
     lastActive = now;
   }
   if (asleep) return;
+
+  tiltNav();
 
   // Reading needs a long fuse. Two minutes on a page is normal, and
   // dozing off mid sentence would be maddening.
@@ -3118,7 +3373,7 @@ window.load=async function(){
     adjFilled=true;
   }
   $('keyState').textContent=s.hasKey?('key saved · '+s.storyState):'no key yet';
-  rows('sys',{'Signal':s.rssi,'Address':s.ip,'Hotspot':s.ap,'Free ram':s.heap+' B','OTA room':s.ota,
+  rows('sys',{'Signal':s.rssi,'Address':s.ip,'Hotspot':s.ap,'Control':s.control,'Tilts':s.tilts,'Free ram':s.heap+' B','OTA room':s.ota,
               'Storage used':s.fsUsed,'Uptime':s.up+' s','Boots':s.boots,'Falls':s.fall,
               'Chip':s.chip,'Firmware':s.fw,'Clock source':s.clockSrc});
   if(!filled){$('ssid').value=s.ssid;$('tz').value=s.tz;filled=true}
@@ -3138,6 +3393,9 @@ static void apiState() {
   o += "\"k1\":" + String(cTap) + ",\"k2\":" + String(cDouble) + ",\"k3\":" + String(cTriple) +
        ",\"k4\":" + String(cQuad) + ",\"fall\":" + String(cFall) + ",\"boots\":" + String(cBoot) + ",";
   o += "\"autoTurn\":" + String(cfgAutoTurn ? "true" : "false") + ",";
+  o += "\"control\":\"" + String(cfgTilt ? "taps and tilt" : "taps") + "\",";
+  o += "\"tilts\":\"" + String(nTiltNext) + " next, " + String(nTiltPrev) + " back, " +
+       String(nTiltIn) + " in, " + String(nTiltOut) + " out, " + String(nTiltHome) + " home\",";
   o += "\"city\":\"" + wCity + "\",";
   o += "\"temp\":\"" + String(wxOk ? String(wTemp, 1) + " C" : String("--")) + "\",";
   o += "\"hum\":\"" + String(wxOk ? String(wHum, 0) + " %" : String("--")) + "\",";
@@ -3543,11 +3801,12 @@ void setup() {
   prefs.begin("nexus", false);
   cBoot = prefs.getUInt("boots", 0) + 1;
   prefs.putUInt("boots", cBoot);
-  cfgBright   = constrain(prefs.getInt("bri", 160), 10, 255);
+  cfgBright   = constrain(prefs.getInt("bri", 160), 0, 255);
   cfgSleepIdx = constrain(prefs.getInt("slpi", 1), 0, SLEEP_N - 1);
   cfgPopupIdx = constrain(prefs.getInt("popi", 2), 0, POPUP_N - 1);
   cfgEyes     = constrain(prefs.getInt("eye", 0), 0, STYLE_N - 1);
   cfgAutoTurn = prefs.getBool("turn", false);
+  cfgTilt     = prefs.getBool("ctrl", false);
   cfgTz       = prefs.getString("tz", DEF_TZ);
   cfgSsid     = prefs.getString("ssid", "");
   cfgPass     = prefs.getString("pass", "");
@@ -3622,16 +3881,32 @@ void setup() {
   eyes.setIdleMode(ON, 5, 4);
   eyes.setMood(STYLES[cfgEyes].mood);
 
+  // Leaning only means anything against how it is sitting now, and that
+  // changes every time it is picked up and put down. So it takes a moment
+  // to settle before handing control over.
+  if (cfgTilt) {
+    navCalBegin(false);
+    while (navCal != NC_OFF) { navCalService(); drawNavCal(); web.handleClient(); delay(40); }
+  }
+
   // Two columns, numbers on a common left edge so the words line up.
   oled.clearDisplay();
-  titleBarC("HOW TO KNOCK");
-  at(8,  16, "1  next");
-  at(8,  28, "2  open");
-  at(66, 16, "3  back");
-  at(66, 28, "4  reload");
-  oled.drawFastHLine(8, 40, 112, SSD1306_WHITE);
-  knockIcon(19, 51);
-  at(32, 48, "Knock to begin");
+  if (cfgTilt) {
+    titleBarC("KNOCK OR LEAN");
+    at(8,  16, "1 next");   at(66, 16, "dn next");
+    at(8,  28, "2 open");   at(66, 28, "lt open");
+    oled.drawFastHLine(8, 40, 112, SSD1306_WHITE);
+    ctr("up 3s for home", 48, 1);
+  } else {
+    titleBarC("HOW TO KNOCK");
+    at(8,  16, "1  next");
+    at(8,  28, "2  open");
+    at(66, 16, "3  back");
+    at(66, 28, "4  reload");
+    oled.drawFastHLine(8, 40, 112, SSD1306_WHITE);
+    knockIcon(19, 51);
+    at(32, 48, "Knock to begin");
+  }
   oled.display();
   holdCard(2000);                      // a knock ends it, and it never dawdles
 
@@ -3715,6 +3990,14 @@ void loop() {
   }
   // pages turn themselves when you asked them to
   if (cfgAutoTurn && inReader() && (long)(now - rdTurn) >= 0) nextPage();
+
+  if (navCal != NC_OFF) {                      // learning the leans
+    lastActive = now;
+    navCalService();
+    if (now - lastDraw >= 60) { lastDraw = now; drawNavCal(); }
+    delay(2);
+    return;
+  }
 
   if (alertPhase != AL_NONE) {                 // the call takes the screen
     lastActive = now;

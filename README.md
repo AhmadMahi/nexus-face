@@ -7,6 +7,29 @@ own firmware so those work with no network at all.
 
 You drive it by knocking on the desk beside it.
 
+## Driving it
+
+Knocking always works. Leaning is something you turn on **as well**, in
+SETTINGS under Control, never instead: a misread lean can then never leave
+you with no way back.
+
+### Leaning
+
+| Lean | Does |
+|------|------|
+| down | next |
+| up | the one before |
+| left | go in |
+| right | come out |
+| up, held three seconds | home |
+
+Turning it on asks you to hold still and then show it each of the four
+leans, so it learns which way round it is sitting and you see what each
+one does. Every boot after that takes a moment to settle first, because
+the resting position moves whenever the thing is picked up and put down.
+Inside a game, leaning plays the game and knocking handles pause and
+leave.
+
 ## Knocking
 
 One rule, everywhere:
@@ -94,11 +117,14 @@ the game list forgets it and asks again. The resting position is measured
 afresh every time a game starts, since that is what changes when you move
 it.
 
-**SETTINGS** brightness, sleep timeout, page turn (by knock or automatic),
+**SETTINGS** brightness (down to 0, which is the dimmest the panel goes
+rather than off), control method, sleep timeout, page turn (by knock or automatic),
 popup time, eye style, hotspot, check for update, reboot.
 
 **SYSTEM** uptime, network, memory and address. The full detail lives on
 the page.
+
+**ABOUT**, the last thing in SETTINGS: who made it, and where to find him.
 
 ## The page
 
