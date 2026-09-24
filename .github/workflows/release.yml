@@ -1,9 +1,5 @@
 name: Build and release firmware
 
-# Tag a commit to publish a release the robot will pick up:
-#   git tag v1.0.1 && git push origin v1.0.1
-# Keep the tag in step with FW_VERSION in the sketch.
-
 on:
   push:
     tags: ['v*']
@@ -26,7 +22,8 @@ jobs:
             https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.3.10
-          arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" "FluxGarage RoboEyes"
+          arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" \
+            "FluxGarage RoboEyes" "ArduinoJson"
 
       - name: Compile
         run: |

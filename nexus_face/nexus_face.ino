@@ -1,34 +1,26 @@
 /*
   ================================================================
-   NEXUS FACE  -  ESP32-C3 companion
+   NEXUS  -  ESP32-C3 desk companion
   ================================================================
-   Everything is driven by knocking on it.
+   Knock on it to drive it.
 
-     1 knock ...... next thing on this screen
-     2 knocks ..... next screen
-     3 knocks ..... do the thing you have selected
-     4 knocks ..... straight back to HOME
+     1 knock ...... next screen        (or next item inside a menu,
+                                        or change the value you opened)
+     2 knocks ..... go in
+     3 knocks ..... come back out
 
-   SCREENS   HOME, CLOCK, WEATHER, MESSAGES, FACE, SENSORS,
-             SETTINGS, SYSTEM
+   SCREENS   HOME, WEATHER, PRAYER, MESSAGES, STORY, SYSTEM, SETTINGS
 
-   Leave it 30 seconds and the panel powers down and the processor
-   throttles back. Pick it up, shake it or knock it to bring it back.
+   It joins your WiFi and serves one page at its own address. If it
+   ever cannot get on, it raises a rescue hotspot so you can still
+   reach the page and fix the credentials.
 
    WIRING   everything on one I2C bus
      SDA GPIO8   SCL GPIO9
      OLED 0x3C   ADXL345 0x53   MPU6050 0x68
-   Both sensors are optional; it uses whichever answers.
 
-   NETWORK  joins your WiFi and runs its own hotspot at the same
-            time, so the panel is always reachable.
-              hotspot  NEXUS-ROBOT / password
-              panel    http://192.168.4.1
-
-   UPDATES  SETTINGS > Check for update pulls the newest release
-            from GitHub and installs it over the air.
-
-   LIBRARIES  FluxGarage RoboEyes, Adafruit GFX, Adafruit SSD1306
+   LIBRARIES  FluxGarage RoboEyes, Adafruit GFX, Adafruit SSD1306,
+              ArduinoJson
    Board      ESP32-C3.  Partition: Minimal SPIFFS (1.9MB APP)
   ================================================================
 */
@@ -39,6 +31,7 @@
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
 #include <Update.h>
 #include <Preferences.h>
 #include <time.h>
@@ -49,27 +42,25 @@
 #define SDA_PIN 8
 #define SCL_PIN 9
 #define OLED_ADDR 0x3C
-// RoboEyes already uses W and H, so the screen size lives under other names
-#define SCRW 128
+#define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.1.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
 #define DEF_WIFI_SSID "YOUR_WIFI_NAME"
 #define DEF_WIFI_PASS "YOUR_WIFI_PASSWORD"
 #define DEF_TZ        "IST-5:30"
-
-const char* AP_SSID = "NEXUS-ROBOT";
-const char* AP_PASS = "password";
+const char* RESCUE_SSID = "NEXUS-RESCUE";
+const char* RESCUE_PASS = "password";
 
 Adafruit_SSD1306 oled(SCRW, SCRH, &Wire, -1);
 RoboEyes<Adafruit_SSD1306> eyes(oled);
 WebServer   web(80);
 Preferences prefs;
 
-// ---------------- sensor registers ----------------
+// ---------------- sensors ----------------
 #define A_DEVID 0x00
 #define A_THRESH_TAP 0x1D
 #define A_THRESH_FF 0x28
@@ -95,17 +86,24 @@ uint8_t adxl = 0, mpu = 0;
 float ax, ay, az, amag = 1, mx, my, mz, gxr, gyr, gzr, mtemp;
 
 // ---------------- screens ----------------
-enum { S_HOME = 0, S_CLOCK, S_WEATHER, S_MSG, S_FACE, S_SENSORS, S_SETTINGS, S_SYSTEM, S_COUNT };
+enum { S_HOME = 0, S_WEATHER, S_PRAYER, S_MSG, S_STORY, S_SYSTEM, S_SETTINGS, S_COUNT };
 const char* S_NAME[S_COUNT] =
-  { "HOME", "CLOCK", "WEATHER", "MESSAGES", "FACE", "SENSORS", "SETTINGS", "SYSTEM" };
+  { "HOME", "WEATHER", "PRAYER", "MESSAGES", "STORY", "SYSTEM", "SETTINGS" };
 
 int screen = S_HOME;
-int itemIdx = 0;                  // which row is selected on this screen
+int depth  = 0;                  // 0 screens, 1 settings list, 2 editing
+int itemIdx = 0;
 
-// ---------------- settings menu ----------------
-enum { CFG_BRIGHT = 0, CFG_SLEEP, CFG_EYES, CFG_UPDATE, CFG_REBOOT, CFG_COUNT };
-const char* CFG_NAME[CFG_COUNT] =
-  { "Brightness", "Sleep after", "Eye style", "Check update", "Reboot" };
+// ---------------- settings ----------------
+enum { C_BRIGHT = 0, C_SLEEP, C_POPUP, C_EYES, C_STORY, C_UPDATE, C_REBOOT, C_COUNT };
+const char* C_NAME[C_COUNT] =
+  { "Brightness", "Sleep after", "Popup time", "Eye style", "New story", "Check update", "Reboot" };
+
+// 0 to a minute in steps, then the longer ones, then round again
+const int SLEEP_OPTS[] = { 15, 30, 45, 60, 120, 180, 300, 600 };
+const int SLEEP_N = sizeof(SLEEP_OPTS) / sizeof(SLEEP_OPTS[0]);
+const int POPUP_OPTS[] = { 0, 5, 10, 20, 30, 60 };
+const int POPUP_N = sizeof(POPUP_OPTS) / sizeof(POPUP_OPTS[0]);
 
 struct EyeStyle { const char* name; byte w, h, r; int gap; bool cyc; byte mood; };
 const EyeStyle STYLES[] = {
@@ -113,21 +111,20 @@ const EyeStyle STYLES[] = {
   { "square",  38, 38,  2, 10, false, DEFAULT },
   { "wide",    48, 28, 12,  8, false, DEFAULT },
   { "sleepy",  36, 14,  6, 12, false, TIRED   },
-  { "cross",   34, 34,  8, 14, false, ANGRY   },
   { "joy",     36, 36, 16, 12, false, HAPPY   },
   { "cyclops", 46, 46, 14,  0, true,  DEFAULT },
 };
-const int STYLE_COUNT = sizeof(STYLES) / sizeof(STYLES[0]);
+const int STYLE_N = sizeof(STYLES) / sizeof(STYLES[0]);
 
-int cfgBright = 160, cfgSleepSec = 30, cfgEyes = 0;
-String cfgSsid, cfgPass, cfgTz;
+int cfgBright = 160, cfgSleepIdx = 1, cfgPopupIdx = 2, cfgEyes = 0;
+String cfgSsid, cfgPass, cfgTz, cfgKey;
+int sleepSecs() { return SLEEP_OPTS[cfgSleepIdx]; }
+int popupSecs() { return POPUP_OPTS[cfgPopupIdx]; }
 
-// ---------------- messages, kept in flash ----------------
-#define MSG_MAX 8
-String msgs[MSG_MAX];
-int    msgCount = 0;
+// ---------------- content ----------------
+String message = "";                       // just the latest one
+unsigned long popupUntil = 0;
 
-// ---------------- weather ----------------
 float wTemp = NAN, wHum = NAN, wWind = NAN;
 int   wCode = -1;
 String wCity = "";
@@ -135,10 +132,26 @@ bool  wxOk = false;
 unsigned long nextWx = 0;
 float locLat = NAN, locLon = NAN;
 
+const char* PRAYERS[5] = { "Fajr", "Dhuhr", "Asr", "Maghrib", "Isha" };
+int  prayerMin[5] = { -1, -1, -1, -1, -1 };
+bool prayerOk = false;
+int  prayerDay = -1;
+unsigned long nextPrayerTry = 0;
+
+// The story is wrapped into lines once, when it arrives, so turning a
+// page later costs nothing.
+#define STORY_LINES 72
+#define LINES_PER_PAGE 4
+String storyLine[STORY_LINES];
+int    storyLines = 0, storyPage = 0;
+bool   storyBusy = false;
+String storyState = "no story yet";
+unsigned long nextStory = 0, lastPageTurn = 0;
+
 // ---------------- runtime ----------------
-bool asleep = false, screenOn = true, timeOk = false;
+bool asleep = false, screenOn = true, timeOk = false, rescueAP = false;
 unsigned long lastActive = 0, lastDraw = 0, lastPoll = 0, reactUntil = 0, lastShake = 0;
-uint32_t cTap = 0, cScreen = 0, cFall = 0, cShake = 0, cBoot = 0;
+uint32_t cTap = 0, cDouble = 0, cTriple = 0, cFall = 0, cShake = 0, cBoot = 0;
 uint8_t  burst = 0;
 unsigned long burstStart = 0;
 String   otaStatus = "";
@@ -147,12 +160,6 @@ int      otaPct = -1;
 #define TAP_WINDOW_MS 520
 #define TILT 0.35f
 #define SHAKE_G 0.60f
-
-const char* const QUIPS[] = {
-  "waiting for the clock", "counting electrons", "time is a construct",
-  "ask me again shortly", "no signal, no idea",
-};
-const int QUIP_COUNT = sizeof(QUIPS) / sizeof(QUIPS[0]);
 
 // ================================================================
 //  I2C
@@ -173,7 +180,6 @@ static bool rBlk(uint8_t a, uint8_t r, uint8_t* b, uint8_t n) {
   for (uint8_t i = 0; i < n; i++) b[i] = Wire.read();
   return true;
 }
-
 static void startSensors() {
   uint8_t t[2] = { 0x53, 0x1D };
   for (int i = 0; i < 2 && !adxl; i++) {
@@ -184,9 +190,7 @@ static void startSensors() {
     wReg(adxl, A_LATENT, 0x30);     wReg(adxl, A_WINDOW, 0xC0);
     wReg(adxl, A_TAP_AXES, 0x07);
     wReg(adxl, A_THRESH_FF, 0x07);  wReg(adxl, A_TIME_FF, 0x14);
-    // single taps only: we count them ourselves, which is the only way
-    // to tell three knocks from two
-    wReg(adxl, A_INT_ENABLE, INT_TAP1 | INT_FF);
+    wReg(adxl, A_INT_ENABLE, INT_TAP1 | INT_FF);   // single taps only, we count them
     wReg(adxl, A_POWER_CTL, 0x08);
     delay(20); rReg(adxl, A_INT_SOURCE);
   }
@@ -198,9 +202,7 @@ static void startSensors() {
     wReg(mpu, M_PWR1, 0x00); delay(10);
     wReg(mpu, M_GYRO_CFG, 0x00); wReg(mpu, M_ACC_CFG, 0x00);
   }
-  Serial.printf("ADXL345 %s   MPU6050 %s\n", adxl ? "ok" : "absent", mpu ? "ok" : "absent");
 }
-
 static void readSensors() {
   uint8_t b[14];
   if (adxl && rBlk(adxl, A_DATAX0, b, 6)) {
@@ -222,37 +224,9 @@ static void readSensors() {
 }
 
 // ================================================================
-//  MESSAGES, kept across reboots
-// ================================================================
-static void loadMessages() {
-  msgCount = prefs.getInt("mn", 0);
-  if (msgCount > MSG_MAX) msgCount = MSG_MAX;
-  char k[6];
-  for (int i = 0; i < msgCount; i++) {
-    snprintf(k, sizeof(k), "m%d", i);
-    msgs[i] = prefs.getString(k, "");
-  }
-}
-static void saveMessages() {
-  prefs.putInt("mn", msgCount);
-  char k[6];
-  for (int i = 0; i < msgCount; i++) {
-    snprintf(k, sizeof(k), "m%d", i);
-    prefs.putString(k, msgs[i]);
-  }
-}
-static void addMessage(const String& m) {
-  for (int i = MSG_MAX - 1; i > 0; i--) msgs[i] = msgs[i - 1];
-  msgs[0] = m;
-  if (msgCount < MSG_MAX) msgCount++;
-  saveMessages();
-}
-
-// ================================================================
-//  DRAWING  -  one layout for every screen, so nothing jumps about
-//    y 0..8    header: screen name left, clock and signal right
-//    y 10      rule
-//    y 14..63  content
+//  DRAWING
+//    y 0..9    title bar, white on black inverted
+//    y 12..63  content
 // ================================================================
 static void ctr(const char* s, int y, int size) {
   int w = (int)strlen(s) * 6 * size;
@@ -275,52 +249,52 @@ static void clockStr(char* o, size_t n, bool sec) {
   else     snprintf(o, n, "%02d:%02d", t.tm_hour, t.tm_min);
 }
 
-static void header(const char* title) {
-  at(2, 0, title);
-  int bars = 0;
-  if (WiFi.status() == WL_CONNECTED) {
-    int r = WiFi.RSSI();
-    bars = r > -55 ? 4 : r > -67 ? 3 : r > -78 ? 2 : 1;
+// The bar is a filled block with the text knocked out of it, which reads
+// far better than a hairline rule.
+static void titleBar(const char* title, const char* right) {
+  oled.fillRect(0, 0, SCRW, 11, SSD1306_WHITE);
+  oled.setTextColor(SSD1306_BLACK);
+  oled.setTextSize(1);
+  oled.setCursor(3, 2);
+  oled.print(title);
+  if (right && *right) {
+    oled.setCursor(SCRW - 3 - (int)strlen(right) * 6, 2);
+    oled.print(right);
   }
-  for (int i = 0; i < 4; i++) {
-    int h = 2 + i * 2, x = SCRW - 14 + i * 3;
-    if (i < bars) oled.fillRect(x, 8 - h, 2, h, SSD1306_WHITE);
-    else          oled.drawPixel(x, 7, SSD1306_WHITE);
-  }
+  oled.setTextColor(SSD1306_WHITE);
+}
+static void bar(const char* title) {
   char t[8];
   clockStr(t, sizeof(t), false);
-  oled.setTextSize(1);
-  oled.setCursor(SCRW - 18 - 5 * 6, 0);
-  oled.print(t);
-  oled.drawFastHLine(0, 10, SCRW, SSD1306_WHITE);
+  titleBar(title, t);
 }
 
 // ---- weather glyphs ----
 static void wxSun(int x, int y) {
-  oled.fillCircle(x + 9, y + 9, 5, SSD1306_WHITE);
+  oled.fillCircle(x + 10, y + 10, 6, SSD1306_WHITE);
   for (int i = 0; i < 8; i++) {
     float a = i * 0.7854f;
-    oled.drawLine(x + 9 + cosf(a) * 7, y + 9 + sinf(a) * 7,
-                  x + 9 + cosf(a) * 9, y + 9 + sinf(a) * 9, SSD1306_WHITE);
+    oled.drawLine(x + 10 + cosf(a) * 8, y + 10 + sinf(a) * 8,
+                  x + 10 + cosf(a) * 11, y + 10 + sinf(a) * 11, SSD1306_WHITE);
   }
 }
 static void wxCloud(int x, int y) {
-  oled.fillCircle(x + 6, y + 11, 4, SSD1306_WHITE);
-  oled.fillCircle(x + 12, y + 9, 5, SSD1306_WHITE);
-  oled.fillRect(x + 6, y + 10, 8, 5, SSD1306_WHITE);
+  oled.fillCircle(x + 6, y + 13, 5, SSD1306_WHITE);
+  oled.fillCircle(x + 14, y + 11, 6, SSD1306_WHITE);
+  oled.fillRect(x + 6, y + 12, 9, 6, SSD1306_WHITE);
 }
 static void wxRain(int x, int y) {
-  wxCloud(x, y - 3);
-  for (int i = 0; i < 3; i++) oled.drawLine(x + 4 + i * 4, y + 13, x + 3 + i * 4, y + 17, SSD1306_WHITE);
+  wxCloud(x, y - 4);
+  for (int i = 0; i < 3; i++) oled.drawLine(x + 5 + i * 5, y + 14, x + 3 + i * 5, y + 19, SSD1306_WHITE);
 }
 static void wxSnow(int x, int y) {
-  wxCloud(x, y - 3);
-  for (int i = 0; i < 3; i++) oled.drawCircle(x + 4 + i * 4, y + 15, 1, SSD1306_WHITE);
+  wxCloud(x, y - 4);
+  for (int i = 0; i < 3; i++) oled.drawCircle(x + 5 + i * 5, y + 17, 1, SSD1306_WHITE);
 }
 static void wxStorm(int x, int y) {
-  wxCloud(x, y - 3);
-  oled.drawLine(x + 10, y + 12, x + 7, y + 17, SSD1306_WHITE);
-  oled.drawLine(x + 7, y + 17, x + 11, y + 16, SSD1306_WHITE);
+  wxCloud(x, y - 4);
+  oled.drawLine(x + 12, y + 13, x + 8, y + 19, SSD1306_WHITE);
+  oled.drawLine(x + 8, y + 19, x + 13, y + 17, SSD1306_WHITE);
 }
 static const char* wxWord(int c) {
   if (c < 0)   return "no data";
@@ -342,64 +316,59 @@ static void wxIcon(int c, int x, int y) {
   else if (c <= 86) wxSnow(x, y);
   else              wxStorm(x, y);
 }
+static void gearIcon(int cx, int cy, int r) {
+  oled.drawCircle(cx, cy, r, SSD1306_WHITE);
+  oled.drawCircle(cx, cy, r / 2, SSD1306_WHITE);
+  for (int i = 0; i < 8; i++) {
+    float a = i * 0.7854f;
+    oled.drawLine(cx + cosf(a) * r, cy + sinf(a) * r,
+                  cx + cosf(a) * (r + 3), cy + sinf(a) * (r + 3), SSD1306_WHITE);
+  }
+}
 
 // ================================================================
 //  SCREENS
 // ================================================================
+// No signal, no clutter. Just what time it is and what day it is.
 static void drawHome() {
   oled.clearDisplay();
-  header("HOME");
-  char t[10], l[24];
-  clockStr(t, sizeof(t), false);
-  oled.setTextSize(3);
-  oled.setCursor((SCRW - (int)strlen(t) * 18) / 2, 16);
-  oled.print(t);
-
-  struct tm tm0;
-  if (timeOk && getLocalTime(&tm0, 5)) strftime(l, sizeof(l), "%a %d %b", &tm0);
-  else snprintf(l, sizeof(l), "%s", QUIPS[(millis() / 4000) % QUIP_COUNT]);
-  ctr(l, 42, 1);
-
-  if (wxOk) snprintf(l, sizeof(l), "%d C  %s", (int)roundf(wTemp), wxWord(wCode));
-  else      snprintf(l, sizeof(l), "%d msg  %lu taps", msgCount, (unsigned long)cTap);
-  ctr(l, 54, 1);
-  oled.display();
-}
-
-static void drawClock() {
   struct tm t;
   bool ok = timeOk && getLocalTime(&t, 5);
-  oled.clearDisplay();
-  header("CLOCK");
 
-  char big[8], sec[4], date[22];
+  char big[8], sec[4], day[14], date[20];
   if (ok) {
     snprintf(big, sizeof(big), "%02d:%02d", t.tm_hour, t.tm_min);
     snprintf(sec, sizeof(sec), "%02d", t.tm_sec);
-    strftime(date, sizeof(date), "%A %d %B", &t);
+    strftime(day, sizeof(day), "%A", &t);
+    strftime(date, sizeof(date), "%d %B %Y", &t);
   } else {
     strcpy(big, "--:--"); strcpy(sec, "--");
-    snprintf(date, sizeof(date), "%s", QUIPS[(millis() / 4000) % QUIP_COUNT]);
+    strcpy(day, "waiting"); strcpy(date, "for the clock");
   }
-  int bw = 5 * 18;
-  oled.setTextSize(3);
-  oled.setCursor((SCRW - bw - 16) / 2, 18);
+
+  int bw = 5 * 24;                                   // size 4 numerals
+  oled.setTextSize(4);
+  oled.setCursor((SCRW - bw - 14) / 2, 6);
   oled.print(big);
-  at((SCRW - bw - 16) / 2 + bw + 5, 34, sec);
-  ctr(date, 50, 1);
+  at((SCRW - bw - 14) / 2 + bw + 4, 22, sec);
+
+  oled.drawFastHLine(18, 40, SCRW - 36, SSD1306_WHITE);
+  ctr(day, 44, 1);
+  ctr(date, 55, 1);
   oled.display();
 }
 
 static void drawWeather() {
   oled.clearDisplay();
-  header("WEATHER");
+  bar("WEATHER");
   if (!wxOk) {
-    ctr(WiFi.status() == WL_CONNECTED ? "fetching..." : "needs the internet", 28, 1);
+    ctr(WiFi.status() == WL_CONNECTED ? "fetching" : "no network", 28, 1);
     ctr(wCity.length() ? wCity.c_str() : "locating", 44, 1);
     oled.display();
     return;
   }
-  wxIcon(wCode, 4, 16);
+  wxIcon(wCode, 2, 16);
+
   char l[22];
   snprintf(l, sizeof(l), "%d", (int)roundf(wTemp));
   int tw = strlen(l) * 18;
@@ -410,119 +379,43 @@ static void drawWeather() {
   at(30 + tw + 10, 16, "C");
   snprintf(l, sizeof(l), "%d%%", (int)roundf(wHum));
   at(30 + tw + 10, 30, l);
+
   ctr(wxWord(wCode), 44, 1);
   snprintf(l, sizeof(l), "%s  %.0f km/h", wCity.c_str(), wWind);
   ctr(l, 54, 1);
   oled.display();
 }
 
-static void drawMessages() {
+static void fmt12(char* o, size_t n, int mins) {
+  int h = mins / 60, m = mins % 60;
+  int d = h % 12; if (!d) d = 12;
+  snprintf(o, n, "%2d:%02d%s", d, m, h >= 12 ? "pm" : "am");
+}
+static int nextPrayer(int nowMin) {
+  for (int i = 0; i < 5; i++) if (prayerMin[i] > nowMin) return i;
+  return 0;
+}
+static void drawPrayer() {
   oled.clearDisplay();
-  header("MESSAGES");
-  if (!msgCount) {
-    ctr("nothing yet", 28, 1);
-    ctr("send one from the app", 44, 1);
+  bar("PRAYER");
+  if (!prayerOk) {
+    ctr(WiFi.status() == WL_CONNECTED ? "fetching times" : "no network", 30, 1);
     oled.display();
     return;
   }
-  char c[10];
-  snprintf(c, sizeof(c), "%d/%d", itemIdx + 1, msgCount);
-  rightAt(0, c);
+  struct tm t;
+  int nowMin = (timeOk && getLocalTime(&t, 5)) ? t.tm_hour * 60 + t.tm_min : -1;
+  int nx = nowMin >= 0 ? nextPrayer(nowMin) : -1;
 
-  // tilt steers the text, exactly as before
-  int align = ax > TILT ? 1 : (ax < -TILT ? -1 : 0);
-  int drop  = ay > TILT ? 1 : (ay < -TILT ? -1 : 0);
-
-  const int PER = 20, MAXL = 3;
-  String m = msgs[itemIdx], line[MAXL];
-  int n = 0;
-  for (int i = 0; n < MAXL && i < (int)m.length(); ) {
-    int take = min(PER, (int)m.length() - i);
-    if (take == PER) { int sp = m.lastIndexOf(' ', i + take); if (sp > i + 5) take = sp - i; }
-    line[n++] = m.substring(i, i + take);
-    i += take;
-    while (i < (int)m.length() && m.charAt(i) == ' ') i++;
-  }
-  int lowest = SCRH - 2 - (n - 1) * 11 - 7;
-  int top = constrain(18 + drop * 10, 14, max(14, lowest));
-  for (int k = 0; k < n; k++) {
-    int lw = line[k].length() * 6;
-    int x = (SCRW - lw) / 2;
-    if (align < 0) x = 4;
-    if (align > 0) x = SCRW - lw - 4;
-    at(x, top + k * 11, line[k].c_str());
-  }
-  oled.display();
-}
-
-static void drawSensors() {
-  oled.clearDisplay();
-  header("SENSORS");
-  const int BX = 4, BY = 15, BW = 44, BH = 44;
-  oled.drawRect(BX, BY, BW, BH, SSD1306_WHITE);
-  int cx = BX + BW / 2, cy = BY + BH / 2;
-  oled.drawFastHLine(cx - 3, cy, 7, SSD1306_WHITE);
-  oled.drawFastVLine(cx, cy - 3, 7, SSD1306_WHITE);
-  int dx = constrain((int)(ax * (BW / 2 - 5)), -(BW / 2 - 5), BW / 2 - 5);
-  int dy = constrain((int)(ay * (BH / 2 - 5)), -(BH / 2 - 5), BH / 2 - 5);
-  oled.fillCircle(cx + dx, cy + dy, 4, SSD1306_WHITE);
-
-  char l[18];
-  snprintf(l, sizeof(l), "X%+5.2f", ax); at(54, 16, l);
-  snprintf(l, sizeof(l), "Y%+5.2f", ay); at(54, 26, l);
-  snprintf(l, sizeof(l), "Z%+5.2f", az); at(54, 36, l);
-  snprintf(l, sizeof(l), "%.2f g", amag); at(54, 46, l);
-  snprintf(l, sizeof(l), "%s", mpu ? "2 sensors" : "1 sensor"); at(54, 56, l);
-  oled.display();
-}
-
-static void drawSystem() {
-  oled.clearDisplay();
-  header("SYSTEM");
-  char l[26];
-  uint32_t heap = ESP.getFreeHeap(), tot = ESP.getHeapSize();
-  snprintf(l, sizeof(l), "fw %s", FW_VERSION);      at(4, 15, l);
-  snprintf(l, sizeof(l), "ram %uk/%uk", (unsigned)(heap / 1024), (unsigned)(tot / 1024));
-  at(4, 25, l);
-  int bw = SCRW - 8, fill = bw * (tot - heap) / tot;
-  oled.drawRect(4, 34, bw, 5, SSD1306_WHITE);
-  if (fill > 2) oled.fillRect(5, 35, fill - 2, 3, SSD1306_WHITE);
-  // a long uptime in seconds would run off the edge, so it folds to hours
-  unsigned long up = millis() / 1000UL;
-  char u[12];
-  if (up >= 3600) snprintf(u, sizeof(u), "%luh%02lum", up / 3600, (up % 3600) / 60);
-  else            snprintf(u, sizeof(u), "%lus", up);
-  snprintf(l, sizeof(l), "up %s", u);
-  at(4, 43, l);
-  snprintf(l, sizeof(l), "boot %lu", (unsigned long)cBoot);
-  rightAt(43, l);
-  snprintf(l, sizeof(l), "%s", WiFi.status() == WL_CONNECTED
-           ? WiFi.localIP().toString().c_str() : "192.168.4.1");
-  at(4, 53, l);
-  oled.display();
-}
-
-// a proper list, one row per setting, value on the right
-static void drawSettings() {
-  oled.clearDisplay();
-  header("SETTINGS");
-  char v[18];
-  for (int i = 0; i < CFG_COUNT; i++) {
+  char v[12];
+  for (int i = 0; i < 5; i++) {
     int y = 14 + i * 10;
-    if (i == itemIdx) {
+    if (i == nx) {                                   // the one coming up, picked out
       oled.fillRect(0, y - 1, SCRW, 10, SSD1306_WHITE);
       oled.setTextColor(SSD1306_BLACK);
-    } else {
-      oled.setTextColor(SSD1306_WHITE);
-    }
-    at(4, y, CFG_NAME[i]);
-    switch (i) {
-      case CFG_BRIGHT: snprintf(v, sizeof(v), "%d", cfgBright); break;
-      case CFG_SLEEP:  snprintf(v, sizeof(v), "%ds", cfgSleepSec); break;
-      case CFG_EYES:   snprintf(v, sizeof(v), "%s", STYLES[cfgEyes].name); break;
-      case CFG_UPDATE: snprintf(v, sizeof(v), "%s", FW_VERSION); break;
-      default:         snprintf(v, sizeof(v), "x3"); break;
-    }
+    } else oled.setTextColor(SSD1306_WHITE);
+    at(4, y, PRAYERS[i]);
+    fmt12(v, sizeof(v), prayerMin[i]);
     oled.setCursor(SCRW - 3 - (int)strlen(v) * 6, y);
     oled.print(v);
   }
@@ -530,10 +423,133 @@ static void drawSettings() {
   oled.display();
 }
 
-// shown while an update is running
+static void drawMessage() {
+  oled.clearDisplay();
+  bar("MESSAGE");
+  if (!message.length()) {
+    ctr("nothing yet", 28, 1);
+    ctr("send one from the app", 44, 1);
+    oled.display();
+    return;
+  }
+  const int PER = 21, MAXL = 4;
+  String line[MAXL];
+  int n = 0;
+  for (int i = 0; n < MAXL && i < (int)message.length(); ) {
+    int take = min(PER, (int)message.length() - i);
+    if (take == PER) { int sp = message.lastIndexOf(' ', i + take); if (sp > i + 5) take = sp - i; }
+    line[n++] = message.substring(i, i + take);
+    i += take;
+    while (i < (int)message.length() && message.charAt(i) == ' ') i++;
+  }
+  int top = 16 + (48 - n * 11) / 2;
+  for (int k = 0; k < n; k++) ctr(line[k].c_str(), top + k * 11, 1);
+  oled.display();
+}
+
+static void drawStory() {
+  oled.clearDisplay();
+  char r[12];
+  if (storyLines) {
+    int pages = (storyLines + LINES_PER_PAGE - 1) / LINES_PER_PAGE;
+    snprintf(r, sizeof(r), "%d/%d", storyPage + 1, pages);
+  } else strcpy(r, "");
+  titleBar("STORY", r);
+
+  if (storyBusy) {
+    ctr("writing", 26, 1);
+    int a = (millis() / 110) % 8;
+    for (int i = 0; i < 8; i++) {
+      float th = i * 0.7854f;
+      int rr = (i == a) ? 9 : 5;
+      oled.drawPixel(SCRW / 2 + cosf(th) * rr, 46 + sinf(th) * rr, SSD1306_WHITE);
+    }
+    oled.display();
+    return;
+  }
+  if (!storyLines) {
+    ctr(storyState.c_str(), 28, 1);
+    ctr("add a key in settings", 44, 1);
+    oled.display();
+    return;
+  }
+  int start = storyPage * LINES_PER_PAGE;
+  for (int i = 0; i < LINES_PER_PAGE && start + i < storyLines; i++)
+    at(2, 16 + i * 12, storyLine[start + i].c_str());
+  oled.display();
+}
+
+static void drawSystem() {
+  oled.clearDisplay();
+  bar("SYSTEM");
+  char l[26];
+  uint32_t heap = ESP.getFreeHeap(), tot = ESP.getHeapSize();
+
+  snprintf(l, sizeof(l), "1:%lu 2:%lu 3:%lu", (unsigned long)cTap,
+           (unsigned long)cDouble, (unsigned long)cTriple);
+  at(3, 14, l);
+  snprintf(l, sizeof(l), "falls %lu  boots %lu", (unsigned long)cFall, (unsigned long)cBoot);
+  at(3, 24, l);
+  snprintf(l, sizeof(l), "ram %uk/%uk", (unsigned)(heap / 1024), (unsigned)(tot / 1024));
+  at(3, 34, l);
+  int bw = SCRW - 6, fill = bw * (tot - heap) / tot;
+  oled.drawRect(3, 42, bw, 5, SSD1306_WHITE);
+  if (fill > 2) oled.fillRect(4, 43, fill - 2, 3, SSD1306_WHITE);
+
+  // signal and address on their own lines: together they can be wider
+  // than the screen once the numbers get long
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(l, sizeof(l), "signal %d dBm", WiFi.RSSI());
+    at(3, 48, l);
+    at(3, 56, WiFi.localIP().toString().c_str());
+  } else {
+    at(3, 48, rescueAP ? "rescue hotspot" : "offline");
+    if (rescueAP) at(3, 56, "192.168.4.1");
+  }
+  oled.display();
+}
+
+static void drawSettings() {
+  oled.clearDisplay();
+  if (depth == 0) {                                  // the signpost
+    bar("SETTINGS");
+    gearIcon(SCRW / 2, 32, 11);
+    ctr("knock twice to open", 52, 1);
+    oled.display();
+    return;
+  }
+  bar(depth == 2 ? "CHANGE" : "SETTINGS");
+
+  char v[18];
+  int first = itemIdx > 3 ? itemIdx - 3 : 0;         // scroll, four rows fit
+  for (int r = 0; r < 4 && first + r < C_COUNT; r++) {
+    int i = first + r, y = 14 + r * 12;
+    bool on = (i == itemIdx);
+    if (on) { oled.fillRect(0, y - 2, SCRW, 12, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
+    else      oled.setTextColor(SSD1306_WHITE);
+    at(3, y, C_NAME[i]);
+    switch (i) {
+      case C_BRIGHT: snprintf(v, sizeof(v), "%d", cfgBright); break;
+      case C_SLEEP:  if (sleepSecs() < 60) snprintf(v, sizeof(v), "%ds", sleepSecs());
+                     else snprintf(v, sizeof(v), "%dm", sleepSecs() / 60); break;
+      case C_POPUP:  if (!popupSecs()) snprintf(v, sizeof(v), "off");
+                     else snprintf(v, sizeof(v), "%ds", popupSecs()); break;
+      case C_EYES:   snprintf(v, sizeof(v), "%s", STYLES[cfgEyes].name); break;
+      case C_STORY:  snprintf(v, sizeof(v), "%s", cfgKey.length() ? "ready" : "no key"); break;
+      case C_UPDATE: snprintf(v, sizeof(v), "%s", FW_VERSION); break;
+      default:       snprintf(v, sizeof(v), "x2"); break;
+    }
+    oled.setCursor(SCRW - 3 - (int)strlen(v) * 6, y);
+    oled.print(v);
+    if (on && depth == 2) { oled.drawRect(0, y - 2, SCRW, 12, SSD1306_BLACK); }
+  }
+  oled.setTextColor(SSD1306_WHITE);
+  oled.display();
+}
+
 static void drawOta() {
   oled.clearDisplay();
-  header("UPDATE");
+  bar("UPDATE");
   ctr(otaStatus.c_str(), 22, 1);
   if (otaPct >= 0) {
     int bw = SCRW - 24;
@@ -544,26 +560,25 @@ static void drawOta() {
     snprintf(p, sizeof(p), "%d%%", otaPct);
     ctr(p, 50, 1);
   } else {
-    // a little spinner while it is still thinking
     int a = (millis() / 120) % 8;
     for (int i = 0; i < 8; i++) {
       float th = i * 0.7854f;
-      int r = (i == a) ? 8 : 5;
-      oled.drawPixel(SCRW / 2 + cosf(th) * r, 42 + sinf(th) * r, SSD1306_WHITE);
+      int r = (i == a) ? 9 : 5;
+      oled.drawPixel(SCRW / 2 + cosf(th) * r, 44 + sinf(th) * r, SSD1306_WHITE);
     }
   }
   oled.display();
 }
 
 // ================================================================
-//  NETWORK HELPERS
+//  NETWORK
 // ================================================================
 static bool httpGetTo(const String& url, bool tls, String& out, int ms) {
   if (WiFi.status() != WL_CONNECTED) return false;
   HTTPClient h;
   h.setConnectTimeout(ms); h.setTimeout(ms);
   h.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  h.setUserAgent("nexus-face");
+  h.setUserAgent("nexus");
   bool ok = false;
   if (tls) { WiFiClientSecure c; c.setInsecure();
              if (h.begin(c, url) && h.GET() == 200) { out = h.getString(); ok = true; } }
@@ -573,47 +588,155 @@ static bool httpGetTo(const String& url, bool tls, String& out, int ms) {
   return ok;
 }
 
-// Open-Meteo repeats every field name inside "current_units" with the unit
-// as a string, so a naive search finds "C" instead of the number. Scope the
-// search to the "current" object and the values come out right.
-static float curNum(const String& body, const char* key, float def) {
-  int c = body.indexOf("\"current\":{");
+// Open-Meteo lists every field twice, once in "current_units" with the
+// unit as a string. Scope the search or you read "C" and get zero.
+static float curNum(const String& b, const char* k, float def) {
+  int c = b.indexOf("\"current\":{");
   if (c < 0) return def;
-  int i = body.indexOf(String("\"") + key + "\":", c);
-  if (i < 0) return def;
-  return body.substring(i + strlen(key) + 3).toFloat();
+  int i = b.indexOf(String("\"") + k + "\":", c);
+  return i < 0 ? def : b.substring(i + strlen(k) + 3).toFloat();
+}
+
+static bool locate() {
+  if (!isnan(locLat) && locLat != 0) return true;
+  String b;
+  if (!httpGetTo("http://ip-api.com/json/?fields=status,city,lat,lon", false, b, 6000)) return false;
+  int i = b.indexOf("\"lat\":"); if (i >= 0) locLat = b.substring(i + 6).toFloat();
+  i = b.indexOf("\"lon\":");     if (i >= 0) locLon = b.substring(i + 6).toFloat();
+  i = b.indexOf("\"city\":\"");
+  if (i >= 0) { int e = b.indexOf('"', i + 8); wCity = b.substring(i + 8, e); }
+  if (wCity.length() > 13) wCity = wCity.substring(0, 13);
+  return !isnan(locLat) && locLat != 0;
 }
 
 static void fetchWeather() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  String body;
-  if (isnan(locLat)) {
-    if (httpGetTo("http://ip-api.com/json/?fields=status,city,lat,lon", false, body, 6000)) {
-      int i = body.indexOf("\"lat\":");
-      if (i >= 0) locLat = body.substring(i + 6).toFloat();
-      i = body.indexOf("\"lon\":");
-      if (i >= 0) locLon = body.substring(i + 6).toFloat();
-      i = body.indexOf("\"city\":\"");
-      if (i >= 0) { int e = body.indexOf('"', i + 8); wCity = body.substring(i + 8, e); }
-      if (wCity.length() > 13) wCity = wCity.substring(0, 13);
-      Serial.printf("located %s  %.3f %.3f\n", wCity.c_str(), locLat, locLon);
-    }
-    if (isnan(locLat) || locLat == 0) return;
-  }
+  if (!locate()) return;
+  String b;
   String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(locLat, 3) +
                "&longitude=" + String(locLon, 3) +
                "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m";
-  if (!httpGetTo(url, true, body, 8000)) return;
-  wTemp = curNum(body, "temperature_2m", NAN);
-  wHum  = curNum(body, "relative_humidity_2m", NAN);
-  wWind = curNum(body, "wind_speed_10m", NAN);
-  wCode = (int)curNum(body, "weather_code", -1);
+  if (!httpGetTo(url, true, b, 8000)) return;
+  wTemp = curNum(b, "temperature_2m", NAN);
+  wHum  = curNum(b, "relative_humidity_2m", NAN);
+  wWind = curNum(b, "wind_speed_10m", NAN);
+  wCode = (int)curNum(b, "weather_code", -1);
   wxOk  = !isnan(wTemp);
-  Serial.printf("weather %.1fC %.0f%% wind %.1f code %d\n", wTemp, wHum, wWind, wCode);
+}
+
+static int parseHHMM(const char* s) {
+  int h = 0, m = 0;
+  if (sscanf(s, "%d:%d", &h, &m) != 2) return -1;
+  if (h < 0 || h > 23 || m < 0 || m > 59) return -1;
+  return h * 60 + m;
+}
+static void fetchPrayer() {
+  struct tm t;
+  if (!timeOk || !getLocalTime(&t, 5)) return;
+  if (!locate()) return;
+
+  char d[16];
+  strftime(d, sizeof(d), "%d-%m-%Y", &t);
+  String url = "https://api.aladhan.com/v1/timings/" + String(d) +
+               "?latitude=" + String(locLat, 4) + "&longitude=" + String(locLon, 4) +
+               "&method=1&school=0";
+  String b;
+  if (!httpGetTo(url, true, b, 9000)) return;
+
+  JsonDocument filter;
+  filter["data"]["timings"] = true;
+  JsonDocument doc;
+  if (deserializeJson(doc, b, DeserializationOption::Filter(filter))) return;
+  JsonObject tm_ = doc["data"]["timings"];
+  if (tm_.isNull()) return;
+
+  int tmp[5];
+  for (int i = 0; i < 5; i++) {
+    tmp[i] = parseHHMM(tm_[PRAYERS[i]] | "");
+    if (tmp[i] < 0) return;
+  }
+  for (int i = 0; i < 5; i++) prayerMin[i] = tmp[i];
+  prayerOk = true;
+  prayerDay = t.tm_yday;
+  Serial.println("prayer times updated");
 }
 
 // ================================================================
-//  OVER THE AIR UPDATE
+//  STORY  (OpenAI, gpt-4o-mini)
+// ================================================================
+// The text is wrapped into lines the moment it arrives, so paging
+// through it later is free.
+static void layoutStory(const String& text) {
+  storyLines = 0;
+  storyPage = 0;
+  const int PER = 21;
+  int i = 0, n = text.length();
+  while (i < n && storyLines < STORY_LINES) {
+    while (i < n && (text.charAt(i) == ' ' || text.charAt(i) == '\n')) i++;
+    if (i >= n) break;
+    int take = min(PER, n - i);
+    int nl = text.indexOf('\n', i);
+    if (nl >= 0 && nl < i + take) take = nl - i;
+    else if (take == PER) {
+      int sp = text.lastIndexOf(' ', i + take);
+      if (sp > i + 4) take = sp - i;
+    }
+    storyLine[storyLines++] = text.substring(i, i + take);
+    i += take;
+  }
+}
+
+static void fetchStory() {
+  if (!cfgKey.length()) { storyState = "no api key"; return; }
+  if (WiFi.status() != WL_CONNECTED) { storyState = "no network"; return; }
+
+  storyBusy = true;
+  storyState = "writing";
+  drawStory();
+
+  WiFiClientSecure c; c.setInsecure();
+  HTTPClient h;
+  h.setConnectTimeout(12000); h.setTimeout(25000);
+  if (!h.begin(c, "https://api.openai.com/v1/chat/completions")) {
+    storyBusy = false; storyState = "cannot reach openai"; return;
+  }
+  h.addHeader("Content-Type", "application/json");
+  h.addHeader("Authorization", "Bearer " + cfgKey);
+
+  String body = "{\"model\":\"gpt-4o-mini\",\"max_tokens\":700,\"temperature\":0.9,"
+                "\"messages\":[{\"role\":\"user\",\"content\":"
+                "\"Write a gentle love story of about 400 words in simple, warm English. "
+                "Plain prose only: no title, no headings, no markdown, no quotation marks.\"}]}";
+
+  int code = h.POST(body);
+  if (code != 200) {
+    String err = h.getString();
+    h.end();
+    storyBusy = false;
+    storyState = (code == 401) ? "key rejected" : ("openai " + String(code));
+    Serial.println("story failed " + String(code) + " " + err.substring(0, 160));
+    return;
+  }
+
+  JsonDocument filter;
+  filter["choices"][0]["message"]["content"] = true;
+  JsonDocument doc;
+  DeserializationError e = deserializeJson(doc, h.getStream(),
+                                           DeserializationOption::Filter(filter));
+  h.end();
+  if (e) { storyBusy = false; storyState = "bad reply"; return; }
+
+  String text = doc["choices"][0]["message"]["content"] | "";
+  if (!text.length()) { storyBusy = false; storyState = "empty reply"; return; }
+
+  layoutStory(text);
+  storyBusy = false;
+  storyState = "ready";
+  lastPageTurn = millis();
+  Serial.printf("story ready, %d lines\n", storyLines);
+}
+
+// ================================================================
+//  OTA
 // ================================================================
 static long verNum(const String& v) {
   int a = 0, b = 0, c = 0;
@@ -628,50 +751,42 @@ static void otaProgress(size_t done, size_t total) {
   otaPct = p;
   drawOta();
 }
-
 static void runUpdate() {
-  if (WiFi.status() != WL_CONNECTED) { otaStatus = "no network"; drawOta(); delay(1800); return; }
-
+  if (WiFi.status() != WL_CONNECTED) { otaStatus = "no network"; otaPct = -1; drawOta(); delay(1800); return; }
   otaStatus = "checking"; otaPct = -1; drawOta();
 
-  String body;
-  if (!httpGetTo("https://api.github.com/repos/" OTA_REPO "/releases/latest", true, body, 8000)) {
+  String b;
+  if (!httpGetTo("https://api.github.com/repos/" OTA_REPO "/releases/latest", true, b, 9000)) {
     otaStatus = "github unreachable"; drawOta(); delay(2000); return;
   }
-  int i = body.indexOf("\"tag_name\":\"");
-  String tag = i < 0 ? "" : body.substring(i + 12, body.indexOf('"', i + 12));
-  int a = body.indexOf(OTA_ASSET);
-  int u = a < 0 ? -1 : body.indexOf("\"browser_download_url\":\"", a);
-  String url = u < 0 ? "" : body.substring(u + 24, body.indexOf('"', u + 24));
-
-  if (!tag.length() || !url.length()) { otaStatus = "no release yet"; drawOta(); delay(2000); return; }
-  if (verNum(tag) <= verNum(FW_VERSION)) {
-    otaStatus = "already newest"; drawOta(); delay(1800); return;
-  }
+  int i = b.indexOf("\"tag_name\":\"");
+  String tag = i < 0 ? "" : b.substring(i + 12, b.indexOf('"', i + 12));
+  int a = b.indexOf(OTA_ASSET);
+  int u = a < 0 ? -1 : b.indexOf("\"browser_download_url\":\"", a);
+  String url = u < 0 ? "" : b.substring(u + 24, b.indexOf('"', u + 24));
+  if (!tag.length() || !url.length()) { otaStatus = "no release"; drawOta(); delay(2000); return; }
+  if (verNum(tag) <= verNum(FW_VERSION)) { otaStatus = "already newest"; drawOta(); delay(1800); return; }
 
   otaStatus = tag; otaPct = 0; drawOta();
-
   WiFiClientSecure c; c.setInsecure();
   HTTPClient h;
   h.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   h.setConnectTimeout(15000); h.setTimeout(20000);
-  h.setUserAgent("nexus-face");
+  h.setUserAgent("nexus");
   if (!h.begin(c, url) || h.GET() != 200) { otaStatus = "download failed"; drawOta(); delay(2000); h.end(); return; }
   int len = h.getSize();
   if (len <= 0 || !Update.begin(len)) { otaStatus = "no room"; drawOta(); delay(2000); h.end(); return; }
   Update.onProgress(otaProgress);
   size_t wrote = Update.writeStream(*h.getStreamPtr());
   h.end();
-  if (wrote != (size_t)len || !Update.end(true)) {
-    otaStatus = "install failed"; otaPct = -1; drawOta(); delay(2200); return;
-  }
+  if (wrote != (size_t)len || !Update.end(true)) { otaStatus = "install failed"; otaPct = -1; drawOta(); delay(2200); return; }
   otaStatus = "installed"; otaPct = 100; drawOta();
   delay(1400);
   ESP.restart();
 }
 
 // ================================================================
-//  SLEEP
+//  SLEEP AND EYES
 // ================================================================
 static void screenPower(bool on) {
   if (on == screenOn) return;
@@ -683,7 +798,7 @@ static void applyBright() {
   oled.ssd1306_command(cfgBright);
 }
 static void applyEyes(int i) {
-  cfgEyes = (i + STYLE_COUNT) % STYLE_COUNT;
+  cfgEyes = (i + STYLE_N) % STYLE_N;
   const EyeStyle& e = STYLES[cfgEyes];
   eyes.setCyclops(e.cyc);
   eyes.setWidth(e.w, e.w); eyes.setHeight(e.h, e.h);
@@ -693,12 +808,12 @@ static void applyEyes(int i) {
 static void goSleep() {
   if (asleep) return;
   asleep = true;
+  applyEyes(cfgEyes);
   eyes.setIdleMode(OFF); eyes.setAutoblinker(OFF);
   eyes.setMood(TIRED); eyes.close();
   for (int i = 0; i < 26; i++) { eyes.update(); delay(16); }
   screenPower(false);
   setCpuFrequencyMhz(80);
-  Serial.println("asleep");
 }
 static void wake(const char* why) {
   lastActive = millis();
@@ -708,85 +823,82 @@ static void wake(const char* why) {
   screenPower(true);
   eyes.setAutoblinker(ON, 3, 2); eyes.setIdleMode(ON, 2, 2);
   applyEyes(cfgEyes); eyes.open();
-  screen = S_HOME; itemIdx = 0;
+  for (int i = 0; i < 18; i++) { eyes.update(); delay(16); }
+  screen = S_HOME; depth = 0; itemIdx = 0;
   Serial.printf("awake (%s)\n", why);
 }
 
 // ================================================================
 //  KNOCKS
-//    1 next item   2 next screen   3 activate   4 home
+//    depth 0   1 next screen   2 go in      3 nothing
+//    depth 1   1 next item     2 open it    3 back to screens
+//    depth 2   1 change value  2 nothing    3 back to the list
 // ================================================================
 static void react(unsigned long ms) { reactUntil = millis() + ms; }
 
-static int itemsOn(int s) {
-  if (s == S_SETTINGS) return CFG_COUNT;
-  if (s == S_MSG)      return max(1, msgCount);
-  return 1;
-}
-
-static void knockNext() {                       // 1
+static void knockOne() {
   cTap++;
-  itemIdx = (itemIdx + 1) % itemsOn(screen);
-}
-
-static void knockScreen() {                     // 2
-  cScreen++;
-  screen = (screen + 1) % S_COUNT;
-  itemIdx = 0;
-  if (screen == S_FACE) { applyEyes(cfgEyes); eyes.open(); }
-}
-
-static void knockDo() {                         // 3
-  if (screen == S_SETTINGS) {
-    switch (itemIdx) {
-      case CFG_BRIGHT:
-        cfgBright += 45; if (cfgBright > 255) cfgBright = 25;
-        applyBright(); prefs.putInt("bri", cfgBright); break;
-      case CFG_SLEEP:
-        cfgSleepSec = cfgSleepSec >= 120 ? 15 : cfgSleepSec * 2;
-        prefs.putInt("slp", cfgSleepSec); break;
-      case CFG_EYES:
-        applyEyes(cfgEyes + 1); prefs.putInt("eye", cfgEyes); break;
-      case CFG_UPDATE:
-        runUpdate(); break;
-      default:
-        delay(150); ESP.restart();
-    }
-  } else if (screen == S_FACE) {
-    eyes.anim_laugh(); react(1500);
-  } else if (screen == S_WEATHER) {
-    nextWx = 0;                                  // refresh now
-  } else if (screen == S_MSG && msgCount) {
-    msgCount = 0; itemIdx = 0; saveMessages();   // clear the lot
+  if (depth == 0) { screen = (screen + 1) % S_COUNT; itemIdx = 0; return; }
+  if (depth == 1) { itemIdx = (itemIdx + 1) % C_COUNT; return; }
+  switch (itemIdx) {                                  // depth 2: change it
+    case C_BRIGHT: cfgBright += 45; if (cfgBright > 255) cfgBright = 25;
+                   applyBright(); prefs.putInt("bri", cfgBright); break;
+    case C_SLEEP:  cfgSleepIdx = (cfgSleepIdx + 1) % SLEEP_N;
+                   prefs.putInt("slpi", cfgSleepIdx); break;
+    case C_POPUP:  cfgPopupIdx = (cfgPopupIdx + 1) % POPUP_N;
+                   prefs.putInt("popi", cfgPopupIdx); break;
+    case C_EYES:   applyEyes(cfgEyes + 1); prefs.putInt("eye", cfgEyes); break;
+    default: break;
   }
 }
 
-static void knockHome() {                       // 4
-  screen = S_HOME; itemIdx = 0;
+static void knockTwo() {
+  cDouble++;
+  if (depth == 0) {
+    if (screen == S_SETTINGS) { depth = 1; itemIdx = 0; }
+    else if (screen == S_WEATHER) nextWx = 0;         // refresh now
+    else if (screen == S_PRAYER)  nextPrayerTry = 0;
+    else if (screen == S_STORY)   nextStory = 0;
+    return;
+  }
+  if (depth == 1) {
+    if (itemIdx == C_REBOOT) { delay(150); ESP.restart(); }
+    if (itemIdx == C_UPDATE) { runUpdate(); return; }
+    if (itemIdx == C_STORY)  { nextStory = 0; screen = S_STORY; depth = 0; return; }
+    depth = 2;
+  }
+}
+
+static void knockThree() {
+  cTriple++;
+  if (depth > 0) depth--;
+  else { screen = S_HOME; itemIdx = 0; }
 }
 
 static void onFall() {
   cFall++;
-  screen = S_FACE; itemIdx = 0;
+  int keep = screen;
+  applyEyes(cfgEyes);
   eyes.setMood(DEFAULT); eyes.setPosition(N); eyes.setVFlicker(ON, 6);
-  for (int i = 0; i < 10; i++) { eyes.update(); delay(16); }
+  for (int i = 0; i < 12; i++) { eyes.update(); delay(16); }
   eyes.setPosition(S);
-  for (int i = 0; i < 10; i++) { eyes.update(); delay(16); }
-  eyes.setVFlicker(OFF); eyes.setHeight(6, 6);
-  react(2000);
+  for (int i = 0; i < 12; i++) { eyes.update(); delay(16); }
+  eyes.setVFlicker(OFF);
+  eyes.setHeight(6, 6);                               // flat out
+  for (int i = 0; i < 40; i++) { eyes.update(); delay(16); }
+  applyEyes(cfgEyes);
+  screen = keep;
+  react(300);
 }
 
 static void settleBurst() {
   if (!burst || millis() - burstStart < TAP_WINDOW_MS) return;
   uint8_t n = burst;
   burst = 0;
-  switch (n) {
-    case 1: knockNext();   break;
-    case 2: knockScreen(); break;
-    case 3: knockDo();     break;
-    default: knockHome();  break;
-  }
-  Serial.printf("knock x%u -> %s [%d]\n", n, S_NAME[screen], itemIdx);
+  if      (n == 1) knockOne();
+  else if (n == 2) knockTwo();
+  else             knockThree();
+  Serial.printf("knock x%u -> %s depth %d item %d\n", n, S_NAME[screen], depth, itemIdx);
 }
 
 static void input() {
@@ -799,7 +911,7 @@ static void input() {
     if (s & INT_TAP1) {
       wake("knock");
       if (!burst) burstStart = now;
-      if (burst < 4) burst++;
+      if (burst < 3) burst++;
       lastActive = now;
     }
   }
@@ -808,35 +920,18 @@ static void input() {
   if (fabsf(amag - 1.0f) > SHAKE_G && now - lastShake > 600) {
     lastShake = now; cShake++;
     if (asleep) { wake("shake"); return; }
-    if (screen == S_FACE) {
-      eyes.setMood(ANGRY); eyes.setHFlicker(ON, 4); eyes.anim_confused(); react(1600);
-    }
     lastActive = now;
-    return;
   }
   if (fabsf(amag - 1.0f) > 0.12f || fabsf(gxr) + fabsf(gyr) + fabsf(gzr) > 25.0f) {
     if (asleep) wake("picked up");
     lastActive = now;
   }
   if (asleep) return;
-  if (now - lastActive > (unsigned long)cfgSleepSec * 1000UL) { goSleep(); return; }
-  if (now < reactUntil) return;
-
-  if (screen == S_FACE) {
-    if      (ax >  TILT && ay >  TILT) eyes.setPosition(SE);
-    else if (ax >  TILT && ay < -TILT) eyes.setPosition(NE);
-    else if (ax < -TILT && ay >  TILT) eyes.setPosition(SW);
-    else if (ax < -TILT && ay < -TILT) eyes.setPosition(NW);
-    else if (ax >  TILT)               eyes.setPosition(E);
-    else if (ax < -TILT)               eyes.setPosition(W);
-    else if (ay >  TILT)               eyes.setPosition(S);
-    else if (ay < -TILT)               eyes.setPosition(N);
-    else                               eyes.setPosition(DEFAULT);
-  }
+  if (now - lastActive > (unsigned long)sleepSecs() * 1000UL) goSleep();
 }
 
 // ================================================================
-//  WEB PANEL
+//  WEB PAGE  (one page, on your own network)
 // ================================================================
 const char PAGE[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
@@ -854,14 +949,14 @@ h2{font-size:11px;letter-spacing:.2em;color:var(--mut);margin:22px 0 8px;text-tr
 .g4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
 .tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 4px}
 .tile b{display:block;font-size:19px;font-weight:500;font-variant-numeric:tabular-nums}
-.tile span{font-size:10px;color:var(--mut);letter-spacing:.06em}
+.tile span{font-size:10px;color:var(--mut)}
 input{width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);background:#0b141c;color:var(--fg);font:inherit;text-align:center}
 button{font:inherit;font-weight:600;padding:11px;border:0;border-radius:10px;background:var(--acc);color:#04201c;cursor:pointer;width:100%;margin-top:8px}
 button.g{background:transparent;color:var(--fg);border:1px solid var(--line)}
 .row{display:flex;gap:8px}.row button{margin-top:0}
 table{width:100%;font-size:13px;font-variant-numeric:tabular-nums}
 td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{text-align:right}
-.msg{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:9px 12px;margin-bottom:6px;text-align:left;font-size:14px;word-break:break-word}
+.story{text-align:left;font-size:14px;line-height:1.55;color:#cfe0ee;max-height:220px;overflow:auto}
 .bar{height:6px;background:#0b141c;border-radius:3px;overflow:hidden;margin-top:8px}
 .bar i{display:block;height:100%;background:var(--acc)}
 #t{margin-top:10px;font-size:13px;color:var(--acc);min-height:18px}
@@ -870,49 +965,55 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
 <div class="clock" id="clk">--:--</div>
 <div class="sub" id="sub">connecting</div>
 
-<h2>Say something</h2>
+<h2>Send a message</h2>
 <div class="card">
-  <input id="m" maxlength="72" placeholder="type a message">
+  <input id="m" maxlength="84" placeholder="it will pop up on the face">
   <button onclick="send()">Send</button>
 </div>
 
 <h2>Screens</h2>
 <div class="card"><div class="row">
   <button class="g" onclick="go(0)">Home</button>
-  <button class="g" onclick="go(1)">Clock</button>
-  <button class="g" onclick="go(2)">Weather</button>
-  <button class="g" onclick="go(3)">Msgs</button>
+  <button class="g" onclick="go(1)">Weather</button>
+  <button class="g" onclick="go(2)">Prayer</button>
+  <button class="g" onclick="go(3)">Msg</button>
 </div><div class="row" style="margin-top:8px">
-  <button class="g" onclick="go(4)">Face</button>
-  <button class="g" onclick="go(5)">Sensors</button>
+  <button class="g" onclick="go(4)">Story</button>
+  <button class="g" onclick="go(5)">System</button>
   <button class="g" onclick="go(6)">Settings</button>
-  <button class="g" onclick="go(7)">System</button>
 </div></div>
 
-<h2>Activity</h2>
+<h2>Knocks</h2>
 <div class="g4">
-  <div class="tile"><b id="c1">0</b><span>KNOCKS</span></div>
-  <div class="tile"><b id="c2">0</b><span>SCREENS</span></div>
-  <div class="tile"><b id="c3">0</b><span>FALLS</span></div>
-  <div class="tile"><b id="c4">0</b><span>SHAKES</span></div>
+  <div class="tile"><b id="k1">0</b><span>ONE</span></div>
+  <div class="tile"><b id="k2">0</b><span>TWO</span></div>
+  <div class="tile"><b id="k3">0</b><span>THREE</span></div>
+  <div class="tile"><b id="k4">0</b><span>FALLS</span></div>
 </div>
-
-<h2>Messages</h2><div class="card" id="ml"></div>
-<div class="row"><button class="g" onclick="act('/api/clear')">Clear all</button></div>
 
 <h2>Weather</h2><div class="card"><table id="wx"></table>
   <button class="g" onclick="act('/api/weather')">Refresh</button></div>
-<h2>Motion</h2><div class="card"><table id="mot"></table></div>
+<h2>Prayer times</h2><div class="card"><table id="pr"></table></div>
+
+<h2>Story</h2><div class="card">
+  <div class="story" id="st">nothing yet</div>
+  <button class="g" onclick="act('/api/story')">Write a new one</button>
+</div>
+
 <h2>System</h2><div class="card"><table id="sys"></table><div class="bar"><i id="hb"></i></div>
   <div class="row" style="margin-top:8px">
     <button class="g" onclick="act('/api/update')">Check update</button>
     <button class="g" onclick="if(confirm('Reboot?'))act('/api/reboot')">Reboot</button>
   </div></div>
 
-<h2>WiFi</h2><div class="card">
-  <input id="ssid" placeholder="network"><div style="height:8px"></div>
-  <input id="pass" type="password" placeholder="password (blank keeps it)">
-  <button onclick="savewifi()">Save and reboot</button>
+<h2>Settings</h2><div class="card">
+  <input id="key" type="password" placeholder="OpenAI API key (blank keeps it)">
+  <div style="height:8px"></div>
+  <input id="ssid" placeholder="wifi network"><div style="height:8px"></div>
+  <input id="pass" type="password" placeholder="wifi password (blank keeps it)">
+  <div style="height:8px"></div>
+  <input id="tz" placeholder="timezone eg IST-5:30">
+  <button onclick="save()">Save and reboot</button>
 </div>
 <div id="t"></div>
 </div><script>
@@ -920,13 +1021,15 @@ const $=i=>document.getElementById(i);
 window.esc=function(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 window.rows=function(el,o){$(el).innerHTML=Object.entries(o).map(([k,v])=>'<tr><td>'+k+'</td><td>'+esc(v)+'</td></tr>').join('')}
 window.post=async function(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(d||{})})}
-window.act=async function(u){await post(u,{});$('t').textContent='done';load()}
+window.act=async function(u){$('t').textContent='working';await post(u,{});$('t').textContent='done';load()}
 window.go=async function(n){await post('/api/screen',{n:n});$('t').textContent='opened'}
 window.send=async function(){const m=$('m').value.trim();if(!m){$('t').textContent='type something';return}
   await post('/api/msg',{m:m});$('m').value='';$('t').textContent='sent';load()}
-window.savewifi=async function(){
-  const d={ssid:$('ssid').value};if($('pass').value)d.pass=$('pass').value;
-  await post('/api/wifi',d);$('t').textContent='saved, rebooting'}
+window.save=async function(){
+  const d={ssid:$('ssid').value,tz:$('tz').value};
+  if($('pass').value)d.pass=$('pass').value;
+  if($('key').value)d.key=$('key').value;
+  await post('/api/cfg',d);$('t').textContent='saved, rebooting'}
 window.pushTime=async function(){const d=new Date();
   await post('/api/time',{e:Math.floor(d.getTime()/1000),o:-d.getTimezoneOffset()})}
 let filled=false;
@@ -935,14 +1038,14 @@ window.load=async function(){
   if(!s.timeOk) await pushTime();
   $('clk').textContent=s.time;
   $('sub').textContent=(s.asleep?'asleep':'awake')+' · '+s.screen+' · fw '+s.fw;
-  $('c1').textContent=s.tap;$('c2').textContent=s.scr;$('c3').textContent=s.fall;$('c4').textContent=s.shake;
-  $('ml').innerHTML=s.msgs.length?s.msgs.map(m=>'<div class="msg">'+esc(m)+'</div>').join(''):'<span style="color:var(--mut);font-size:13px">nothing stored</span>';
+  $('k1').textContent=s.k1;$('k2').textContent=s.k2;$('k3').textContent=s.k3;$('k4').textContent=s.fall;
   rows('wx',{'city':s.city,'temperature':s.temp,'humidity':s.hum,'wind':s.wind,'conditions':s.cond});
-  rows('mot',{'ADXL X':s.ax,'ADXL Y':s.ay,'ADXL Z':s.az,'gravity':s.amag+' g','MPU temp':s.mtemp+' C','gyro':s.gyro});
-  rows('sys',{'free ram':s.heap+' B','used':s.used+' B','uptime':s.up+' s','boots':s.boots,
-              'chip':s.chip,'address':s.ip,'clients':s.cl,'firmware':s.fw});
+  rows('pr',s.prayer);
+  $('st').textContent=s.story;
+  rows('sys',{'signal':s.rssi,'address':s.ip,'free ram':s.heap+' B','uptime':s.up+' s',
+              'boots':s.boots,'chip':s.chip,'firmware':s.fw});
   $('hb').style.width=s.pct+'%';
-  if(!filled){$('ssid').value=s.ssid;filled=true}
+  if(!filled){$('ssid').value=s.ssid;$('tz').value=s.tz;filled=true}
 }
 load();setInterval(load,1200);
 </script></body></html>
@@ -958,27 +1061,30 @@ static void apiState() {
   o += "\"time\":\"" + String(t) + "\",\"screen\":\"" + String(S_NAME[screen]) + "\",";
   o += "\"timeOk\":" + String(timeOk ? "true" : "false") + ",";
   o += "\"asleep\":" + String(asleep ? "true" : "false") + ",\"fw\":\"" FW_VERSION "\",";
-  o += "\"ax\":" + f2(ax, 2) + ",\"ay\":" + f2(ay, 2) + ",\"az\":" + f2(az, 2) + ",\"amag\":" + f2(amag, 2) + ",";
-  o += "\"mtemp\":" + f2(mtemp, 1) + ",\"gyro\":\"" + f2(gxr, 0) + " / " + f2(gyr, 0) + " / " + f2(gzr, 0) + "\",";
+  o += "\"k1\":" + String(cTap) + ",\"k2\":" + String(cDouble) + ",\"k3\":" + String(cTriple) +
+       ",\"fall\":" + String(cFall) + ",\"boots\":" + String(cBoot) + ",";
   o += "\"city\":\"" + wCity + "\",";
   o += "\"temp\":\"" + String(wxOk ? String(wTemp, 1) + " C" : String("--")) + "\",";
   o += "\"hum\":\"" + String(wxOk ? String(wHum, 0) + " %" : String("--")) + "\",";
   o += "\"wind\":\"" + String(wxOk ? String(wWind, 1) + " km/h" : String("--")) + "\",";
-  o += "\"cond\":\"" + String(wxWord(wCode)) + "\",";
-  o += "\"tap\":" + String(cTap) + ",\"scr\":" + String(cScreen) + ",\"fall\":" + String(cFall) +
-       ",\"shake\":" + String(cShake) + ",\"boots\":" + String(cBoot) + ",";
-  o += "\"heap\":" + String(heap) + ",\"used\":" + String(tot - heap) +
-       ",\"pct\":" + String(100 - heap * 100 / tot) + ",";
-  o += "\"up\":" + String(millis() / 1000UL) + ",\"cl\":" + String(WiFi.softAPgetStationNum()) + ",";
+  o += "\"cond\":\"" + String(wxWord(wCode)) + "\",\"prayer\":{";
+  for (int i = 0; i < 5; i++) {
+    char v[12];
+    if (prayerOk) fmt12(v, sizeof(v), prayerMin[i]); else strcpy(v, "--");
+    o += "\"" + String(PRAYERS[i]) + "\":\"" + String(v) + "\"";
+    if (i < 4) o += ",";
+  }
+  o += "},";
+  String st = "";
+  for (int i = 0; i < storyLines; i++) { st += storyLine[i]; st += " "; }
+  st.replace("\\", " "); st.replace("\"", "'");
+  o += "\"story\":\"" + String(st.length() ? st : storyState) + "\",";
+  o += "\"heap\":" + String(heap) + ",\"pct\":" + String(100 - heap * 100 / tot) + ",";
+  o += "\"up\":" + String(millis() / 1000UL) + ",";
+  o += "\"rssi\":\"" + String(WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) + " dBm" : String("offline")) + "\",";
   o += "\"chip\":\"" + String(ESP.getChipModel()) + " @" + String(ESP.getCpuFreqMHz()) + "MHz\",";
   o += "\"ip\":\"" + String(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "\",";
-  o += "\"ssid\":\"" + cfgSsid + "\",\"msgs\":[";
-  for (int i = 0; i < msgCount; i++) {
-    String m = msgs[i]; m.replace("\\", " "); m.replace("\"", "'");
-    o += "\"" + m + "\"";
-    if (i < msgCount - 1) o += ",";
-  }
-  o += "]}";
+  o += "\"ssid\":\"" + cfgSsid + "\",\"tz\":\"" + cfgTz + "\"}";
   web.send(200, "application/json", o);
 }
 
@@ -987,40 +1093,41 @@ static void setupWeb() {
   web.on("/api/state", HTTP_GET, apiState);
   web.on("/api/msg", HTTP_POST, []() {
     String m = web.arg("m"); m.trim();
-    if (m.length()) { addMessage(m.substring(0, 72)); screen = S_MSG; itemIdx = 0; wake("message"); }
+    if (m.length()) {
+      message = m.substring(0, 84);
+      prefs.putString("msg", message);
+      wake("message");
+      if (popupSecs()) { screen = S_MSG; depth = 0; popupUntil = millis() + popupSecs() * 1000UL; }
+    }
     web.send(200, "application/json", "{\"ok\":true}");
   });
   web.on("/api/screen", HTTP_POST, []() {
     screen = constrain((int)web.arg("n").toInt(), 0, S_COUNT - 1);
-    itemIdx = 0; wake("panel");
+    depth = 0; itemIdx = 0; wake("panel");
     web.send(200, "application/json", "{\"ok\":true}");
   });
-  web.on("/api/clear", HTTP_POST, []() {
-    msgCount = 0; itemIdx = 0; saveMessages();
-    web.send(200, "application/json", "{\"ok\":true}");
-  });
-  web.on("/api/weather", HTTP_POST, []() {
-    nextWx = 0;
-    web.send(200, "application/json", "{\"ok\":true}");
-  });
-  // your phone knows the time even when we cannot reach a time server
+  web.on("/api/weather", HTTP_POST, []() { nextWx = 0; web.send(200, "application/json", "{\"ok\":true}"); });
+  web.on("/api/story",   HTTP_POST, []() { nextStory = 0; web.send(200, "application/json", "{\"ok\":true}"); });
   web.on("/api/time", HTTP_POST, []() {
     long e = web.arg("e").toInt();
-    int  o = web.arg("o").toInt();
+    int  z = web.arg("o").toInt();
     if (e > 1700000000L) {
       struct timeval tv = { .tv_sec = (time_t)e, .tv_usec = 0 };
       settimeofday(&tv, nullptr);
       char tz[24];
-      snprintf(tz, sizeof(tz), "UTC%+d:%02d", -o / 60, abs(o) % 60);
+      snprintf(tz, sizeof(tz), "UTC%+d:%02d", -z / 60, abs(z) % 60);
       setenv("TZ", tz, 1); tzset();
       timeOk = true;
     }
     web.send(200, "application/json", "{\"ok\":true}");
   });
-  web.on("/api/wifi", HTTP_POST, []() {
+  web.on("/api/cfg", HTTP_POST, []() {
     String s = web.arg("ssid"); s.trim();
     if (s.length()) prefs.putString("ssid", s);
     if (web.arg("pass").length()) prefs.putString("pass", web.arg("pass"));
+    String z = web.arg("tz"); z.trim();
+    if (z.length()) prefs.putString("tz", z);
+    if (web.arg("key").length()) prefs.putString("key", web.arg("key"));
     web.send(200, "application/json", "{\"ok\":true}");
     delay(300); ESP.restart();
   });
@@ -1032,26 +1139,65 @@ static void setupWeb() {
     web.send(200, "application/json", "{\"ok\":true}");
     delay(300); ESP.restart();
   });
-  web.onNotFound([]() {
-    web.sendHeader("Location", "http://192.168.4.1/", true);
-    web.send(302, "text/plain", "");
-  });
+  web.onNotFound([]() { web.send(404, "text/plain", "not found"); });
   web.begin();
 }
 
 // ================================================================
-//  BOOT
+//  BOOT ANIMATION
 // ================================================================
-static void splash(const char* a, const char* b) {
-  oled.clearDisplay();
-  oled.setTextSize(2);
-  oled.setCursor((SCRW - 60) / 2, 14);
-  oled.print("NEXUS");
-  ctr(a, 36, 1);
-  if (b) ctr(b, 48, 1);
+// A caption under the eyes, so the eyes carry the boot rather than a
+// wall of text doing it.
+static void bootFrame(const char* caption, int dots) {
+  eyes.update();                       // draws the eyes into the buffer
+  if (caption) {
+    oled.fillRect(0, 52, SCRW, 12, SSD1306_BLACK);
+    char l[26];
+    snprintf(l, sizeof(l), "%s%.*s", caption, dots, "...");
+    ctr(l, 55, 1);
+  }
   oled.display();
 }
+static void bootStage(const char* caption, unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    bootFrame(caption, (int)((millis() / 350) % 4));
+    delay(24);
+  }
+}
 
+// eyes closed, then a slow blink open and a look around
+static void wakeUpAnimation() {
+  eyes.setAutoblinker(OFF); eyes.setIdleMode(OFF);
+  eyes.setMood(TIRED);
+  eyes.close();
+  for (int i = 0; i < 20; i++) { eyes.update(); delay(22); }
+
+  eyes.open();
+  eyes.setMood(DEFAULT);
+  for (int i = 0; i < 18; i++) { eyes.update(); delay(22); }
+
+  eyes.setPosition(W); for (int i = 0; i < 12; i++) { eyes.update(); delay(20); }
+  eyes.setPosition(E); for (int i = 0; i < 12; i++) { eyes.update(); delay(20); }
+  eyes.setPosition(DEFAULT);
+  eyes.blink();
+  for (int i = 0; i < 10; i++) { eyes.update(); delay(20); }
+}
+
+static void nameCard() {
+  oled.clearDisplay();
+  oled.setTextSize(3);
+  oled.setCursor((SCRW - 5 * 18) / 2, 18);
+  oled.print("NEXUS");
+  oled.drawFastHLine(24, 44, SCRW - 48, SSD1306_WHITE);
+  ctr("desk companion", 50, 1);
+  oled.display();
+  delay(1300);
+}
+
+// ================================================================
+//  SETUP
+// ================================================================
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -1060,21 +1206,22 @@ void setup() {
   cBoot = prefs.getUInt("boots", 0) + 1;
   prefs.putUInt("boots", cBoot);
   cfgBright   = constrain(prefs.getInt("bri", 160), 10, 255);
-  cfgSleepSec = constrain(prefs.getInt("slp", 30), 10, 3600);
-  cfgEyes     = constrain(prefs.getInt("eye", 0), 0, STYLE_COUNT - 1);
+  cfgSleepIdx = constrain(prefs.getInt("slpi", 1), 0, SLEEP_N - 1);
+  cfgPopupIdx = constrain(prefs.getInt("popi", 2), 0, POPUP_N - 1);
+  cfgEyes     = constrain(prefs.getInt("eye", 0), 0, STYLE_N - 1);
   cfgTz       = prefs.getString("tz", DEF_TZ);
   cfgSsid     = prefs.getString("ssid", "");
   cfgPass     = prefs.getString("pass", "");
+  cfgKey      = prefs.getString("key", "");
+  message     = prefs.getString("msg", "");
 
-  // First run: take the credentials compiled in and write them to flash.
-  // From then on they live in flash, so an update can never wipe them.
+  // First run: copy what is compiled in into flash. After that flash
+  // wins, so an update can never take the network away.
   if (!cfgSsid.length() && strcmp(DEF_WIFI_SSID, "YOUR_WIFI_NAME") != 0) {
     cfgSsid = DEF_WIFI_SSID; cfgPass = DEF_WIFI_PASS;
     prefs.putString("ssid", cfgSsid);
     prefs.putString("pass", cfgPass);
-    Serial.println("wifi seeded from the sketch into flash");
   }
-  loadMessages();
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
@@ -1084,72 +1231,121 @@ void setup() {
   oled.setTextColor(SSD1306_WHITE);
   applyBright();
 
-  splash("starting", nullptr);
+  eyes.begin(SCRW, SCRH, 50);
+  applyEyes(cfgEyes);
+
+  wakeUpAnimation();                                 // good morning
   startSensors();
+  bootStage("checking senses", 700);
 
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  splash(AP_SSID, "pass: password");
-  delay(1300);
-
+  // ---- station only. The hotspot is a rescue door, not a network.
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   if (cfgSsid.length()) {
-    splash("joining", cfgSsid.c_str());
     WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) delay(120);
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 14000) {
+      bootFrame("joining wifi", (int)((millis() / 350) % 4));
+      delay(24);
+    }
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    splash("getting the time", WiFi.localIP().toString().c_str());
+    eyes.setMood(HAPPY);
+    bootStage("connected", 700);
     configTzTime(cfgTz.c_str(), "pool.ntp.org", "time.google.com", "time.cloudflare.com");
     struct tm tm0;
     unsigned long t0 = millis();
-    while (!getLocalTime(&tm0, 200) && millis() - t0 < 8000) delay(100);
+    while (!getLocalTime(&tm0, 200) && millis() - t0 < 8000) {
+      bootFrame("getting the time", (int)((millis() / 350) % 4));
+      delay(24);
+    }
     timeOk = getLocalTime(&tm0, 200);
+    eyes.setMood(timeOk ? HAPPY : DEFAULT);
+    bootStage(timeOk ? "clock set" : "no clock yet", 700);
   } else {
-    splash("no network", "hotspot only");
-    delay(1200);
+    // could not get on: raise the rescue hotspot so the page is still
+    // reachable and the credentials can be fixed without a cable
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(RESCUE_SSID, RESCUE_PASS);
+    rescueAP = true;
+    eyes.setMood(TIRED);
+    bootStage("no wifi", 900);
+    oled.clearDisplay();
+    ctr("RESCUE HOTSPOT", 14, 1);
+    ctr(RESCUE_SSID, 28, 1);
+    ctr("pass: password", 40, 1);
+    ctr("192.168.4.1", 52, 1);
+    oled.display();
+    delay(3500);
   }
 
   setupWeb();
+  nameCard();
 
-  eyes.begin(SCRW, SCRH, 50);
-  applyEyes(cfgEyes);
   eyes.setAutoblinker(ON, 3, 2);
   eyes.setIdleMode(ON, 2, 2);
+  eyes.setMood(STYLES[cfgEyes].mood);
 
-  splash("1 next  2 screen", "3 do    4 home");
-  delay(1800);
+  oled.clearDisplay();
+  titleBar("READY", "");
+  ctr("1 next", 20, 1);
+  ctr("2 go in", 34, 1);
+  ctr("3 back", 48, 1);
+  oled.display();
+  delay(1900);
 
-  screen = S_HOME; itemIdx = 0;
+  screen = S_HOME; depth = 0; itemIdx = 0;
   lastActive = millis();
   Serial.printf("up. fw %s boot #%lu\n", FW_VERSION, (unsigned long)cBoot);
 }
 
+// ================================================================
+//  LOOP
+// ================================================================
 void loop() {
   web.handleClient();
   unsigned long now = millis();
 
   if (now - lastPoll >= 45) { lastPoll = now; input(); }
 
-  if (!asleep && WiFi.status() == WL_CONNECTED && (long)(now - nextWx) >= 0) {
-    nextWx = now + 900000UL;
-    fetchWeather();
+  if (!asleep && WiFi.status() == WL_CONNECTED) {
+    if ((long)(now - nextWx) >= 0) { nextWx = now + 900000UL; fetchWeather(); }
+
+    struct tm t;
+    bool haveDay = timeOk && getLocalTime(&t, 5);
+    if ((long)(now - nextPrayerTry) >= 0 && haveDay &&
+        (!prayerOk || prayerDay != t.tm_yday)) {
+      nextPrayerTry = now + 300000UL;
+      fetchPrayer();
+    }
+    if ((long)(now - nextStory) >= 0 && cfgKey.length() && !storyBusy) {
+      nextStory = now + 21600000UL;          // a fresh one every six hours
+      fetchStory();
+    }
   }
+
+  // a message that just arrived holds the screen for a moment
+  if (popupUntil && now > popupUntil) { popupUntil = 0; screen = S_HOME; }
 
   if (asleep) { delay(6); return; }
 
-  if (screen == S_FACE) {
-    eyes.update();
-  } else if (now - lastDraw >= 110) {
+  // the story turns its own pages, since one knock means next screen
+  if (screen == S_STORY && storyLines > LINES_PER_PAGE && now - lastPageTurn > 5000) {
+    lastPageTurn = now;
+    int pages = (storyLines + LINES_PER_PAGE - 1) / LINES_PER_PAGE;
+    storyPage = (storyPage + 1) % pages;
+  }
+
+  if (now - lastDraw >= 110) {
     lastDraw = now;
     switch (screen) {
-      case S_CLOCK:    drawClock();    break;
       case S_WEATHER:  drawWeather();  break;
-      case S_MSG:      drawMessages(); break;
-      case S_SENSORS:  drawSensors();  break;
-      case S_SETTINGS: drawSettings(); break;
+      case S_PRAYER:   drawPrayer();   break;
+      case S_MSG:      drawMessage();  break;
+      case S_STORY:    drawStory();    break;
       case S_SYSTEM:   drawSystem();   break;
+      case S_SETTINGS: drawSettings(); break;
       default:         drawHome();     break;
     }
   }

@@ -10,19 +10,18 @@ Everything is done by knocking on the case.
 
 | | |
 | --- | --- |
-| 1 knock | next thing on this screen |
-| 2 knocks | next screen |
-| 3 knocks | do the selected thing |
-| 4 knocks | straight back to HOME |
+| 1 knock | next screen, or next item once you are inside |
+| 2 knocks | go in |
+| 3 knocks | come back out |
 
-Screens: HOME, CLOCK, WEATHER, MESSAGES, FACE, SENSORS, SETTINGS, SYSTEM.
+Screens: **HOME, WEATHER, PRAYER, MESSAGES, STORY, SYSTEM, SETTINGS.**
 
-In **SETTINGS** one knock moves down the list and three knocks change the
-value, so brightness, sleep timeout, eye style, **Check update** and reboot
-are all reachable without a phone.
+In **SETTINGS**, two knocks opens the list, one knock walks it, two knocks
+opens the item, and then one knock changes the value. Three knocks steps
+back out. Brightness, sleep timeout, popup time, eye style, a fresh story,
+**Check update** and reboot are all reachable without touching a phone.
 
-Tilt the board and the eyes follow. Shake it and it gets cross. Knock it
-while it is asleep and it wakes. Drop it and it falls over.
+Knock it while it is asleep and it wakes. Drop it and it falls flat.
 
 ## Hardware
 
@@ -38,15 +37,34 @@ Both sensors are optional and it uses whichever answers. The ADXL345 is
 worth having: its tap and free-fall detection are done in hardware, so
 knocks and drops are caught reliably.
 
+## Screens
+
+**HOME** the time, big, with the day and date. Nothing else.
+**WEATHER** an icon, the temperature, humidity and wind.
+**PRAYER** all five times, with the next one picked out.
+**MESSAGES** whatever you sent from the page.
+**STORY** a short story written by gpt-4o-mini, turning its own pages.
+**SYSTEM** knock counts, falls, boots, memory, signal, address.
+**SETTINGS** everything you can change from the device itself.
+
 ## Network
 
-It joins your WiFi **and** runs its own hotspot at the same time, so the
-panel is reachable either way.
+It joins your WiFi and serves one page at its address on your network.
+
+If it ever cannot get on, it raises a rescue hotspot so the page is still
+reachable and you can fix the credentials without a cable:
 
 ```
-hotspot   NEXUS-ROBOT / password
-panel     http://192.168.4.1   (or its address on your network)
+NEXUS-RESCUE / password  ->  http://192.168.4.1
 ```
+
+## Stories
+
+Put an OpenAI key in the settings section of the page and the STORY screen
+fills itself from **gpt-4o-mini**, refreshing every six hours or on demand.
+The text is wrapped into lines the moment it arrives, so turning a page
+costs nothing. The key is kept in flash and never appears in the published
+binary.
 
 The clock syncs over NTP. If it has no route to a time server, the panel
 quietly hands over your phone's own clock and timezone as soon as you open
