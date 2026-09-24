@@ -1,137 +1,98 @@
-# NEXUS Face
+# NEXUS
 
-An ESP32-C3 desk companion. A 0.96" OLED, two accelerometers, animated
-robot eyes, a real clock, live weather, and its own WiFi hotspot with a
-control panel. It updates itself from the releases here.
+A desk companion built on an ESP32-C3. It has a face, it knows the time,
+the weather and the prayer times, it keeps a shelf of short reads, and it
+carries the Quran, the 99 Names and the morning and evening adhkar in its
+own firmware so those work with no network at all.
 
-## Driving it
+You drive it by knocking on the desk beside it.
 
-Everything is done by knocking on the case.
+## Knocking
 
-| | |
-| --- | --- |
-| 1 knock | next screen, or next item once you are inside |
-| 2 knocks | go in |
-| 3 knocks | come back out |
+One rule, everywhere:
 
-Screens: **HOME, FOCUS, WEATHER, PRAYER, MESSAGES, STORY, SETTINGS, SYSTEM.**
+| Knocks | On a card | In a list | In a reader |
+|--------|-----------|-----------|-------------|
+| 1 | next screen | next item | next page |
+| 2 | go in | open it | back to the list |
+| 3 | home | back out | back to the carousel |
+| 4 | home | reload | reload |
 
-In **SETTINGS**, two knocks opens the list, one knock walks it, two knocks
-opens the item, and then one knock changes the value. Three knocks steps
-back out. Brightness, sleep timeout, popup time, eye style, a fresh story,
-**Check update** and reboot are all reachable without touching a phone.
-
-Knock it while it is asleep and it wakes. Drop it and it falls flat.
-
-## Hardware
-
-| | |
-| --- | --- |
-| Board | ESP32-C3 |
-| Display | SSD1306 0.96", I2C `0x3C` |
-| Motion | ADXL345 `0x53` and/or MPU6050 `0x68` |
-| SDA | GPIO 8 |
-| SCL | GPIO 9 |
-
-Both sensors are optional and it uses whichever answers. The ADXL345 is
-worth having: its tap and free-fall detection are done in hardware, so
-knocks and drops are caught reliably.
+Reload only means something on the shelf of short reads, where it writes a
+new one, and on the zikr counter, where it starts the hundred again.
 
 ## Screens
 
-**HOME** the time, with the day and date. Nothing else.
-**FOCUS** a countdown for whatever you are working on, with the task
-scrolling along the bottom.
-**WEATHER** an icon, the temperature, humidity and wind.
-**PRAYER** all five times, with the next one picked out.
-**MESSAGES** whatever you sent from the page.
-**STORY** a short story written by gpt-4o-mini, turning its own pages.
-**SYSTEM** knock counts, falls, boots, memory, signal, address.
-**SETTINGS** everything you can change from the device itself.
-**SYSTEM** memory, uptime, knocks, falls, signal and address.
-
-## Working together
-
-The page has two halves. **Let's work together** is the one you use day to
-day: build a plan out of stretches, each with a name and a length, and the
-clock runs them in order.
-
 ```
-Write the spec    10 min
-Review PRs        10 min
-Break              5 min
-Refactor parser   15 min
+HOME -> FOCUS -> WEATHER -> MESSAGES -> PRAYER -> FAITH -> SHORT READS -> SETTINGS -> SYSTEM
 ```
 
-Press Start and the screen fills with a countdown, the task name scrolling
-underneath. Each stretch flashes **COMPLETED** as it ends and hands over to
-the next. Name one "break" and it flashes **BREAK OVER** instead, and after
-thirty minutes of unbroken work it will tell you to **TAKE A BREAK** and go
-walk for a minute whether you planned one or not. The plan is kept in flash,
-so it survives a reboot.
+**HOME** the time, the day and the date. With no network there is no clock
+to show, so it runs a stopwatch instead. Two knocks restart it.
 
-**Configuration** is everything else: screens, weather, prayer times, system,
-the OpenAI key and the network.
+**FOCUS** a plan of timed stretches, set on the page. Each one counts down,
+flashes when it is done and hands over to the next. Half an hour of work
+without a pause and it asks you to walk for a minute.
 
-## Network
+**WEATHER** from Open-Meteo, located by IP.
 
-It joins your WiFi and serves one page at its address on your network.
+**MESSAGES** whatever was last sent from the page.
 
-If it ever cannot get on, it raises a rescue hotspot so the page is still
-reachable and you can fix the credentials without a cable:
+**PRAYER** five times from AlAdhan, with the next one picked out. They are
+kept in flash, so they are still there with no network.
 
-```
-NEXUS-RESCUE / password  ->  http://192.168.4.1
-```
+**FAITH** two knocks opens five things:
 
-## Stories
+- **Zikr** thirty three SubhanAllah, thirty three Alhamdulillah, thirty
+  three Allahu Akbar and one to round it to a hundred. It paces itself.
+- **99 Names** one large name per knock, with its meaning.
+- **Quran** all 114 chapters. Each one gives its name and meaning, whether
+  it was revealed in Makkah or Madinah, its verse count and a short note on
+  what it covers. Descriptive notes, not tafsir.
+- **Morning adhkar** and **Evening adhkar**.
 
-Put an OpenAI key in the Configuration tab and the STORY screen fills
-itself from **gpt-4o-mini**: long, warm romances of around eight hundred
-words, with Muslim names. It refreshes every six hours or on demand.
+All of it is compiled into the firmware, so none of it needs a network.
 
-The story screen shows a couple of lines as a cover. **Two knocks** opens
-it, **one knock** turns each page, **three knocks** closes it. While you
-are reading, the idle timeout stretches to two minutes so it will not doze
-off mid sentence.
+**SHORT READS** a shelf of stories, newest first. Two knocks opens the
+shelf, two more opens one, one knock turns each page. Four knocks writes a
+new one and fills the rest of the shelf quietly afterwards. You can also
+paste your own on the page. They live in the filesystem and survive a
+reboot and an update.
 
-You can also paste your own text on the page and it is wrapped and stored
-exactly the same way, up to about 3400 characters, or fifty pages.
+**SETTINGS** brightness, sleep timeout, page turn (by knock or automatic),
+popup time, eye style, hotspot, check for update, reboot.
 
-Everything is wrapped into lines the moment it arrives, so turning a page
-costs nothing. The story survives a reboot. The key lives in flash and
-never appears in the published binary.
+**SYSTEM** uptime, network, memory and address. The full detail lives on
+the page.
 
-The clock syncs over NTP. If it has no route to a time server, the panel
-quietly hands over your phone's own clock and timezone as soon as you open
-it, so the time is right regardless.
+## The page
 
-## Flashing
+It runs whenever the device is on its network, at the address shown on the
+SYSTEM screen. Two tabs: the work session, messages and the shelf on one,
+and everything configurable on the other.
 
-Download `nexus_face.bin` from [Releases](../../releases) and flash at
-`0x10000`, or build from source:
+## Credentials
 
-1. Install **Adafruit GFX**, **Adafruit SSD1306** and **FluxGarage RoboEyes**.
-2. Put your WiFi details in `DEF_WIFI_SSID` / `DEF_WIFI_PASS` at the top.
-3. Set **Tools > Partition Scheme > Minimal SPIFFS (1.9MB APP with OTA)**.
-   Updates need a spare app slot; schemes without one cannot self-update.
-4. Upload.
+Nothing secret is ever committed or published. The binary attached to a
+release carries placeholders only. Real credentials live in a gitignored
+`secrets.h` when you build locally, and on the device itself in NVS, where
+an update cannot reach them. Set the network from the page, or from the
+hotspot in SETTINGS if the device cannot get online.
 
-Credentials are copied into flash on first boot and read from there
-afterwards, so an update never wipes them. The published binary carries
-placeholders, never anyone's password.
+The OpenAI key, used only for writing short reads, is entered on the page
+and stored the same way.
 
-## Updates
+## Building
 
-**SETTINGS > Check update**, three knocks. It asks GitHub for the latest
-release, compares it with the version it is running, and installs it with a
-progress bar if it is newer. There is a button on the panel too.
+Board ESP32-C3, partition scheme **Minimal SPIFFS (1.9MB APP with OTA)**.
+The OTA slot and the 128 kB filesystem both depend on it.
 
-To publish one: bump `FW_VERSION`, then
+Libraries: Adafruit GFX, Adafruit SSD1306, FluxGarage RoboEyes, ArduinoJson.
 
-```bash
-git tag v1.0.1 && git push origin v1.0.1
-```
+Wiring, all on one I2C bus: SDA GPIO8, SCL GPIO9. OLED 0x3C, ADXL345 0x53,
+MPU6050 0x68.
 
-Actions builds it, checks the tag matches `FW_VERSION`, and attaches
-`nexus_face.bin` to the release.
+## Updating
+
+SETTINGS, then Check update, then two knocks. It reads the latest release
+here, shows the download moving, and restarts into it.
