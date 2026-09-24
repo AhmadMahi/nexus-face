@@ -66,13 +66,23 @@ new one and fills the rest of the shelf quietly afterwards. You can also
 paste your own on the page. They live in the filesystem and survive a
 reboot and an update.
 
-**GAMES** two, both played by tilting.
+**GAMES** six, all played by tilting, two to a page. One knock steps
+through them and the page turns itself; the dots along the bottom say
+where you are.
 
-- **Snake** tilt to steer. It starts slow and works up to a top speed that
-  tilt can still keep up with.
-- **Brick** tilt to slide the paddle. The edges of the paddle send the ball
-  away at an angle, so you steer with it as well as block with it. The ball
-  launches itself if you leave it sitting.
+- **Snake** tilt to steer. Works up from 220ms a step to 120ms.
+- **Brick** tilt to slide the paddle, whose edges send the ball away at an
+  angle so you steer with it as well as block. Five wall patterns that
+  cycle as the levels climb.
+- **Car** three lanes. Obstacles are spaced so only one lane is ever
+  deadly at a time, and never spawn into a lane that would close the last
+  gap: hard, never unavoidable.
+- **Catch** tilt the basket. Keep the squares, let the crosses through.
+- **Pong** tilt to return it, first to seven. The ball quickens on every
+  return so a rally always ends.
+- **Roll** the one that leans hardest on the sensor: the ball carries
+  momentum, so you lead it and catch it again. Every level is flood filled
+  before it is used, so the goal is always reachable.
 
 While playing: two knocks pause, three leave, four start again. Best scores
 are kept in flash.

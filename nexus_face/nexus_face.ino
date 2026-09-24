@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "1.6.0"
+#define FW_VERSION "1.7.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -1046,12 +1046,14 @@ static void drawOta() {
 //  position is re-measured every time a game starts, because that is
 //  the part that drifts when you pick it up and put it down.
 // ================================================================
-enum { G_SNAKE = 0, G_BRICK, G_COUNT };
-const char* G_NAME[G_COUNT] = { "Snake", "Brick" };
+enum { G_SNAKE = 0, G_BRICK, G_CAR, G_CATCH, G_PONG, G_ROLL, G_COUNT };
+const char* G_NAME[G_COUNT] = { "Snake", "Brick", "Car", "Catch", "Pong", "Roll" };
+#define G_PER_PAGE 2
+#define G_PAGES ((G_COUNT + G_PER_PAGE - 1) / G_PER_PAGE)
 
 enum { GS_CAL_STILL = 0, GS_CAL_RIGHT, GS_CAL_AWAY, GS_READY, GS_PLAY, GS_PAUSE, GS_OVER };
 int  gState = GS_READY;
-int  gScore = 0, gBest[G_COUNT] = { 0, 0 };
+int  gScore = 0, gBest[G_COUNT] = { 0, 0, 0, 0, 0, 0 };
 unsigned long gNext = 0, gStamp = 0;
 
 int8_t mapAxX = -1, mapSgnX = 1, mapAxY = -1, mapSgnY = 1;   // -1 until taught
@@ -1142,6 +1144,7 @@ static void snDraw() {
   oled.drawPixel(foodX * SN_CELL + 1, SN_TOP + foodY * SN_CELL + 1, SSD1306_WHITE);
 }
 
+
 // ---------------- Brick ----------------
 #define BR_COLS 8
 #define BR_ROWS 3
@@ -1157,17 +1160,33 @@ bool  brStuck = true;
 unsigned long brStuckAt = 0;
 #define BR_AUTO_LAUNCH 1300UL      // so it never just sits there looking broken
 
+// Each level lays the wall out differently, so it is not only the speed
+// that changes as you climb.
 static void brFill() {
   brLeft = 0;
+  int shape = (brLevel - 1) % 5;
   for (int r = 0; r < BR_ROWS; r++)
-    for (int c = 0; c < BR_COLS; c++) { brick[r][c] = true; brLeft++; }
+    for (int c = 0; c < BR_COLS; c++) {
+      bool on = true;
+      switch (shape) {
+        case 1: on = ((r + c) % 2) == 0;                 break;   // chequered
+        case 2: on = (c >= r) && (c < BR_COLS - r);      break;   // a pyramid
+        case 3: on = (r != 1) || (c % 3 != 1);           break;   // gaps in the middle
+        case 4: on = (c < 2) || (c >= BR_COLS - 2) || r == 0; break; // a bowl
+        default: on = true;                              break;
+      }
+      brick[r][c] = on;
+      if (on) brLeft++;
+    }
+  if (!brLeft) { for (int c = 0; c < BR_COLS; c++) { brick[0][c] = true; brLeft++; } }
 }
 static void brServe() {
   brStuck = true;
   brStuckAt = millis();
   padX = (SCRW - PAD_W) / 2;
   bx = padX + PAD_W / 2; by = PAD_Y - 3;
-  float sp = 0.85f + 0.12f * (brLevel - 1);
+  float sp = 0.85f + 0.10f * (brLevel - 1);
+  if (sp > 2.0f) sp = 2.0f;
   bvx = (random(2) ? sp : -sp) * 0.75f;
   bvy = -sp;
 }
@@ -1178,7 +1197,7 @@ static void brReset() {
 static void brStepGame() {
   float tx, ty;
   tiltRead(tx, ty);
-  padX += tx * 26.0f;                       // tilt slides it, proportionally
+  padX += tx * 26.0f;
   padX = constrain(padX, 0.0f, (float)(SCRW - PAD_W));
 
   // Waiting on a knock forever is how a game looks broken, so it lets
@@ -1194,17 +1213,15 @@ static void brStepGame() {
   if (bx > SCRW - 2) { bx = SCRW - 2; bvx = -bvx; }
   if (by < 12)       { by = 12;       bvy = -bvy; }
 
-  // the paddle, which also steers: the edges send it away at an angle
   if (bvy > 0 && by >= PAD_Y - 2 && by <= PAD_Y + 2 &&
       bx >= padX - 1 && bx <= padX + PAD_W + 1) {
     by = PAD_Y - 2;
     bvy = -fabsf(bvy);
-    float off = ((bx - padX) / PAD_W) - 0.5f;          // -0.5 .. 0.5
+    float off = ((bx - padX) / PAD_W) - 0.5f;
     bvx += off * 1.1f;
     bvx = constrain(bvx, -1.7f, 1.7f);
   }
 
-  // bricks
   if (by >= BR_TOP && by < BR_TOP + BR_ROWS * BR_H) {
     int c = (int)bx / BR_W;
     int r = (int)(by - BR_TOP) / BR_H;
@@ -1213,7 +1230,7 @@ static void brStepGame() {
       brLeft--;
       gScore += 10;
       bvy = -bvy;
-      if (!brLeft) { brLevel++; brFill(); brServe(); return; }
+      if (!brLeft) { brLevel++; gScore += 50; brFill(); brServe(); return; }
     }
   }
 
@@ -1229,18 +1246,386 @@ static void brDraw() {
       if (brick[r][c]) oled.fillRect(c * BR_W, BR_TOP + r * BR_H, BR_W - 1, BR_H - 2, SSD1306_WHITE);
   oled.fillRect((int)padX, PAD_Y, PAD_W, 3, SSD1306_WHITE);
   oled.fillRect((int)bx - 1, (int)by - 1, 2, 2, SSD1306_WHITE);
+  for (int i = 0; i < brLives; i++) oled.fillRect(122 - i * 4, 12, 2, 2, SSD1306_WHITE);
 }
 
-// ---------------- shared ----------------
+// ---------------- Car ----------------
+//  Three lanes. Tilt picks one, and it will not slide two across in a
+//  single lean: you have to come back to level before it moves again.
+#define CAR_LANES 3
+#define CAR_LEFT  6
+#define CAR_LANEW 38
+#define CAR_W     14
+#define CAR_H     11
+#define CAR_Y     47
+#define CAR_OBS   5
+int   carLane = 1;
+bool  carLatch = false;
+float carSpeed = 1.0f, carScroll = 0;
+struct CarObs { int8_t lane; float y; bool live; };
+CarObs carObs[CAR_OBS];
+int   carPassed = 0;
+
+static int carLaneX(int l) { return CAR_LEFT + l * CAR_LANEW + (CAR_LANEW - CAR_W) / 2; }
+static void carReset() {
+  carLane = 1; carLatch = false; carSpeed = 1.0f; carScroll = 0; carPassed = 0; gScore = 0;
+  for (int i = 0; i < CAR_OBS; i++) carObs[i].live = false;
+  carObs[0].live = true; carObs[0].lane = random(CAR_LANES); carObs[0].y = -12;
+}
+static void carStep() {
+  float tx, ty;
+  tiltRead(tx, ty);
+  if (!carLatch && tx > 0.28f)  { if (carLane < CAR_LANES - 1) carLane++; carLatch = true; }
+  if (!carLatch && tx < -0.28f) { if (carLane > 0) carLane--;             carLatch = true; }
+  if (fabsf(tx) < 0.14f) carLatch = false;
+
+  carScroll += carSpeed;
+  if (carScroll > 1000) carScroll -= 1000;
+
+  int live = 0;
+  for (int i = 0; i < CAR_OBS; i++) {
+    if (!carObs[i].live) continue;
+    live++;
+    carObs[i].y += carSpeed;
+    if (carObs[i].y > 64) {
+      carObs[i].live = false;
+      carPassed++;
+      gScore += 10;
+      if (carPassed % 5 == 0 && carSpeed < 3.2f) carSpeed += 0.18f;
+      continue;
+    }
+    // hit?
+    if (carObs[i].lane == carLane &&
+        carObs[i].y + CAR_H > CAR_Y && carObs[i].y < CAR_Y + CAR_H) { gState = GS_OVER; return; }
+  }
+  // Feed in the next one only once the most recent has come far enough
+  // down. Gating on the lowest one instead let them pile up together at
+  // the top, and three abreast is a wall, not a challenge. The gap grows
+  // with speed, so there is always time to read it.
+  float highest = 1000;
+  for (int i = 0; i < CAR_OBS; i++) if (carObs[i].live && carObs[i].y < highest) highest = carObs[i].y;
+  if (live < CAR_OBS && highest > 20.0f + carSpeed * 9.0f) {
+    // Whatever is still near the top is what you have to thread. Spawn
+    // only into a lane that is clear there, and never take the last one:
+    // a wall across all three would be unavoidable, not difficult.
+    bool taken[CAR_LANES];
+    for (int l = 0; l < CAR_LANES; l++) taken[l] = false;
+    int nTaken = 0;
+    for (int k = 0; k < CAR_OBS; k++)
+      if (carObs[k].live && carObs[k].y < 30 && !taken[carObs[k].lane]) { taken[carObs[k].lane] = true; nTaken++; }
+    if (nTaken >= CAR_LANES - 1) return;
+    int freeLane[CAR_LANES], nf = 0;
+    for (int l = 0; l < CAR_LANES; l++) if (!taken[l]) freeLane[nf++] = l;
+    for (int i = 0; i < CAR_OBS; i++) if (!carObs[i].live) {
+      carObs[i].live = true;
+      carObs[i].y = -12;
+      carObs[i].lane = freeLane[random(nf)];
+      break;
+    }
+  }
+}
+static void carBody(int x, int y, bool mine) {
+  oled.drawRoundRect(x, y, CAR_W, CAR_H, 3, SSD1306_WHITE);
+  if (mine) { oled.fillRect(x + 3, y + 3, CAR_W - 6, 3, SSD1306_WHITE); }
+  else      { oled.fillRect(x + 2, y + 2, CAR_W - 4, CAR_H - 4, SSD1306_WHITE); }
+}
+static void carDraw() {
+  oled.drawFastVLine(CAR_LEFT - 2, 12, 52, SSD1306_WHITE);
+  oled.drawFastVLine(CAR_LEFT + CAR_LANES * CAR_LANEW + 1, 12, 52, SSD1306_WHITE);
+  int off = ((int)carScroll) % 12;
+  for (int l = 1; l < CAR_LANES; l++) {
+    int x = CAR_LEFT + l * CAR_LANEW;
+    for (int y = 12 - off; y < 64; y += 12) oled.drawFastVLine(x, max(12, y), min(6, 64 - y), SSD1306_WHITE);
+  }
+  for (int i = 0; i < CAR_OBS; i++)
+    if (carObs[i].live) carBody(carLaneX(carObs[i].lane), (int)carObs[i].y, false);
+  carBody(carLaneX(carLane), CAR_Y, true);
+}
+
+// ---------------- Catch ----------------
+#define CT_BASK 22
+#define CT_Y    56
+#define CT_MAX  6
+float ctX;
+struct CtItem { float x, y, v; bool live, bad; };
+CtItem ctIt[CT_MAX];
+int   ctLives = 3;
+unsigned long ctNext = 0;
+
+static void ctReset() {
+  ctX = (SCRW - CT_BASK) / 2; ctLives = 3; gScore = 0;
+  for (int i = 0; i < CT_MAX; i++) ctIt[i].live = false;
+  ctNext = millis() + 400;
+}
+static void ctStep() {
+  float tx, ty;
+  tiltRead(tx, ty);
+  ctX = constrain(ctX + tx * 26.0f, 0.0f, (float)(SCRW - CT_BASK));
+
+  if (millis() > ctNext) {
+    for (int i = 0; i < CT_MAX; i++) if (!ctIt[i].live) {
+      ctIt[i].live = true;
+      ctIt[i].bad = random(100) < 28;
+      ctIt[i].x = 4 + random(SCRW - 12);
+      ctIt[i].y = 12;
+      ctIt[i].v = 0.55f + (gScore / 400.0f);
+      if (ctIt[i].v > 2.0f) ctIt[i].v = 2.0f;
+      break;
+    }
+    unsigned long gap = 900 - min(500, gScore);
+    ctNext = millis() + gap + random(300);
+  }
+
+  for (int i = 0; i < CT_MAX; i++) {
+    if (!ctIt[i].live) continue;
+    ctIt[i].y += ctIt[i].v;
+    if (ctIt[i].y >= CT_Y - 1 && ctIt[i].y <= CT_Y + 4 &&
+        ctIt[i].x >= ctX - 2 && ctIt[i].x <= ctX + CT_BASK + 2) {
+      ctIt[i].live = false;
+      if (ctIt[i].bad) { ctLives--; if (ctLives <= 0) { gState = GS_OVER; return; } }
+      else gScore += 10;
+      continue;
+    }
+    if (ctIt[i].y > 64) ctIt[i].live = false;
+  }
+}
+static void ctDraw() {
+  oled.drawFastHLine((int)ctX, CT_Y + 3, CT_BASK, SSD1306_WHITE);
+  oled.drawFastVLine((int)ctX, CT_Y, 4, SSD1306_WHITE);
+  oled.drawFastVLine((int)ctX + CT_BASK - 1, CT_Y, 4, SSD1306_WHITE);
+  for (int i = 0; i < CT_MAX; i++) {
+    if (!ctIt[i].live) continue;
+    int x = (int)ctIt[i].x, y = (int)ctIt[i].y;
+    if (ctIt[i].bad) {                       // the ones to let through
+      oled.drawLine(x - 2, y - 2, x + 2, y + 2, SSD1306_WHITE);
+      oled.drawLine(x + 2, y - 2, x - 2, y + 2, SSD1306_WHITE);
+    } else oled.fillRect(x - 1, y - 1, 3, 3, SSD1306_WHITE);
+  }
+  for (int i = 0; i < ctLives; i++) oled.fillRect(122 - i * 4, 12, 2, 2, SSD1306_WHITE);
+}
+
+// ---------------- Pong ----------------
+#define PG_PAD 22
+#define PG_MY  59
+#define PG_AI  13
+float pgMy, pgAi, pgX, pgY, pgVx, pgVy;
+int   pgMe = 0, pgThem = 0;
+#define PG_WIN 7
+
+static void pgServe(bool toMe) {
+  pgX = SCRW / 2; pgY = 36;
+  pgVx = (random(2) ? 0.8f : -0.8f);
+  pgVy = toMe ? 1.0f : -1.0f;
+}
+static void pgReset() {
+  pgMy = pgAi = (SCRW - PG_PAD) / 2;
+  pgMe = pgThem = 0; gScore = 0;
+  pgServe(random(2));
+}
+static void pgStep() {
+  float tx, ty;
+  tiltRead(tx, ty);
+  pgMy = constrain(pgMy + tx * 26.0f, 0.0f, (float)(SCRW - PG_PAD));
+
+  // the other side is beatable on purpose: it cannot quite keep up
+  float want = pgX - PG_PAD / 2;
+  float d = want - pgAi;
+  float lim = 1.02f + 0.04f * (pgMe + pgThem);      // keeps up, but not perfectly
+  if (lim > 1.5f) lim = 1.5f;
+  pgAi += constrain(d, -lim, lim);
+  pgAi = constrain(pgAi, 0.0f, (float)(SCRW - PG_PAD));
+
+  pgX += pgVx; pgY += pgVy;
+  if (pgX < 1)        { pgX = 1;        pgVx = -pgVx; }
+  if (pgX > SCRW - 2) { pgX = SCRW - 2; pgVx = -pgVx; }
+
+  if (pgVy > 0 && pgY >= PG_MY - 2 && pgY <= PG_MY + 2 && pgX >= pgMy - 1 && pgX <= pgMy + PG_PAD + 1) {
+    pgY = PG_MY - 2; pgVy = -fabsf(pgVy) * 1.04f;      // no endless rallies
+    if (pgVy < -2.1f) pgVy = -2.1f;
+    pgVx = constrain(pgVx + (((pgX - pgMy) / PG_PAD) - 0.5f) * 1.0f, -1.6f, 1.6f);
+  }
+  if (pgVy < 0 && pgY <= PG_AI + 3 && pgY >= PG_AI - 1 && pgX >= pgAi - 1 && pgX <= pgAi + PG_PAD + 1) {
+    pgY = PG_AI + 3; pgVy = fabsf(pgVy) * 1.04f;
+    if (pgVy > 2.1f) pgVy = 2.1f;
+    pgVx = constrain(pgVx + (((pgX - pgAi) / PG_PAD) - 0.5f) * 1.0f, -1.6f, 1.6f);
+  }
+
+  if (pgY > 63) { pgThem++; if (pgThem >= PG_WIN) { gState = GS_OVER; return; } pgServe(false); }
+  if (pgY < 12) { pgMe++;   gScore = pgMe * 10;
+                  if (pgMe >= PG_WIN) { gState = GS_OVER; return; } pgServe(true); }
+}
+static void pgDraw() {
+  for (int x = 2; x < SCRW - 2; x += 6) oled.drawFastHLine(x, 36, 3, SSD1306_WHITE);
+  oled.fillRect((int)pgMy, PG_MY, PG_PAD, 3, SSD1306_WHITE);
+  oled.fillRect((int)pgAi, PG_AI, PG_PAD, 3, SSD1306_WHITE);
+  oled.fillRect((int)pgX - 1, (int)pgY - 1, 2, 2, SSD1306_WHITE);
+}
+
+// ---------------- Roll ----------------
+//  The one that leans hardest on the sensor: the ball carries momentum,
+//  so you have to lead it and then catch it again.
+#define RL_HOLES 7
+float rlX, rlY, rlVx, rlVy;
+int   rlLives = 3, rlLevel = 1, rlN = 0;
+struct Hole { int8_t x, y; };
+Hole rlH[RL_HOLES];
+int8_t rlGx, rlGy;
+
+#define RL_GW 30
+#define RL_GH 12
+static bool rlBlockedAt(int px, int py) {
+  for (int i = 0; i < rlN; i++) {
+    int dx = px - rlH[i].x, dy = py - rlH[i].y;
+    if (dx * dx + dy * dy < 64) return true;        // keep 8px clear of a hole
+  }
+  return false;
+}
+// A level where the holes happen to fence the goal off is not hard, it
+// is broken. Flood fill a coarse grid from the start and only keep a
+// layout the ball can actually get through.
+static bool rlReachable() {
+  static uint8_t seen[RL_GW * RL_GH];
+  static uint16_t q[RL_GW * RL_GH];
+  memset(seen, 0, sizeof(seen));
+  int head = 0, tail = 0;
+  int sx = constrain((12 - 3) / 4, 0, RL_GW - 1),  sy = constrain((20 - 15) / 4, 0, RL_GH - 1);
+  int gx = constrain((rlGx - 3) / 4, 0, RL_GW - 1), gy = constrain((rlGy - 15) / 4, 0, RL_GH - 1);
+  seen[sy * RL_GW + sx] = 1;
+  q[tail++] = sy * RL_GW + sx;
+  const int8_t D[4][2] = { {1,0}, {-1,0}, {0,1}, {0,-1} };
+  while (head < tail) {
+    int c = q[head++];
+    int cx = c % RL_GW, cy = c / RL_GW;
+    if (cx == gx && cy == gy) return true;
+    for (int d = 0; d < 4; d++) {
+      int nx = cx + D[d][0], ny = cy + D[d][1];
+      if (nx < 0 || ny < 0 || nx >= RL_GW || ny >= RL_GH) continue;
+      int n = ny * RL_GW + nx;
+      if (seen[n]) continue;
+      if (rlBlockedAt(3 + nx * 4 + 2, 15 + ny * 4 + 2)) continue;
+      seen[n] = 1;
+      q[tail++] = n;
+    }
+  }
+  return false;
+}
+
+static void rlPlace() {
+  rlN = min(RL_HOLES, 2 + rlLevel);
+  for (int attempt = 0; attempt < 16; attempt++) {
+    for (int i = 0; i < rlN; i++) {
+      rlH[i].x = 64; rlH[i].y = 40;                 // a sane spot if placing fails
+      for (int tries = 0; tries < 40; tries++) {
+        int8_t hx = 12 + random(SCRW - 24), hy = 20 + random(38);
+        if (abs(hx - 12) + abs(hy - 20) < 26) continue;      // not on the start
+        bool clash = false;
+        for (int k = 0; k < i; k++)
+          if (abs(rlH[k].x - hx) < 14 && abs(rlH[k].y - hy) < 14) clash = true;
+        if (clash) continue;
+        rlH[i].x = hx; rlH[i].y = hy;
+        break;
+      }
+    }
+    // A goal sitting on a hole can never be reached, so keep it clear.
+    for (int tries = 0; tries < 60; tries++) {
+      rlGx = 20 + random(SCRW - 40);
+      rlGy = 20 + random(36);
+      if (abs(rlGx - 12) + abs(rlGy - 20) < 40) continue;
+      bool clear = true;
+      for (int i = 0; i < rlN; i++)
+        if (abs(rlH[i].x - rlGx) < 15 && abs(rlH[i].y - rlGy) < 15) clear = false;
+      if (clear) break;
+    }
+    if (rlReachable()) return;
+  }
+}
+static void rlServe() { rlX = 12; rlY = 20; rlVx = rlVy = 0; }
+static void rlReset() { rlLives = 3; rlLevel = 1; gScore = 0; rlPlace(); rlServe(); }
+static void rlStep() {
+  float tx, ty;
+  tiltRead(tx, ty);
+  rlVx += tx * 0.42f;
+  rlVy -= ty * 0.42f;                    // tilting away rolls it up the screen
+  rlVx *= 0.93f; rlVy *= 0.93f;
+  rlVx = constrain(rlVx, -2.4f, 2.4f);
+  rlVy = constrain(rlVy, -2.4f, 2.4f);
+  rlX += rlVx; rlY += rlVy;
+
+  if (rlX < 3)        { rlX = 3;        rlVx = -rlVx * 0.5f; }
+  if (rlX > SCRW - 4) { rlX = SCRW - 4; rlVx = -rlVx * 0.5f; }
+  if (rlY < 15)       { rlY = 15;       rlVy = -rlVy * 0.5f; }
+  if (rlY > 60)       { rlY = 60;       rlVy = -rlVy * 0.5f; }
+
+  for (int i = 0; i < rlN; i++) {
+    float dx = rlX - rlH[i].x, dy = rlY - rlH[i].y;
+    if (dx * dx + dy * dy < 20) {
+      rlLives--;
+      if (rlLives <= 0) { gState = GS_OVER; return; }
+      rlServe();
+      return;
+    }
+  }
+  float gx = rlX - rlGx, gy = rlY - rlGy;
+  if (gx * gx + gy * gy < 26) {
+    gScore += 50;
+    rlLevel++;
+    rlPlace();
+    rlServe();
+  }
+}
+static void rlDraw() {
+  for (int i = 0; i < rlN; i++) {
+    oled.drawCircle(rlH[i].x, rlH[i].y, 4, SSD1306_WHITE);
+    oled.drawCircle(rlH[i].x, rlH[i].y, 2, SSD1306_WHITE);
+  }
+  oled.drawRect(rlGx - 4, rlGy - 4, 9, 9, SSD1306_WHITE);
+  oled.fillRect(rlGx - 2, rlGy - 2, 5, 5, SSD1306_WHITE);
+  oled.fillCircle((int)rlX, (int)rlY, 2, SSD1306_WHITE);
+  for (int i = 0; i < rlLives; i++) oled.fillRect(122 - i * 4, 12, 2, 2, SSD1306_WHITE);
+}
+
+// ================================================================
+//  SHARED
+// ================================================================
+static const char* bestKey(int g) {
+  switch (g) {
+    case G_SNAKE: return "bSnake";
+    case G_BRICK: return "bBrick";
+    case G_CAR:   return "bCar";
+    case G_CATCH: return "bCatch";
+    case G_PONG:  return "bPong";
+    default:      return "bRoll";
+  }
+}
+static void gameReset(int g) {
+  switch (g) {
+    case G_SNAKE: snReset(); break;
+    case G_BRICK: brReset(); break;
+    case G_CAR:   carReset(); break;
+    case G_CATCH: ctReset(); break;
+    case G_PONG:  pgReset(); break;
+    default:      rlReset(); break;
+  }
+}
 static void gameStart(int which) {
-  gState = tiltTaught() ? GS_CAL_STILL : GS_CAL_STILL;   // rest is measured every time
+  gState = GS_CAL_STILL;                 // the rest position is measured every time
   calAcc[0] = calAcc[1] = calAcc[2] = 0; calN = 0;
   gStamp = millis();
-  if (which == G_SNAKE) snReset(); else brReset();
+  gameReset(which);
+}
+static const char* gameHint(int g) {
+  switch (g) {
+    case G_SNAKE: return "Tilt to steer";
+    case G_BRICK: return "Tilt to slide";
+    case G_CAR:   return "Tilt to change lane";
+    case G_CATCH: return "Tilt to catch";
+    case G_PONG:  return "Tilt to return it";
+    default:      return "Tilt to roll it";
+  }
 }
 
 // the teaching steps, and the short hold that finds the rest position
-static void gameCalibrate(int which) {
+static void gameCalibrate() {
   readSensors();
   float v[3] = { ax, ay, az };
 
@@ -1260,7 +1645,6 @@ static void gameCalibrate(int which) {
     }
     return;
   }
-
   if (gState == GS_CAL_RIGHT) {
     int best = -1; float bd = 0.30f;
     for (int i = 0; i < 3; i++) {
@@ -1276,9 +1660,8 @@ static void gameCalibrate(int which) {
     }
     return;
   }
-
   if (gState == GS_CAL_AWAY) {
-    if (millis() - gStamp < 700) return;          // let the hand settle first
+    if (millis() - gStamp < 700) return;
     for (int i = 0; i < 3; i++) {
       if (i == gravAx || i == mapAxX) continue;
       float d = v[i] - restV[i];
@@ -1288,8 +1671,6 @@ static void gameCalibrate(int which) {
         saveTiltMap();
         gState = GS_READY;
         gStamp = millis();
-        Serial.printf("tilt taught: x=axis%d(%+d) y=axis%d(%+d) grav=axis%d\n",
-                      mapAxX, mapSgnX, mapAxY, mapSgnY, gravAx);
         return;
       }
     }
@@ -1301,37 +1682,30 @@ static void serviceGame() {
   unsigned long now = millis();
   readSensors();                       // the tick is faster than the input poll
 
-  if (gState <= GS_CAL_AWAY) { gameCalibrate(which); return; }
+  if (gState <= GS_CAL_AWAY) { gameCalibrate(); return; }
   if (gState == GS_READY) {
     if (now - gStamp > 1800) { gState = GS_PLAY; gNext = now; }
     return;
   }
   if (gState != GS_PLAY) return;
+  if ((long)(now - gNext) < 0) return;
 
-  if (which == G_SNAKE) {
-    if ((long)(now - gNext) < 0) return;
-    gNext = now + snPace;
-    snStep();
-  } else {
-    if ((long)(now - gNext) < 0) return;
-    gNext = now + 28;
-    brStepGame();
+  switch (which) {
+    case G_SNAKE: gNext = now + snPace; snStep();   break;
+    case G_BRICK: gNext = now + 28;     brStepGame(); break;
+    case G_CAR:   gNext = now + 28;     carStep();  break;
+    case G_CATCH: gNext = now + 28;     ctStep();   break;
+    case G_PONG:  gNext = now + 26;     pgStep();   break;
+    default:      gNext = now + 26;     rlStep();   break;
   }
 
   if (gState == GS_OVER && gScore > gBest[which]) {
     gBest[which] = gScore;
-    prefs.putInt(which == G_SNAKE ? "bestSnake" : "bestBrick", gScore);
+    prefs.putInt(bestKey(which), gScore);
   }
 }
 
-// ---------------- the screens ----------------
-static void padIcon(int cx, int cy) {
-  oled.drawRoundRect(cx - 15, cy - 8, 30, 16, 5, SSD1306_WHITE);
-  oled.drawFastHLine(cx - 11, cy, 7, SSD1306_WHITE);      // the cross
-  oled.drawFastVLine(cx - 8, cy - 3, 7, SSD1306_WHITE);
-  oled.fillCircle(cx + 7, cy - 2, 2, SSD1306_WHITE);      // and the buttons
-  oled.fillCircle(cx + 11, cy + 3, 2, SSD1306_WHITE);
-}
+// ---------------- the icons ----------------
 static void snakeIcon(int x, int y) {
   const int8_t P[8][2] = { {2,4},{6,4},{10,4},{14,4},{14,8},{14,12},{18,12},{22,12} };
   for (int i = 0; i < 8; i++) oled.fillRect(x + P[i][0], y + P[i][1], 3, 3, SSD1306_WHITE);
@@ -1344,21 +1718,79 @@ static void brickIcon(int x, int y) {
   oled.fillRect(x + 9, y + 22, 12, 2, SSD1306_WHITE);
   oled.fillRect(x + 20, y + 18, 2, 2, SSD1306_WHITE);
 }
+static void carIcon(int x, int y) {
+  for (int k = 0; k < 2; k++)
+    for (int yy = y + 1; yy < y + 23; yy += 6)
+      oled.drawFastVLine(x + 8 + k * 14, yy, 3, SSD1306_WHITE);
+  oled.drawRoundRect(x + 11, y + 13, 9, 10, 2, SSD1306_WHITE);
+  oled.fillRect(x + 13, y + 15, 5, 3, SSD1306_WHITE);
+  oled.fillRect(x + 12, y + 2, 7, 7, SSD1306_WHITE);
+}
+static void catchIcon(int x, int y) {
+  oled.drawFastHLine(x + 8, y + 21, 14, SSD1306_WHITE);
+  oled.drawFastVLine(x + 8, y + 16, 6, SSD1306_WHITE);
+  oled.drawFastVLine(x + 21, y + 16, 6, SSD1306_WHITE);
+  oled.fillRect(x + 13, y + 3, 3, 3, SSD1306_WHITE);
+  oled.fillRect(x + 19, y + 10, 3, 3, SSD1306_WHITE);
+  oled.drawLine(x + 5, y + 6, x + 9, y + 10, SSD1306_WHITE);
+  oled.drawLine(x + 9, y + 6, x + 5, y + 10, SSD1306_WHITE);
+}
+static void pongIcon(int x, int y) {
+  oled.fillRect(x + 6, y + 3, 12, 2, SSD1306_WHITE);
+  oled.fillRect(x + 12, y + 20, 12, 2, SSD1306_WHITE);
+  for (int yy = y + 9; yy < y + 17; yy += 4) oled.drawFastHLine(x + 4, yy, 3, SSD1306_WHITE);
+  oled.fillRect(x + 16, y + 11, 3, 3, SSD1306_WHITE);
+}
+static void rollIcon(int x, int y) {
+  oled.drawCircle(x + 7, y + 6, 4, SSD1306_WHITE);
+  oled.drawCircle(x + 7, y + 6, 2, SSD1306_WHITE);
+  oled.fillCircle(x + 20, y + 9, 3, SSD1306_WHITE);
+  oled.drawRect(x + 17, y + 17, 8, 8, SSD1306_WHITE);
+  oled.fillRect(x + 19, y + 19, 4, 4, SSD1306_WHITE);
+}
+static void gameIcon(int g, int x, int y) {
+  switch (g) {
+    case G_SNAKE: snakeIcon(x, y); break;
+    case G_BRICK: brickIcon(x, y); break;
+    case G_CAR:   carIcon(x, y);   break;
+    case G_CATCH: catchIcon(x, y); break;
+    case G_PONG:  pongIcon(x, y);  break;
+    default:      rollIcon(x, y);  break;
+  }
+}
 
+// ---------------- the screens ----------------
+static void padIcon(int cx, int cy) {
+  oled.drawRoundRect(cx - 15, cy - 8, 30, 16, 5, SSD1306_WHITE);
+  oled.drawFastHLine(cx - 11, cy, 7, SSD1306_WHITE);
+  oled.drawFastVLine(cx - 8, cy - 3, 7, SSD1306_WHITE);
+  oled.fillCircle(cx + 7, cy - 2, 2, SSD1306_WHITE);
+  oled.fillCircle(cx + 11, cy + 3, 2, SSD1306_WHITE);
+}
+
+// Two to a page, and the page turns itself as the pick walks past the
+// end of it. The dots along the bottom say how many pages there are.
 static void drawGameList() {
   oled.clearDisplay();
   char r[10];
   snprintf(r, sizeof(r), "%d/%d", itemIdx + 1, G_COUNT);
   titleBar("GAMES", r);
-  const int TX[2] = { 10, 76 }, TY = 15, TW = 42, TH = 30;
-  for (int i = 0; i < G_COUNT; i++) {
-    if (i == itemIdx) oled.drawRoundRect(TX[i] - 2, TY - 2, TW, TH, 4, SSD1306_WHITE);
-    if (i == G_SNAKE) snakeIcon(TX[i] + 4, TY + 4);
-    else              brickIcon(TX[i] + 4, TY + 3);
+  int page = itemIdx / G_PER_PAGE;
+  const int TX[2] = { 10, 76 }, TY = 14, TW = 42, TH = 30;
+  for (int k = 0; k < G_PER_PAGE; k++) {
+    int g = page * G_PER_PAGE + k;
+    if (g >= G_COUNT) break;
+    if (g == itemIdx) oled.drawRoundRect(TX[k] - 2, TY - 2, TW, TH, 4, SSD1306_WHITE);
+    gameIcon(g, TX[k] + 5, TY + 3);
   }
   char l[26];
   snprintf(l, sizeof(l), "%s   best %d", G_NAME[itemIdx], gBest[itemIdx]);
-  ctr(l, 50, 1);
+  ctr(l, 48, 1);
+  int dx = SCRW / 2 - (G_PAGES * 8) / 2 + 4;
+  for (int p = 0; p < G_PAGES; p++) {
+    if (p == page) oled.fillCircle(dx + p * 8, 60, 2, SSD1306_WHITE);
+    else           oled.drawCircle(dx + p * 8, 60, 1, SSD1306_WHITE);
+  }
   oled.display();
 }
 
@@ -1394,9 +1826,21 @@ static void drawGamePlay() {
     return;
   }
 
+  char t[14], r[14];
+  switch (which) {
+    case G_BRICK: snprintf(t, sizeof(t), "BRICK L%d", brLevel); break;
+    case G_ROLL:  snprintf(t, sizeof(t), "ROLL L%d", rlLevel);  break;
+    case G_CAR:   snprintf(t, sizeof(t), "CAR");                break;
+    case G_CATCH: snprintf(t, sizeof(t), "CATCH");              break;
+    case G_PONG:  snprintf(t, sizeof(t), "PONG");               break;
+    default:      snprintf(t, sizeof(t), "SNAKE");              break;
+  }
+  if (which == G_PONG) snprintf(r, sizeof(r), "%d-%d", pgMe, pgThem);
+  else                 snprintf(r, sizeof(r), "%d", gScore);
+
   if (gState == GS_READY) {
-    titleBar(which == G_SNAKE ? "SNAKE" : "BRICK", "");
-    ctr(which == G_SNAKE ? "Tilt to steer" : "Tilt to slide", 22, 1);
+    titleBar(t, "");
+    ctr(gameHint(which), 22, 1);
     long left = 1800 - (long)(millis() - gStamp);
     char c[4];
     snprintf(c, sizeof(c), "%ld", left / 600 + 1);
@@ -1405,12 +1849,15 @@ static void drawGamePlay() {
     return;
   }
 
-  char r[14];
-  if (which == G_SNAKE) snprintf(r, sizeof(r), "%d", gScore);
-  else                  snprintf(r, sizeof(r), "L%d %d", brLives, gScore);
-  titleBar(which == G_SNAKE ? "SNAKE" : "BRICK", r);
-
-  if (which == G_SNAKE) snDraw(); else brDraw();
+  titleBar(t, r);
+  switch (which) {
+    case G_SNAKE: snDraw();  break;
+    case G_BRICK: brDraw();  break;
+    case G_CAR:   carDraw(); break;
+    case G_CATCH: ctDraw();  break;
+    case G_PONG:  pgDraw();  break;
+    default:      rlDraw();  break;
+  }
   if (which == G_BRICK && brStuck && gState == GS_PLAY) ctr("Knock to launch", 44, 1);
 
   if (gState == GS_PAUSE) {
@@ -1420,11 +1867,9 @@ static void drawGamePlay() {
     ctr("2 go on  3 leave", 38, 1);
   }
   if (gState == GS_OVER) {
-    // Brick scores reach four digits, so the two numbers get a line each
-    // rather than sharing one and running out of the box.
     oled.fillRect(4, 13, 120, 46, SSD1306_BLACK);
     oled.drawRect(4, 13, 120, 46, SSD1306_WHITE);
-    ctr("GAME OVER", 17, 1);
+    ctr(which == G_PONG && pgMe >= PG_WIN ? "YOU WIN" : "GAME OVER", 17, 1);
     char l[20];
     snprintf(l, sizeof(l), "Score %d", gScore);       ctr(l, 28, 1);
     snprintf(l, sizeof(l), "Best %d", gBest[which]);  ctr(l, 38, 1);
@@ -3032,7 +3477,7 @@ static void nameCard() {
   oled.drawFastHLine(24, 44, SCRW - 48, SSD1306_WHITE);
   ctr("Your companion", 50, 1);
   oled.display();
-  holdCard(1200);
+  holdCard(900);
 }
 
 // ---------------------------------------------------------------
@@ -3106,8 +3551,7 @@ void setup() {
   loadPrayer();
   loadAdj();
   loadTiltMap();
-  gBest[G_SNAKE] = prefs.getInt("bestSnake", 0);
-  gBest[G_BRICK] = prefs.getInt("bestBrick", 0);
+  for (int g = 0; g < G_COUNT; g++) gBest[g] = prefs.getInt(bestKey(g), 0);
   randomSeed(esp_random());
   swStart = millis();
 
@@ -3180,10 +3624,20 @@ void setup() {
   knockIcon(19, 51);
   at(32, 48, "Knock to begin");
   oled.display();
-  holdCard(2500);                      // a knock ends it, and it never dawdles
+  holdCard(2000);                      // a knock ends it, and it never dawdles
 
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
   lastActive = millis();
+  drawHome();                          // on screen before anything can block
+
+  // These all started at zero, so the first pass through loop() fired
+  // every one of them back to back: weather, then prayer, then a story.
+  // Between them that is the better part of half a minute of blocking
+  // network calls, during which nothing redraws and no knock is acted
+  // on. The card stayed up and the device looked wedged. Stagger them.
+  nextWx        = millis() + 3000;
+  nextPrayerTry = millis() + 8000;
+  nextStory     = millis() + 25000;
   Serial.printf("up. fw %s boot #%lu  shelf %d  fs %s\n",
                 FW_VERSION, (unsigned long)cBoot, readCount, fsOk ? "ok" : "none");
 }
@@ -3199,23 +3653,27 @@ void loop() {
   serviceSession();
   servicePrayerAlert();
 
+  // Fetching blocks for seconds at a time, so it waits for a lull rather
+  // than freezing the screen under someone's hand.
+  bool idle = (now - lastActive) > 2500;
+
   if (online()) {
     // keep trying for a clock until one lands, then leave it alone
-    if (!timeOk && (long)(now - nextTimeTry) >= 0) {
+    if (!timeOk && idle && (long)(now - nextTimeTry) >= 0) {
       nextTimeTry = now + 20000;
       trySyncTime(1500);
     }
-    if (!asleep && (long)(now - nextWx) >= 0) { nextWx = now + 900000UL; fetchWeather(); }
+    if (!asleep && idle && (long)(now - nextWx) >= 0) { nextWx = now + 900000UL; fetchWeather(); }
 
     struct tm t;
     bool haveDay = timeOk && getLocalTime(&t, 5);
-    if ((long)(now - nextPrayerTry) >= 0 && haveDay &&
+    if (idle && (long)(now - nextPrayerTry) >= 0 && haveDay &&
         (!prayerOk || prayerDay != t.tm_yday)) {
       nextPrayerTry = now + 300000UL;
       fetchPrayer();
     }
     // a fresh read every six hours, and the queue left over from a reload
-    if ((long)(now - nextStory) >= 0 && cfgKey.length() && !storyBusy && readCount < READS_MAX) {
+    if (idle && (long)(now - nextStory) >= 0 && cfgKey.length() && !storyBusy && readCount < READS_MAX) {
       nextStory = now + 21600000UL;
       fetchStory(!asleep && screen == S_READS);
     }
