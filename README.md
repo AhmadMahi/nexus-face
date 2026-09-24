@@ -28,7 +28,14 @@ leans, so it learns which way round it is sitting and you see what each
 one does. Every boot after that takes a moment to settle first, because
 the resting position moves whenever the thing is picked up and put down.
 Inside a game, leaning plays the game and knocking handles pause and
-leave.
+leave. While leaning is on, the fall animation is not armed at all: a
+hand turning the device over unloads it constantly and sets it off.
+
+Rest is measured in your hand, because that is where it asks you to hold
+it. Put the device down somewhere else afterwards and every lean would
+read as already held over, so once it has sat still for five seconds the
+resting position settles to wherever it actually is. That takes about six
+seconds and needs nothing from you.
 
 ## Knocking
 
@@ -131,6 +138,11 @@ the page.
 It runs whenever the device is on its network, at the address shown on the
 SYSTEM screen. Two tabs: the work session, messages and the shelf on one,
 and everything configurable on the other.
+
+Control and updating are both on the page as well as on the device, so
+there is a way back if a setting on the face turns out to be awkward to
+reach. The page can switch between taps and tilt, install the newest
+release, or list the earlier ones and put any of them back.
 
 ## Credentials
 

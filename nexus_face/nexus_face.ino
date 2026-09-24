@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.0.2"
+#define FW_VERSION "2.0.3"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -250,7 +250,8 @@ bool asleep = false, screenOn = true, timeOk = false, rescueAP = false, fsOk = f
 unsigned long lastActive = 0, lastDraw = 0, lastPoll = 0, reactUntil = 0, lastShake = 0;
 unsigned long nextTimeTry = 0, swStart = 0, inputMuteUntil = 0;
 unsigned long lastLowG = 0, lastFallAt = 0;
-float lastTx = 0, lastTy = 0;
+float lastRawX = 0, lastRawY = 0, lastRawZ = 0;
+unsigned long steadySince = 0;
 uint32_t cTap = 0, cDouble = 0, cTriple = 0, cQuad = 0, cFall = 0, cShake = 0, cBoot = 0;
 uint8_t  burst = 0;
 unsigned long burstStart = 0;
@@ -308,7 +309,7 @@ static void startSensors() {
     // at the sensitive end of the datasheet range and a hand turning the
     // thing over tripped it constantly.
     wReg(adxl, A_THRESH_FF, 0x06);  wReg(adxl, A_TIME_FF, 0x28);
-    wReg(adxl, A_INT_ENABLE, INT_TAP1 | INT_FF);   // single taps only, we count them
+    wReg(adxl, A_INT_ENABLE, INT_TAP1 | INT_FF);   // reset later by applyFallInt()
     wReg(adxl, A_POWER_CTL, 0x08);
     delay(20); rReg(adxl, A_INT_SOURCE);
   }
@@ -321,6 +322,15 @@ static void startSensors() {
     wReg(mpu, M_GYRO_CFG, 0x00); wReg(mpu, M_ACC_CFG, 0x00);
   }
 }
+// With leaning switched on the device lives in a hand, and a hand unloads
+// it constantly while turning it over. The fall animation is not worth
+// the false alarms there, so it is simply not armed in that mode.
+static void applyFallInt() {
+  if (!adxl) return;
+  wReg(adxl, A_INT_ENABLE, cfgTilt ? (uint8_t)INT_TAP1 : (uint8_t)(INT_TAP1 | INT_FF));
+  rReg(adxl, A_INT_SOURCE);                  // drop anything already pending
+}
+
 static void readSensors() {
   uint8_t b[14];
   if (adxl && rBlk(adxl, A_DATAX0, b, 6)) {
@@ -2077,9 +2087,10 @@ static void navCalService() {
         for (int i = 0; i < 3; i++) restV[i] = calAcc[i] / calN;
         gravAx = 0;
         for (int i = 1; i < 3; i++) if (fabsf(restV[i]) > fabsf(restV[gravAx])) gravAx = i;
-        if (!navCalTeach && tiltTaught() && mapAxX != gravAx && mapAxY != gravAx) {
-          navCal = NC_OFF;                  // a boot check: the axes are known
+        if (!navCalTeach && tiltTaught()) {
+          navCal = NC_OFF;                  // a boot check: keep the taught axes
           navLatch = true;
+          steadySince = 0;
         } else {
           mapAxX = mapAxY = -1;
           navCal = NC_UP;
@@ -3056,6 +3067,7 @@ static void knockOne() {
                        applyBright(); prefs.putInt("bri", cfgBright); break; }
       case C_CONTROL: cfgTilt = !cfgTilt;
                      prefs.putBool("ctrl", cfgTilt);
+                     applyFallInt();
                      if (cfgTilt) navCalBegin(true);        // show how, there and then
                      break;
       case C_SLEEP:  cfgSleepIdx = (cfgSleepIdx + 1) % SLEEP_N;
@@ -3278,8 +3290,28 @@ static void tiltNav() {
   // leaning it never shows up in the movement check that keeps it awake:
   // it would doze off under your hand mid gesture. Watch the lean itself
   // change instead. One left standing at an angle still settles down.
-  if (fabsf(tx - lastTx) > 0.03f || fabsf(ty - lastTy) > 0.03f) lastActive = now;
-  lastTx = tx; lastTy = ty;
+  // Judge stillness from the sensor itself, not from the lean. The lean
+  // is measured against rest, and the correction below moves rest, so a
+  // lean based test would read its own correction as movement, stop
+  // itself, and crawl. Raw cannot fight itself.
+  float rawD = fabsf(ax - lastRawX) + fabsf(ay - lastRawY) + fabsf(az - lastRawZ);
+  lastRawX = ax; lastRawY = ay; lastRawZ = az;
+
+  // Gravity has the same magnitude whichever way up it is, so leaning
+  // never showed up in the movement check that keeps it awake.
+  if (rawD > 0.03f) lastActive = now;
+
+  // Rest is measured in your hand, because that is where it asks you to
+  // hold it. Put the thing down afterwards and every lean reads as
+  // already held over: the latch never clears, no gesture fires again,
+  // and nothing refreshes the idle timer, so it dozes and does the same
+  // after every shake. Once it has sat still a while, let rest settle to
+  // wherever it is actually sitting.
+  if (rawD > 0.02f || !steadySince) steadySince = now;
+  else if (!upSince && now - steadySince > 5000) {
+    float v[3] = { ax, ay, az };
+    for (int i = 0; i < 3; i++) restV[i] += (v[i] - restV[i]) * 0.08f;
+  }
 
   if (ty > NAV_TILT_ON) {
     if (!upSince) { upSince = now; upConsumed = false; }
@@ -3353,7 +3385,7 @@ static void input() {
     // The latch trips on any brief unloading, and a hand turning the
     // device over produces those constantly. Believe it only if the low
     // reading is one we saw ourselves, and never twice in a few seconds.
-    if ((s & INT_FF) && lastLowG && now - lastLowG < 400 &&
+    if (!cfgTilt && (s & INT_FF) && lastLowG && now - lastLowG < 400 &&
         (!lastFallAt || now - lastFallAt > 4000)) {
       lastFallAt = now;
       wake("fall"); onFall(); return;
@@ -3503,6 +3535,18 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
     <button class="g" onclick="go(9)">System</button>
   </div></div>
 
+  <h2>Control</h2><div class="card">
+    <table><tr><td>Driven by</td><td id="ctrlNow">taps</td></tr></table>
+    <div class="row" style="margin-top:8px">
+      <button class="g" onclick="setCtrl(0)">Taps only</button>
+      <button class="g" onclick="setCtrl(1)">Taps and tilt</button>
+    </div>
+    <div style="font-size:12px;color:var(--mut);margin-top:8px;text-align:left">
+      Switching tilt on here keeps the leans it already learned, and turns
+      the fall animation off, which a hand sets off constantly. To teach
+      the leans again, use Control on the device itself.</div>
+  </div>
+
   <h2>Reading</h2><div class="card">
     <table><tr><td>Pages turn</td><td id="turnNow">by knock</td></tr></table>
     <div class="row" style="margin-top:8px">
@@ -3527,12 +3571,17 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
     <button onclick="saveAdj()">Save the adjustments</button>
   </div>
 
+  <h2>Update</h2><div class="card">
+    <button onclick="if(confirm('Install the newest release?'))act('/api/update')">Install the newest release</button>
+    <button class="g" onclick="listRel()">List earlier releases</button>
+    <div id="rel"></div>
+  </div>
+
   <h2>System</h2><div class="card"><table id="sys"></table>
     <div class="row" style="margin-top:8px">
-      <button class="g" onclick="act('/api/update')">Check update</button>
       <button class="g" onclick="if(confirm('Reboot?'))act('/api/reboot')">Reboot</button>
-    </div>
-    <button class="g" onclick="act('/api/hotspot')">Turn on the hotspot</button></div>
+      <button class="g" onclick="act('/api/hotspot')">Hotspot</button>
+    </div></div>
 
   <h2>OpenAI</h2><div class="card">
     <div class="sub" id="keyState" style="margin-bottom:8px">no key</div>
@@ -3585,6 +3634,23 @@ window.pasteStory=async function(){
   $('t').textContent='stored, '+(j.count||0)+' on the shelf';
   load();
 }
+window.setCtrl=async function(t){
+  if(t===1&&!confirm('Switch to taps and tilt?'))return;
+  await post('/api/control',{t:t}); $('t').textContent='control set'; load()}
+window.listRel=async function(){
+  $('t').textContent='asking github';
+  const r=await post('/api/releases',{});
+  const j=await r.json().catch(()=>({tags:[]}));
+  const tags=j.tags||[];
+  $('rel').innerHTML=tags.length?tags.map((t,i)=>
+    '<div class="task"><b>'+esc(t)+'</b>'
+    +'<button class="g" onclick="inst('+i+',\''+esc(t)+'\')">install</button></div>').join('')
+    :'<div style="color:var(--mut);font-size:13px;padding:6px 0">nothing came back</div>';
+  $('t').textContent=tags.length+' releases listed'}
+window.inst=async function(i,t){
+  if(!confirm('Put '+t+' on? It will restart when it is done.'))return;
+  $('t').textContent='installing '+t;
+  await post('/api/install',{i:i})}
 window.saveAdj=async function(){
   const d={}; for(let i=0;i<5;i++) d['a'+i]=$('a'+i).value||'0';
   await post('/api/adj',d); $('t').textContent='adjustments saved'; load()}
@@ -3605,6 +3671,7 @@ window.load=async function(){
   $('sub').textContent=(s.asleep?'asleep':'awake')+' · '+s.screen+' · fw '+s.fw;
   $('k1').textContent=s.k1;$('k2').textContent=s.k2;$('k3').textContent=s.k3;$('k4').textContent=s.k4;
   $('turnNow').textContent=s.autoTurn?'automatically':'by knock';
+  $('ctrlNow').textContent=s.control;
   $('nowLabel').textContent=s.running?(s.taskName+'  ·  '+(s.taskIdx+1)+' of '+s.plan.length):'nothing running';
   $('nowTime').textContent=s.running?s.left:'--:--';
   $('nowBar').style.width=(s.running?s.taskPct:0)+'%';
@@ -3749,6 +3816,38 @@ static void setupWeb() {
     for (int i = 0; i < 5; i++) alertDone[i] = 0;   // the times moved, so let today ring again
     web.send(200, "application/json", "{\"ok\":true}");
   });
+  web.on("/api/control", HTTP_POST, []() {
+    bool want = web.arg("t").toInt() != 0;
+    if (want != cfgTilt) {
+      cfgTilt = want;
+      prefs.putBool("ctrl", cfgTilt);
+      applyFallInt();
+      // Never taught the leans? Ask on the device. Otherwise just find
+      // where it is resting now, so the first lean is measured from there.
+      if (cfgTilt) navCalBegin(!tiltTaught());
+    }
+    web.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // The list first, then install by its position in that list. The device
+  // only ever fetches a URL it read from its own releases, never one
+  // handed to it.
+  web.on("/api/releases", HTTP_POST, []() {
+    String o = "{\"tags\":[";
+    if (otaFetchList())
+      for (int i = 0; i < relCount; i++) { o += "\"" + relTag[i] + "\""; if (i < relCount - 1) o += ","; }
+    o += "]}";
+    web.send(200, "application/json", o);
+  });
+  web.on("/api/install", HTTP_POST, []() {
+    int i = web.arg("i").toInt();
+    if (i < 0 || i >= relCount) { web.send(400, "application/json", "{\"ok\":false}"); return; }
+    upTag = relTag[i]; upUrl = relUrl[i];
+    web.send(200, "application/json", "{\"ok\":true}");
+    delay(250);
+    otaInstall();
+  });
+
   web.on("/api/hotspot", HTTP_POST, []() {
     startHotspot();
     web.send(200, "application/json", "{\"ok\":true}");
@@ -4101,6 +4200,7 @@ void setup() {
 
   animWake();
   startSensors();
+  applyFallInt();
   animSenses(1500);
 
   WiFi.mode(WIFI_STA);
