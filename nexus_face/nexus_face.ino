@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "1.4.1"
+#define FW_VERSION "1.4.2"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -209,7 +209,7 @@ static bool sessionRunning() { return taskIdx >= 0 && taskIdx < taskCount; }
 // ---------------- runtime ----------------
 bool asleep = false, screenOn = true, timeOk = false, rescueAP = false, fsOk = false;
 unsigned long lastActive = 0, lastDraw = 0, lastPoll = 0, reactUntil = 0, lastShake = 0;
-unsigned long nextTimeTry = 0, swStart = 0;
+unsigned long nextTimeTry = 0, swStart = 0, inputMuteUntil = 0;
 uint32_t cTap = 0, cDouble = 0, cTriple = 0, cQuad = 0, cFall = 0, cShake = 0, cBoot = 0;
 uint8_t  burst = 0;
 unsigned long burstStart = 0;
@@ -305,6 +305,39 @@ static void clockStr(char* o, size_t n, bool sec) {
   else     snprintf(o, n, "%02d:%02d", t.tm_hour, t.tm_min);
 }
 
+// The eyes are drawn as plain filled shapes by the library. A pupil and
+// a glint on top is what makes them read as eyes rather than as blocks.
+static void drawPupils() {
+  int wl = eyes.eyeLwidthCurrent, hl = eyes.eyeLheightCurrent;
+  if (hl > 12 && wl > 12) {
+    int r  = min(wl, hl) / 4;
+    int cx = eyes.eyeLx + wl / 2, cy = eyes.eyeLy + hl / 2;
+    oled.fillCircle(cx, cy, r, SSD1306_BLACK);
+    oled.fillCircle(cx + r / 2, cy - r / 2, max(1, r / 4), SSD1306_WHITE);
+  }
+  if (eyes.cyclops) return;
+  int wr = eyes.eyeRwidthCurrent, hr = eyes.eyeRheightCurrent;
+  if (hr > 12 && wr > 12) {
+    int r  = min(wr, hr) / 4;
+    int cx = eyes.eyeRx + wr / 2, cy = eyes.eyeRy + hr / 2;
+    oled.fillCircle(cx, cy, r, SSD1306_BLACK);
+    oled.fillCircle(cx + r / 2, cy - r / 2, max(1, r / 4), SSD1306_WHITE);
+  }
+}
+// one animation frame of the face
+static void eyesFrame() {
+  eyes.update();                       // the library clears and draws
+  drawPupils();
+  oled.display();
+}
+
+// a knock, drawn as it sounds: a tap and the rings going out from it
+static void knockIcon(int cx, int cy) {
+  oled.fillCircle(cx, cy, 2, SSD1306_WHITE);
+  oled.drawCircle(cx, cy, 5, SSD1306_WHITE);
+  oled.drawCircle(cx, cy, 8, SSD1306_WHITE);
+}
+
 static void titleBar(const char* title, const char* right) {
   oled.fillRect(0, 0, SCRW, 11, SSD1306_WHITE);
   oled.setTextColor(SSD1306_BLACK);
@@ -318,6 +351,14 @@ static void titleBar(const char* title, const char* right) {
   oled.setTextColor(SSD1306_WHITE);
 }
 // The clock is only worth showing in the bar once it is real.
+static void titleBarC(const char* title) {
+  oled.fillRect(0, 0, SCRW, 11, SSD1306_WHITE);
+  oled.setTextColor(SSD1306_BLACK);
+  oled.setTextSize(1);
+  oled.setCursor((SCRW - (int)strlen(title) * 6) / 2, 2);
+  oled.print(title);
+  oled.setTextColor(SSD1306_WHITE);
+}
 static void bar(const char* title) {
   if (!timeOk) { titleBar(title, ""); return; }
   char t[8];
@@ -1572,7 +1613,7 @@ static void goSleep() {
   applyEyes(cfgEyes);
   eyes.setIdleMode(OFF); eyes.setAutoblinker(OFF);
   eyes.setMood(TIRED); eyes.close();
-  for (int i = 0; i < 26; i++) { eyes.update(); delay(16); }
+  for (int i = 0; i < 26; i++) { eyesFrame(); delay(16); }
   screenPower(false);
   setCpuFrequencyMhz(80);
 }
@@ -1584,7 +1625,7 @@ static void wake(const char* why) {
   screenPower(true);
   eyes.setAutoblinker(ON, 3, 2); eyes.setIdleMode(ON, 2, 2);
   applyEyes(cfgEyes); eyes.open();
-  for (int i = 0; i < 18; i++) { eyes.update(); delay(16); }
+  for (int i = 0; i < 18; i++) { eyesFrame(); delay(16); }
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
   Serial.printf("awake (%s)\n", why);
 }
@@ -1750,12 +1791,12 @@ static void onFall() {
   int keep = screen;
   applyEyes(cfgEyes);
   eyes.setMood(DEFAULT); eyes.setPosition(N); eyes.setVFlicker(ON, 6);
-  for (int i = 0; i < 12; i++) { eyes.update(); delay(16); }
+  for (int i = 0; i < 12; i++) { eyesFrame(); delay(16); }
   eyes.setPosition(S);
-  for (int i = 0; i < 12; i++) { eyes.update(); delay(16); }
+  for (int i = 0; i < 12; i++) { eyesFrame(); delay(16); }
   eyes.setVFlicker(OFF);
   eyes.setHeight(6, 6);
-  for (int i = 0; i < 40; i++) { eyes.update(); delay(16); }
+  for (int i = 0; i < 40; i++) { eyesFrame(); delay(16); }
   applyEyes(cfgEyes);
   screen = keep;
   react(300);
@@ -1776,6 +1817,15 @@ static void settleBurst() {
 static void input() {
   readSensors();
   unsigned long now = millis();
+
+  // A knock that dismissed a card has already been acted on. Swallow the
+  // rest of that burst so it does not also step the carousel.
+  if (now < inputMuteUntil) {
+    if (adxl) rReg(adxl, A_INT_SOURCE);
+    burst = 0;
+    lastActive = now;
+    return;
+  }
 
   if (adxl) {
     uint8_t s = rReg(adxl, A_INT_SOURCE);
@@ -2262,6 +2312,7 @@ static void setupWeb() {
 // ================================================================
 static void bootFrame(const char* caption, int dots) {
   eyes.update();
+  drawPupils();
   if (caption) {
     oled.fillRect(0, 52, SCRW, 12, SSD1306_BLACK);
     char l[26];
@@ -2282,15 +2333,33 @@ static void wakeUpAnimation() {
   eyes.setAutoblinker(OFF); eyes.setIdleMode(OFF);
   eyes.setMood(TIRED);
   eyes.close();
-  for (int i = 0; i < 20; i++) { eyes.update(); delay(22); }
+  for (int i = 0; i < 20; i++) { eyesFrame(); delay(22); }
   eyes.open();
   eyes.setMood(DEFAULT);
-  for (int i = 0; i < 18; i++) { eyes.update(); delay(22); }
-  eyes.setPosition(W); for (int i = 0; i < 12; i++) { eyes.update(); delay(20); }
-  eyes.setPosition(E); for (int i = 0; i < 12; i++) { eyes.update(); delay(20); }
+  for (int i = 0; i < 18; i++) { eyesFrame(); delay(22); }
+  eyes.setPosition(W); for (int i = 0; i < 12; i++) { eyesFrame(); delay(20); }
+  eyes.setPosition(E); for (int i = 0; i < 12; i++) { eyesFrame(); delay(20); }
   eyes.setPosition(DEFAULT);
   eyes.blink();
-  for (int i = 0; i < 10; i++) { eyes.update(); delay(20); }
+  for (int i = 0; i < 10; i++) { eyesFrame(); delay(20); }
+}
+
+// Cards used to run out a fixed delay, so a knock during one did nothing
+// and then arrived late. Now a knock ends the card at once, and the rest
+// of that burst is muted so it does not also move the carousel.
+static bool holdCard(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    if (adxl && (rReg(adxl, A_INT_SOURCE) & INT_TAP1)) {
+      inputMuteUntil = millis() + TAP_WINDOW_MS + 150;
+      burst = 0;
+      lastActive = millis();
+      return true;
+    }
+    web.handleClient();
+    delay(8);
+  }
+  return false;
 }
 
 static void nameCard() {
@@ -2301,7 +2370,7 @@ static void nameCard() {
   oled.drawFastHLine(24, 44, SCRW - 48, SSD1306_WHITE);
   ctr("desk companion", 50, 1);
   oled.display();
-  delay(1300);
+  holdCard(1300);
 }
 
 // ---------------------------------------------------------------
@@ -2311,9 +2380,9 @@ static void nameCard() {
 static void offlineWelcome() {
   eyes.setMood(HAPPY);
   eyes.setPosition(DEFAULT);
-  for (int i = 0; i < 16; i++) { eyes.update(); oled.display(); delay(22); }
+  for (int i = 0; i < 16; i++) { eyesFrame(); delay(22); }
   eyes.blink();
-  for (int i = 0; i < 12; i++) { eyes.update(); oled.display(); delay(22); }
+  for (int i = 0; i < 12; i++) { eyesFrame(); delay(22); }
 
   // the greeting slides its underline open
   for (int f = 0; f <= 16; f++) {
@@ -2340,7 +2409,7 @@ static void offlineWelcome() {
     oled.display();
     delay(420);
   }
-  delay(1500);
+  holdCard(1500);
 
   oled.clearDisplay();
   titleBar("WHEN YOU WANT WIFI", "");
@@ -2349,7 +2418,7 @@ static void offlineWelcome() {
   ctr("Hotspot", 44, 1);
   oled.drawFastHLine(30, 56, SCRW - 60, SSD1306_WHITE);
   oled.display();
-  delay(2600);
+  holdCard(2600);
 }
 
 // ================================================================
@@ -2439,14 +2508,18 @@ void setup() {
   eyes.setIdleMode(ON, 2, 2);
   eyes.setMood(STYLES[cfgEyes].mood);
 
+  // Two columns, numbers on a common left edge so the words line up.
   oled.clearDisplay();
-  titleBar("READY", "");
-  ctr("1 next    2 open", 20, 1);
-  ctr("3 back    4 reload", 34, 1);
-  oled.drawFastHLine(20, 46, SCRW - 40, SSD1306_WHITE);
-  ctr("knock to begin", 52, 1);
+  titleBarC("HOW TO KNOCK");
+  at(8,  16, "1  next");
+  at(8,  28, "2  open");
+  at(66, 16, "3  back");
+  at(66, 28, "4  reload");
+  oled.drawFastHLine(8, 40, 112, SSD1306_WHITE);
+  knockIcon(19, 51);
+  at(32, 48, "knock to begin");
   oled.display();
-  delay(2100);
+  holdCard(6000);                      // waits for you, and a knock ends it
 
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
   lastActive = millis();
