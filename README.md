@@ -14,7 +14,7 @@ Everything is done by knocking on the case.
 | 2 knocks | go in |
 | 3 knocks | come back out |
 
-Screens: **HOME, WEATHER, PRAYER, MESSAGES, STORY, SYSTEM, SETTINGS.**
+Screens: **HOME, FOCUS, WEATHER, PRAYER, MESSAGES, STORY, SETTINGS, SYSTEM.**
 
 In **SETTINGS**, two knocks opens the list, one knock walks it, two knocks
 opens the item, and then one knock changes the value. Three knocks steps
@@ -39,13 +39,39 @@ knocks and drops are caught reliably.
 
 ## Screens
 
-**HOME** the time, big, with the day and date. Nothing else.
+**HOME** the time, with the day and date. Nothing else.
+**FOCUS** a countdown for whatever you are working on, with the task
+scrolling along the bottom.
 **WEATHER** an icon, the temperature, humidity and wind.
 **PRAYER** all five times, with the next one picked out.
 **MESSAGES** whatever you sent from the page.
 **STORY** a short story written by gpt-4o-mini, turning its own pages.
 **SYSTEM** knock counts, falls, boots, memory, signal, address.
 **SETTINGS** everything you can change from the device itself.
+**SYSTEM** memory, uptime, knocks, falls, signal and address.
+
+## Working together
+
+The page has two halves. **Let's work together** is the one you use day to
+day: build a plan out of stretches, each with a name and a length, and the
+clock runs them in order.
+
+```
+Write the spec    10 min
+Review PRs        10 min
+Break              5 min
+Refactor parser   15 min
+```
+
+Press Start and the screen fills with a countdown, the task name scrolling
+underneath. Each stretch flashes **COMPLETED** as it ends and hands over to
+the next. Name one "break" and it flashes **BREAK OVER** instead, and after
+thirty minutes of unbroken work it will tell you to **TAKE A BREAK** and go
+walk for a minute whether you planned one or not. The plan is kept in flash,
+so it survives a reboot.
+
+**Configuration** is everything else: screens, weather, prayer times, system,
+the OpenAI key and the network.
 
 ## Network
 

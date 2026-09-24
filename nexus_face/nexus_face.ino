@@ -45,7 +45,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -86,9 +86,9 @@ uint8_t adxl = 0, mpu = 0;
 float ax, ay, az, amag = 1, mx, my, mz, gxr, gyr, gzr, mtemp;
 
 // ---------------- screens ----------------
-enum { S_HOME = 0, S_WEATHER, S_PRAYER, S_MSG, S_STORY, S_SYSTEM, S_SETTINGS, S_COUNT };
+enum { S_HOME = 0, S_FOCUS, S_WEATHER, S_PRAYER, S_MSG, S_STORY, S_SETTINGS, S_SYSTEM, S_COUNT };
 const char* S_NAME[S_COUNT] =
-  { "HOME", "WEATHER", "PRAYER", "MESSAGES", "STORY", "SYSTEM", "SETTINGS" };
+  { "HOME", "FOCUS", "WEATHER", "PRAYER", "MESSAGES", "STORY", "SETTINGS", "SYSTEM" };
 
 int screen = S_HOME;
 int depth  = 0;                  // 0 screens, 1 settings list, 2 editing
@@ -147,6 +147,27 @@ int    storyLines = 0, storyPage = 0;
 bool   storyBusy = false;
 String storyState = "no story yet";
 unsigned long nextStory = 0, lastPageTurn = 0;
+
+// ---------------- work session ----------------
+//  A list of stretches to work through. Each one runs, flashes when it
+//  is done, and hands over to the next.
+#define TASK_MAX 8
+struct Task { String name; int mins; };
+Task tasks[TASK_MAX];
+int  taskCount = 0;
+int  taskIdx   = -1;               // -1 when nothing is running
+unsigned long taskEnd = 0;
+unsigned long flashUntil = 0;
+const char* flashWord = "";
+int  workedMin = 0;                // minutes since the last break
+bool breakDue = false;
+#define BREAK_AFTER_MIN 30
+
+static bool isBreak(const String& n) {
+  String l = n; l.toLowerCase();
+  return l.indexOf("break") >= 0 || l.indexOf("rest") >= 0 || l.indexOf("walk") >= 0;
+}
+static bool sessionRunning() { return taskIdx >= 0 && taskIdx < taskCount; }
 
 // ---------------- runtime ----------------
 bool asleep = false, screenOn = true, timeOk = false, rescueAP = false;
@@ -346,15 +367,17 @@ static void drawHome() {
     strcpy(day, "waiting"); strcpy(date, "for the clock");
   }
 
-  int bw = 5 * 24;                                   // size 4 numerals
-  oled.setTextSize(4);
-  oled.setCursor((SCRW - bw - 14) / 2, 6);
+  // size 3 rather than 4: the bigger one ran right to both edges
+  int bw = 5 * 18;
+  int x0 = (SCRW - bw - 14) / 2;
+  oled.setTextSize(3);
+  oled.setCursor(x0, 8);
   oled.print(big);
-  at((SCRW - bw - 14) / 2 + bw + 4, 22, sec);
+  at(x0 + bw + 5, 18, sec);
 
-  oled.drawFastHLine(18, 40, SCRW - 36, SSD1306_WHITE);
-  ctr(day, 44, 1);
-  ctr(date, 55, 1);
+  oled.drawFastHLine(22, 36, SCRW - 44, SSD1306_WHITE);
+  ctr(day, 41, 1);
+  ctr(date, 53, 1);
   oled.display();
 }
 
@@ -469,7 +492,8 @@ static void drawStory() {
   }
   if (!storyLines) {
     ctr(storyState.c_str(), 28, 1);
-    ctr("add a key in settings", 44, 1);
+    // only blame the key when the key really is the problem
+    ctr(cfgKey.length() ? "two knocks to retry" : "add a key on the page", 44, 1);
     oled.display();
     return;
   }
@@ -482,29 +506,96 @@ static void drawStory() {
 static void drawSystem() {
   oled.clearDisplay();
   bar("SYSTEM");
-  char l[26];
+
+  char l[20];
   uint32_t heap = ESP.getFreeHeap(), tot = ESP.getHeapSize();
 
-  snprintf(l, sizeof(l), "1:%lu 2:%lu 3:%lu", (unsigned long)cTap,
-           (unsigned long)cDouble, (unsigned long)cTriple);
-  at(3, 14, l);
-  snprintf(l, sizeof(l), "falls %lu  boots %lu", (unsigned long)cFall, (unsigned long)cBoot);
-  at(3, 24, l);
-  snprintf(l, sizeof(l), "ram %uk/%uk", (unsigned)(heap / 1024), (unsigned)(tot / 1024));
-  at(3, 34, l);
-  int bw = SCRW - 6, fill = bw * (tot - heap) / tot;
-  oled.drawRect(3, 42, bw, 5, SSD1306_WHITE);
-  if (fill > 2) oled.fillRect(4, 43, fill - 2, 3, SSD1306_WHITE);
+  // left: one headline number and a gauge under it
+  snprintf(l, sizeof(l), "%u", (unsigned)(heap / 1024));
+  oled.setTextSize(3);
+  oled.setCursor(4, 15);
+  oled.print(l);
+  at(4, 39, "kB free");
 
-  // signal and address on their own lines: together they can be wider
-  // than the screen once the numbers get long
-  if (WiFi.status() == WL_CONNECTED) {
-    snprintf(l, sizeof(l), "signal %d dBm", WiFi.RSSI());
-    at(3, 48, l);
-    at(3, 56, WiFi.localIP().toString().c_str());
+  int bw = 56, fill = bw * heap / tot;
+  oled.drawRect(4, 48, bw, 6, SSD1306_WHITE);
+  if (fill > 2) oled.fillRect(5, 49, fill - 2, 4, SSD1306_WHITE);
+
+  // right: one fact per line, all short enough to never reach the edge
+  oled.drawFastVLine(64, 14, 42, SSD1306_WHITE);
+  snprintf(l, sizeof(l), "up %lum", (unsigned long)(millis() / 60000UL));  at(69, 14, l);
+  snprintf(l, sizeof(l), "boot %lu", (unsigned long)cBoot);                at(69, 23, l);
+  snprintf(l, sizeof(l), "tap %lu", (unsigned long)(cTap + cDouble + cTriple)); at(69, 32, l);
+  snprintf(l, sizeof(l), "fall %lu", (unsigned long)cFall);                at(69, 41, l);
+  if (WiFi.status() == WL_CONNECTED) snprintf(l, sizeof(l), "%ddBm", WiFi.RSSI());
+  else                               snprintf(l, sizeof(l), "no wifi");
+  at(69, 50, l);
+
+  // and the address on its own line, where it has the whole width
+  if (WiFi.status() == WL_CONNECTED) at(4, 56, WiFi.localIP().toString().c_str());
+  else at(4, 56, rescueAP ? "rescue 192.168.4.1" : "offline");
+  oled.display();
+}
+
+// ---- the work session ----
+// A countdown filling the screen, with the task itself scrolling along
+// the bottom so a long name still reads.
+static void drawFocus() {
+  oled.clearDisplay();
+
+  if (millis() < flashUntil) {                       // a stretch just ended
+    oled.fillRect(0, 0, SCRW, SCRH, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    int n = strlen(flashWord);
+    int size = n * 12 <= SCRW - 8 ? 2 : 1;
+    ctr(flashWord, size == 2 ? 20 : 26, size);
+    if (breakDue) ctr("walk for a minute", 42, 1);
+    oled.setTextColor(SSD1306_WHITE);
+    oled.display();
+    return;
+  }
+
+  if (!sessionRunning()) {
+    bar("FOCUS");
+    ctr("nothing planned", 26, 1);
+    ctr("add tasks on the page", 42, 1);
+    oled.display();
+    return;
+  }
+
+  const Task& t = tasks[taskIdx];
+  bool brk = isBreak(t.name);
+  char r[12];
+  snprintf(r, sizeof(r), "%d/%d", taskIdx + 1, taskCount);
+  titleBar(brk ? "BREAK" : "FOCUS", r);
+
+  long left = (long)(taskEnd - millis()) / 1000L;
+  if (left < 0) left = 0;
+  char big[10];
+  snprintf(big, sizeof(big), "%ld:%02ld", left / 60, left % 60);
+  oled.setTextSize(3);
+  oled.setCursor((SCRW - (int)strlen(big) * 18) / 2, 16);
+  oled.print(big);
+
+  // how far through this stretch we are
+  long total = (long)t.mins * 60;
+  int bw = SCRW - 16;
+  int fill = total > 0 ? (int)((bw - 2) * (total - left) / total) : 0;
+  oled.drawRect(8, 40, bw, 6, SSD1306_WHITE);
+  if (fill > 0) oled.fillRect(9, 41, fill, 4, SSD1306_WHITE);
+
+  // the task name scrolls if it does not fit
+  int w = t.name.length() * 6;
+  if (w <= SCRW - 4) {
+    ctr(t.name.c_str(), 54, 1);
   } else {
-    at(3, 48, rescueAP ? "rescue hotspot" : "offline");
-    if (rescueAP) at(3, 56, "192.168.4.1");
+    int span = w + 24;
+    int off = (millis() / 55) % span;
+    oled.setTextSize(1);
+    oled.setCursor(2 - off, 54);          oled.print(t.name);
+    oled.setCursor(2 - off + span, 54);   oled.print(t.name);
+    oled.fillRect(0, 52, 2, 10, SSD1306_BLACK);
+    oled.fillRect(SCRW - 2, 52, 2, 10, SSD1306_BLACK);
   }
   oled.display();
 }
@@ -712,18 +803,30 @@ static void fetchStory() {
     String err = h.getString();
     h.end();
     storyBusy = false;
-    storyState = (code == 401) ? "key rejected" : ("openai " + String(code));
-    Serial.println("story failed " + String(code) + " " + err.substring(0, 160));
+    storyState = (code == 401) ? "key rejected"
+               : (code == 429) ? "rate limited"
+               : ("openai " + String(code));
+    Serial.println("story failed " + String(code) + " " + err.substring(0, 200));
     return;
   }
+
+  // Read the body through getString(), which unpicks chunked transfer
+  // encoding for us. Handing getStream() straight to ArduinoJson feeds it
+  // the raw chunk length markers, and it fails every time.
+  String reply = h.getString();
+  h.end();
 
   JsonDocument filter;
   filter["choices"][0]["message"]["content"] = true;
   JsonDocument doc;
-  DeserializationError e = deserializeJson(doc, h.getStream(),
-                                           DeserializationOption::Filter(filter));
-  h.end();
-  if (e) { storyBusy = false; storyState = "bad reply"; return; }
+  DeserializationError e = deserializeJson(doc, reply, DeserializationOption::Filter(filter));
+  if (e) {
+    storyBusy = false;
+    storyState = String("parse: ") + e.c_str();
+    Serial.println("story parse failed: " + String(e.c_str()));
+    Serial.println(reply.substring(0, 300));
+    return;
+  }
 
   String text = doc["choices"][0]["message"]["content"] | "";
   if (!text.length()) { storyBusy = false; storyState = "empty reply"; return; }
@@ -733,6 +836,94 @@ static void fetchStory() {
   storyState = "ready";
   lastPageTurn = millis();
   Serial.printf("story ready, %d lines\n", storyLines);
+}
+
+// ================================================================
+//  WORK SESSION
+// ================================================================
+// Stored as  name|minutes;name|minutes;...  so the whole plan is one
+// preference entry and survives a reboot.
+static void saveTasks() {
+  String out;
+  for (int i = 0; i < taskCount; i++) {
+    String n = tasks[i].name;
+    n.replace("|", " "); n.replace(";", " ");
+    out += n + "|" + String(tasks[i].mins);
+    if (i < taskCount - 1) out += ";";
+  }
+  prefs.putString("plan", out);
+}
+static void loadTasks() {
+  taskCount = 0;
+  String in = prefs.getString("plan", "");
+  int i = 0;
+  while (i < (int)in.length() && taskCount < TASK_MAX) {
+    int semi = in.indexOf(';', i); if (semi < 0) semi = in.length();
+    String part = in.substring(i, semi);
+    int bar = part.indexOf('|');
+    if (bar > 0) {
+      tasks[taskCount].name = part.substring(0, bar);
+      tasks[taskCount].mins = constrain(part.substring(bar + 1).toInt(), 1, 240);
+      taskCount++;
+    }
+    i = semi + 1;
+  }
+}
+
+static void flash(const char* word, unsigned long ms) {
+  flashWord = word;
+  flashUntil = millis() + ms;
+}
+
+static void startTask(int i) {
+  if (i < 0 || i >= taskCount) {                 // the plan is finished
+    taskIdx = -1;
+    workedMin = 0; breakDue = false;
+    flash("ALL DONE", 3000);
+    Serial.println("session complete");
+    return;
+  }
+  taskIdx = i;
+  taskEnd = millis() + (unsigned long)tasks[i].mins * 60000UL;
+  if (isBreak(tasks[i].name)) { workedMin = 0; breakDue = false; }
+  Serial.printf("task %d/%d: %s for %d min\n", i + 1, taskCount,
+                tasks[i].name.c_str(), tasks[i].mins);
+}
+
+static void startSession() {
+  if (!taskCount) return;
+  workedMin = 0; breakDue = false;
+  screen = S_FOCUS; depth = 0;
+  startTask(0);
+}
+static void stopSession() {
+  taskIdx = -1;
+  flashUntil = 0;
+  workedMin = 0; breakDue = false;
+}
+
+// called once a stretch runs out
+static void finishTask() {
+  const Task& t = tasks[taskIdx];
+  bool wasBreak = isBreak(t.name);
+  if (!wasBreak) workedMin += t.mins;
+
+  // an honest nudge once half an hour has gone by without a pause
+  if (!wasBreak && workedMin >= BREAK_AFTER_MIN) {
+    breakDue = true;
+    flash("TAKE A BREAK", 5000);
+    workedMin = 0;
+  } else {
+    breakDue = false;
+    flash(wasBreak ? "BREAK OVER" : "COMPLETED", 2600);
+  }
+  startTask(taskIdx + 1);
+}
+
+static void serviceSession() {
+  if (!sessionRunning()) return;
+  if (millis() < flashUntil) return;             // let the flash finish first
+  if ((long)(millis() - taskEnd) >= 0) finishTask();
 }
 
 // ================================================================
@@ -937,26 +1128,38 @@ const char PAGE[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Nexus</title><style>
-:root{--bg:#070d13;--card:#101c27;--fg:#e6eef5;--mut:#7d93a6;--line:#1e2f3d;--acc:#2dd4bf}
+:root{--bg:#070d13;--card:#101c27;--fg:#e6eef5;--mut:#7d93a6;--line:#1e2f3d;--acc:#2dd4bf;--warn:#fbbf24}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;text-align:center}
-.wrap{max-width:440px;margin:0 auto;padding:20px}
+.wrap{max-width:460px;margin:0 auto;padding:18px}
 h1{font-size:12px;letter-spacing:.34em;color:var(--acc);margin:0}
-.clock{font-size:44px;font-weight:200;margin:2px 0 0;font-variant-numeric:tabular-nums}
-.sub{color:var(--mut);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
-h2{font-size:11px;letter-spacing:.2em;color:var(--mut);margin:22px 0 8px;text-transform:uppercase}
+.clock{font-size:42px;font-weight:200;margin:2px 0 0;font-variant-numeric:tabular-nums}
+.sub{color:var(--mut);font-size:12px;letter-spacing:.1em;text-transform:uppercase}
+.tabs{display:flex;gap:6px;margin:18px 0 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:5px}
+.tabs button{flex:1;margin:0;padding:10px;border-radius:9px;background:transparent;color:var(--mut);font-weight:600;font-size:13px}
+.tabs button.on{background:var(--acc);color:#04201c}
+h2{font-size:11px;letter-spacing:.2em;color:var(--mut);margin:20px 0 8px;text-transform:uppercase}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:8px}
 .g4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
-.tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 4px}
-.tile b{display:block;font-size:19px;font-weight:500;font-variant-numeric:tabular-nums}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:11px 4px}
+.tile b{display:block;font-size:18px;font-weight:500;font-variant-numeric:tabular-nums}
 .tile span{font-size:10px;color:var(--mut)}
-input{width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);background:#0b141c;color:var(--fg);font:inherit;text-align:center}
+input,select{width:100%;padding:11px;border-radius:10px;border:1px solid var(--line);background:#0b141c;color:var(--fg);font:inherit;text-align:center}
 button{font:inherit;font-weight:600;padding:11px;border:0;border-radius:10px;background:var(--acc);color:#04201c;cursor:pointer;width:100%;margin-top:8px}
 button.g{background:transparent;color:var(--fg);border:1px solid var(--line)}
+button.d{background:transparent;color:var(--warn);border:1px solid var(--line)}
 .row{display:flex;gap:8px}.row button{margin-top:0}
 table{width:100%;font-size:13px;font-variant-numeric:tabular-nums}
 td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{text-align:right}
-.story{text-align:left;font-size:14px;line-height:1.55;color:#cfe0ee;max-height:220px;overflow:auto}
+.task{display:flex;align-items:center;gap:8px;background:#0b141c;border:1px solid var(--line);border-radius:10px;padding:9px 11px;margin-bottom:6px;text-align:left}
+.task b{flex:1;font-weight:500;font-size:14px}
+.task i{color:var(--mut);font-style:normal;font-size:13px}
+.task.now{border-color:var(--acc)}
+.task.brk b{color:var(--warn)}
+.task button{width:auto;margin:0;padding:5px 9px;font-size:12px}
+.plan{display:grid;grid-template-columns:1fr 78px;gap:8px}
+.big{font-size:34px;font-weight:200;font-variant-numeric:tabular-nums;margin:4px 0}
+.story{text-align:left;font-size:14px;line-height:1.55;color:#cfe0ee;max-height:200px;overflow:auto}
 .bar{height:6px;background:#0b141c;border-radius:3px;overflow:hidden;margin-top:8px}
 .bar i{display:block;height:100%;background:var(--acc)}
 #t{margin-top:10px;font-size:13px;color:var(--acc);min-height:18px}
@@ -965,55 +1168,96 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
 <div class="clock" id="clk">--:--</div>
 <div class="sub" id="sub">connecting</div>
 
-<h2>Send a message</h2>
-<div class="card">
-  <input id="m" maxlength="84" placeholder="it will pop up on the face">
-  <button onclick="send()">Send</button>
+<div class="tabs">
+  <button id="tabA" class="on" onclick="tab('work')">Let's work together</button>
+  <button id="tabB" onclick="tab('cfg')">Configuration</button>
 </div>
 
-<h2>Screens</h2>
-<div class="card"><div class="row">
-  <button class="g" onclick="go(0)">Home</button>
-  <button class="g" onclick="go(1)">Weather</button>
-  <button class="g" onclick="go(2)">Prayer</button>
-  <button class="g" onclick="go(3)">Msg</button>
-</div><div class="row" style="margin-top:8px">
-  <button class="g" onclick="go(4)">Story</button>
-  <button class="g" onclick="go(5)">System</button>
-  <button class="g" onclick="go(6)">Settings</button>
-</div></div>
+<!-- ============ WORK ============ -->
+<div id="work">
+  <div class="card" id="now">
+    <div class="sub" id="nowLabel">nothing running</div>
+    <div class="big" id="nowTime">--:--</div>
+    <div class="bar"><i id="nowBar" style="width:0%"></i></div>
+    <div class="row" style="margin-top:10px">
+      <button onclick="act('/api/session?go=1')">Start</button>
+      <button class="g" onclick="act('/api/session?go=2')">Skip</button>
+      <button class="d" onclick="act('/api/session?go=0')">Stop</button>
+    </div>
+  </div>
 
-<h2>Knocks</h2>
-<div class="g4">
-  <div class="tile"><b id="k1">0</b><span>ONE</span></div>
-  <div class="tile"><b id="k2">0</b><span>TWO</span></div>
-  <div class="tile"><b id="k3">0</b><span>THREE</span></div>
-  <div class="tile"><b id="k4">0</b><span>FALLS</span></div>
+  <h2>The plan</h2>
+  <div id="plan"></div>
+  <div class="card">
+    <div class="plan">
+      <input id="tn" maxlength="40" placeholder="what are you doing?">
+      <input id="tm" type="number" min="1" max="240" value="10" placeholder="min">
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button onclick="addTask()">Add</button>
+      <button class="g" onclick="addBreak()">Add a break</button>
+    </div>
+    <button class="d" onclick="if(confirm('Clear the whole plan?'))act('/api/plan?clear=1')">Clear the plan</button>
+  </div>
+
+  <h2>Send a message</h2>
+  <div class="card">
+    <input id="m" maxlength="84" placeholder="it will pop up on the face">
+    <button onclick="send()">Send</button>
+  </div>
+
+  <h2>Story</h2><div class="card">
+    <div class="story" id="st">nothing yet</div>
+    <button class="g" onclick="act('/api/story')">Write a new one</button>
+  </div>
 </div>
 
-<h2>Weather</h2><div class="card"><table id="wx"></table>
-  <button class="g" onclick="act('/api/weather')">Refresh</button></div>
-<h2>Prayer times</h2><div class="card"><table id="pr"></table></div>
-
-<h2>Story</h2><div class="card">
-  <div class="story" id="st">nothing yet</div>
-  <button class="g" onclick="act('/api/story')">Write a new one</button>
-</div>
-
-<h2>System</h2><div class="card"><table id="sys"></table><div class="bar"><i id="hb"></i></div>
-  <div class="row" style="margin-top:8px">
-    <button class="g" onclick="act('/api/update')">Check update</button>
-    <button class="g" onclick="if(confirm('Reboot?'))act('/api/reboot')">Reboot</button>
+<!-- ============ CONFIGURATION ============ -->
+<div id="cfg" style="display:none">
+  <h2>Screens</h2>
+  <div class="card"><div class="row">
+    <button class="g" onclick="go(0)">Home</button>
+    <button class="g" onclick="go(1)">Focus</button>
+    <button class="g" onclick="go(2)">Weather</button>
+    <button class="g" onclick="go(3)">Prayer</button>
+  </div><div class="row" style="margin-top:8px">
+    <button class="g" onclick="go(4)">Msg</button>
+    <button class="g" onclick="go(5)">Story</button>
+    <button class="g" onclick="go(6)">Settings</button>
+    <button class="g" onclick="go(7)">System</button>
   </div></div>
 
-<h2>Settings</h2><div class="card">
-  <input id="key" type="password" placeholder="OpenAI API key (blank keeps it)">
-  <div style="height:8px"></div>
-  <input id="ssid" placeholder="wifi network"><div style="height:8px"></div>
-  <input id="pass" type="password" placeholder="wifi password (blank keeps it)">
-  <div style="height:8px"></div>
-  <input id="tz" placeholder="timezone eg IST-5:30">
-  <button onclick="save()">Save and reboot</button>
+  <h2>Knocks</h2>
+  <div class="g4">
+    <div class="tile"><b id="k1">0</b><span>ONE</span></div>
+    <div class="tile"><b id="k2">0</b><span>TWO</span></div>
+    <div class="tile"><b id="k3">0</b><span>THREE</span></div>
+    <div class="tile"><b id="k4">0</b><span>FALLS</span></div>
+  </div>
+
+  <h2>Weather</h2><div class="card"><table id="wx"></table>
+    <button class="g" onclick="act('/api/weather')">Refresh</button></div>
+  <h2>Prayer times</h2><div class="card"><table id="pr"></table></div>
+
+  <h2>System</h2><div class="card"><table id="sys"></table><div class="bar"><i id="hb"></i></div>
+    <div class="row" style="margin-top:8px">
+      <button class="g" onclick="act('/api/update')">Check update</button>
+      <button class="g" onclick="if(confirm('Reboot?'))act('/api/reboot')">Reboot</button>
+    </div></div>
+
+  <h2>OpenAI</h2><div class="card">
+    <div class="sub" id="keyState" style="margin-bottom:8px">no key</div>
+    <input id="key" type="password" placeholder="paste the API key">
+    <button onclick="saveKey()">Save the key</button>
+  </div>
+
+  <h2>Network</h2><div class="card">
+    <input id="ssid" placeholder="wifi network"><div style="height:8px"></div>
+    <input id="pass" type="password" placeholder="wifi password (blank keeps it)">
+    <div style="height:8px"></div>
+    <input id="tz" placeholder="timezone eg IST-5:30">
+    <button onclick="saveNet()">Save and reboot</button>
+  </div>
 </div>
 <div id="t"></div>
 </div><script>
@@ -1023,12 +1267,29 @@ window.rows=function(el,o){$(el).innerHTML=Object.entries(o).map(([k,v])=>'<tr><
 window.post=async function(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(d||{})})}
 window.act=async function(u){$('t').textContent='working';await post(u,{});$('t').textContent='done';load()}
 window.go=async function(n){await post('/api/screen',{n:n});$('t').textContent='opened'}
+window.tab=function(w){
+  const work=w==='work';
+  $('work').style.display=work?'':'none';
+  $('cfg').style.display=work?'none':'';
+  $('tabA').className=work?'on':'';
+  $('tabB').className=work?'':'on';
+}
+window.addTask=async function(){
+  const n=$('tn').value.trim(), m=parseInt($('tm').value||'10',10);
+  if(!n){$('t').textContent='name it first';return}
+  await post('/api/plan',{name:n,mins:m});$('tn').value='';$('t').textContent='added';load()}
+window.addBreak=async function(){
+  await post('/api/plan',{name:'Break',mins:parseInt($('tm').value||'5',10)});
+  $('t').textContent='break added';load()}
+window.del=async function(i){await post('/api/plan',{del:i});load()}
 window.send=async function(){const m=$('m').value.trim();if(!m){$('t').textContent='type something';return}
   await post('/api/msg',{m:m});$('m').value='';$('t').textContent='sent';load()}
-window.save=async function(){
+window.saveKey=async function(){
+  const k=$('key').value.trim(); if(!k){$('t').textContent='paste a key first';return}
+  await post('/api/key',{key:k});$('key').value='';$('t').textContent='key saved';load()}
+window.saveNet=async function(){
   const d={ssid:$('ssid').value,tz:$('tz').value};
   if($('pass').value)d.pass=$('pass').value;
-  if($('key').value)d.key=$('key').value;
   await post('/api/cfg',d);$('t').textContent='saved, rebooting'}
 window.pushTime=async function(){const d=new Date();
   await post('/api/time',{e:Math.floor(d.getTime()/1000),o:-d.getTimezoneOffset()})}
@@ -1039,15 +1300,24 @@ window.load=async function(){
   $('clk').textContent=s.time;
   $('sub').textContent=(s.asleep?'asleep':'awake')+' · '+s.screen+' · fw '+s.fw;
   $('k1').textContent=s.k1;$('k2').textContent=s.k2;$('k3').textContent=s.k3;$('k4').textContent=s.fall;
+  $('nowLabel').textContent=s.running?(s.taskName+'  ·  '+(s.taskIdx+1)+' of '+s.plan.length):'nothing running';
+  $('nowTime').textContent=s.running?s.left:'--:--';
+  $('nowBar').style.width=(s.running?s.taskPct:0)+'%';
+  $('plan').innerHTML=s.plan.length?s.plan.map((p,i)=>
+    '<div class="task'+(s.running&&i===s.taskIdx?' now':'')+(p.brk?' brk':'')+'">'
+    +'<b>'+esc(p.name)+'</b><i>'+p.mins+' min</i>'
+    +'<button class="d" onclick="del('+i+')">x</button></div>').join('')
+    :'<div class="card" style="color:var(--mut);font-size:13px">nothing planned yet</div>';
   rows('wx',{'city':s.city,'temperature':s.temp,'humidity':s.hum,'wind':s.wind,'conditions':s.cond});
   rows('pr',s.prayer);
   $('st').textContent=s.story;
+  $('keyState').textContent=s.hasKey?('key saved · '+s.storyState):'no key yet';
   rows('sys',{'signal':s.rssi,'address':s.ip,'free ram':s.heap+' B','uptime':s.up+' s',
               'boots':s.boots,'chip':s.chip,'firmware':s.fw});
   $('hb').style.width=s.pct+'%';
   if(!filled){$('ssid').value=s.ssid;$('tz').value=s.tz;filled=true}
 }
-load();setInterval(load,1200);
+load();setInterval(load,1000);
 </script></body></html>
 )HTML";
 
@@ -1067,7 +1337,34 @@ static void apiState() {
   o += "\"temp\":\"" + String(wxOk ? String(wTemp, 1) + " C" : String("--")) + "\",";
   o += "\"hum\":\"" + String(wxOk ? String(wHum, 0) + " %" : String("--")) + "\",";
   o += "\"wind\":\"" + String(wxOk ? String(wWind, 1) + " km/h" : String("--")) + "\",";
-  o += "\"cond\":\"" + String(wxWord(wCode)) + "\",\"prayer\":{";
+  o += "\"cond\":\"" + String(wxWord(wCode)) + "\",";
+
+  // the work session
+  o += "\"running\":" + String(sessionRunning() ? "true" : "false") + ",";
+  o += "\"taskIdx\":" + String(taskIdx) + ",";
+  if (sessionRunning()) {
+    long left = (long)(taskEnd - millis()) / 1000L;
+    if (left < 0) left = 0;
+    char lt[12];
+    snprintf(lt, sizeof(lt), "%ld:%02ld", left / 60, left % 60);
+    long total = (long)tasks[taskIdx].mins * 60;
+    String nm = tasks[taskIdx].name; nm.replace("\"", "'");
+    o += "\"left\":\"" + String(lt) + "\",\"taskName\":\"" + nm + "\",";
+    o += "\"taskPct\":" + String(total > 0 ? (int)(100 * (total - left) / total) : 0) + ",";
+  } else {
+    o += "\"left\":\"--:--\",\"taskName\":\"\",\"taskPct\":0,";
+  }
+  o += "\"plan\":[";
+  for (int i = 0; i < taskCount; i++) {
+    String nm = tasks[i].name; nm.replace("\\", " "); nm.replace("\"", "'");
+    o += "{\"name\":\"" + nm + "\",\"mins\":" + String(tasks[i].mins) +
+         ",\"brk\":" + String(isBreak(tasks[i].name) ? "true" : "false") + "}";
+    if (i < taskCount - 1) o += ",";
+  }
+  o += "],";
+  o += "\"hasKey\":" + String(cfgKey.length() ? "true" : "false") + ",";
+  o += "\"storyState\":\"" + storyState + "\",";
+  o += "\"prayer\":{";
   for (int i = 0; i < 5; i++) {
     char v[12];
     if (prayerOk) fmt12(v, sizeof(v), prayerMin[i]); else strcpy(v, "--");
@@ -1107,6 +1404,52 @@ static void setupWeb() {
     web.send(200, "application/json", "{\"ok\":true}");
   });
   web.on("/api/weather", HTTP_POST, []() { nextWx = 0; web.send(200, "application/json", "{\"ok\":true}"); });
+
+  // the plan: add one, delete one, or wipe it
+  web.on("/api/plan", HTTP_POST, []() {
+    if (web.hasArg("clear")) {
+      taskCount = 0; stopSession(); saveTasks();
+    } else if (web.hasArg("del")) {
+      int d = web.arg("del").toInt();
+      if (d >= 0 && d < taskCount) {
+        for (int i = d; i < taskCount - 1; i++) tasks[i] = tasks[i + 1];
+        taskCount--;
+        if (taskIdx >= taskCount) stopSession();
+        saveTasks();
+      }
+    } else {
+      String n = web.arg("name"); n.trim();
+      int m = constrain((int)web.arg("mins").toInt(), 1, 240);
+      if (n.length() && taskCount < TASK_MAX) {
+        tasks[taskCount].name = n.substring(0, 40);
+        tasks[taskCount].mins = m;
+        taskCount++;
+        saveTasks();
+      }
+    }
+    web.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  web.on("/api/session", HTTP_POST, []() {
+    int go = web.arg("go").toInt();
+    if (go == 1)      { startSession(); wake("session"); }
+    else if (go == 2) { if (sessionRunning()) { flashUntil = 0; startTask(taskIdx + 1); } }
+    else              { stopSession(); }
+    web.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // the key on its own, so saving it does not force a reboot
+  web.on("/api/key", HTTP_POST, []() {
+    String k = web.arg("key"); k.trim();
+    if (k.length()) {
+      cfgKey = k;
+      prefs.putString("key", cfgKey);
+      storyState = "key saved";
+      nextStory = 0;                       // have a go straight away
+      Serial.printf("openai key saved, %d chars\n", cfgKey.length());
+    }
+    web.send(200, "application/json", "{\"ok\":true}");
+  });
   web.on("/api/story",   HTTP_POST, []() { nextStory = 0; web.send(200, "application/json", "{\"ok\":true}"); });
   web.on("/api/time", HTTP_POST, []() {
     long e = web.arg("e").toInt();
@@ -1127,7 +1470,6 @@ static void setupWeb() {
     if (web.arg("pass").length()) prefs.putString("pass", web.arg("pass"));
     String z = web.arg("tz"); z.trim();
     if (z.length()) prefs.putString("tz", z);
-    if (web.arg("key").length()) prefs.putString("key", web.arg("key"));
     web.send(200, "application/json", "{\"ok\":true}");
     delay(300); ESP.restart();
   });
@@ -1214,6 +1556,7 @@ void setup() {
   cfgPass     = prefs.getString("pass", "");
   cfgKey      = prefs.getString("key", "");
   message     = prefs.getString("msg", "");
+  loadTasks();
 
   // First run: copy what is compiled in into flash. After that flash
   // wins, so an update can never take the network away.
@@ -1308,6 +1651,7 @@ void loop() {
   unsigned long now = millis();
 
   if (now - lastPoll >= 45) { lastPoll = now; input(); }
+  serviceSession();
 
   if (!asleep && WiFi.status() == WL_CONNECTED) {
     if ((long)(now - nextWx) >= 0) { nextWx = now + 900000UL; fetchWeather(); }
@@ -1328,6 +1672,9 @@ void loop() {
   // a message that just arrived holds the screen for a moment
   if (popupUntil && now > popupUntil) { popupUntil = 0; screen = S_HOME; }
 
+  // a running session keeps itself awake and on screen
+  if (sessionRunning() || millis() < flashUntil) { lastActive = now; screen = S_FOCUS; }
+
   if (asleep) { delay(6); return; }
 
   // the story turns its own pages, since one knock means next screen
@@ -1340,6 +1687,7 @@ void loop() {
   if (now - lastDraw >= 110) {
     lastDraw = now;
     switch (screen) {
+      case S_FOCUS:    drawFocus();    break;
       case S_WEATHER:  drawWeather();  break;
       case S_PRAYER:   drawPrayer();   break;
       case S_MSG:      drawMessage();  break;
