@@ -1,6 +1,6 @@
-# NEXUS
+# RAFIQ
 
-A desk companion built on an ESP32-C3. It has a face, it knows the time,
+*rafiq* is Arabic for companion. A desk companion built on an ESP32-C3. It has a face, it knows the time,
 the weather and the prayer times, it keeps a shelf of short reads, and it
 carries the Quran, the 99 Names and the morning and evening adhkar in its
 own firmware so those work with no network at all.
@@ -40,6 +40,13 @@ without a pause and it asks you to walk for a minute.
 
 **PRAYER** five times from AlAdhan, with the next one picked out. They are
 kept in flash, so they are still there with no network.
+
+Calculated times and the local masjid rarely agree, so each prayer carries
+its own correction in minutes, set on the page and kept in flash.
+
+The call comes in three steps. Ten minutes out it says a word. Five minutes
+out it says it again and begins to flash. On the minute itself it flashes
+for a minute and then leaves you alone. Each step fires once a day.
 
 **FAITH** two knocks opens five things:
 
