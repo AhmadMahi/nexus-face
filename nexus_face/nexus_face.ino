@@ -32,6 +32,7 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <Update.h>
+#include <esp_ota_ops.h>
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <time.h>
@@ -46,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.4.1"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -212,7 +213,7 @@ unsigned long nextTimeTry = 0, swStart = 0;
 uint32_t cTap = 0, cDouble = 0, cTriple = 0, cQuad = 0, cFall = 0, cShake = 0, cBoot = 0;
 uint8_t  burst = 0;
 unsigned long burstStart = 0;
-String   otaStatus = "";
+String   otaStatus = "", otaStatus2 = "";
 String   clockSrc = "not set";
 int      otaPct = -1;
 
@@ -895,7 +896,10 @@ static void drawSettings() {
 static void drawOta() {
   oled.clearDisplay();
   bar("UPDATE");
-  ctr(otaStatus.c_str(), 22, 1);
+  if (otaStatus2.length()) {                 // a failure worth explaining
+    ctr(otaStatus.c_str(), 16, 1);
+    ctr(otaStatus2.c_str(), 27, 1);
+  } else ctr(otaStatus.c_str(), 22, 1);
   if (otaPct >= 0) {
     int bw = SCRW - 24;
     oled.drawRect(12, 36, bw, 9, SSD1306_WHITE);
@@ -904,7 +908,7 @@ static void drawOta() {
     char p[8];
     snprintf(p, sizeof(p), "%d%%", otaPct);
     ctr(p, 50, 1);
-  } else spinner(44);
+  } else spinner(otaStatus2.length() ? 48 : 44);
   oled.display();
 }
 // ================================================================
@@ -1415,9 +1419,10 @@ static long verNum(const String& v) {
   return (long)a * 1000000L + b * 1000L + c;
 }
 
-static void otaFail(const char* why) {
-  otaStatus = why; otaPct = -1;
-  drawOta(); delay(2400);
+static void otaFail(const char* why, const char* detail = "") {
+  otaStatus = why; otaStatus2 = detail; otaPct = -1;
+  drawOta(); delay(detail[0] ? 4200 : 2400);
+  otaStatus2 = "";
   Update.abort();
 }
 
@@ -1481,9 +1486,22 @@ static void runUpdate() {
   }
   if (!open) { otaFail("too many redirects"); return; }
 
-  if (len <= 0 || !Update.begin((size_t)len)) {
+  // "no room" used to be the whole story, which told you nothing. The
+  // slot an update lands in is fixed by the partition table that was
+  // written over USB, and only USB can change it, so say the numbers.
+  const esp_partition_t* slot = esp_ota_get_next_update_partition(NULL);
+  if (len <= 0) { h->end(); delete h; delete sec; otaFail("no content length"); return; }
+  if (!slot) {
     h->end(); delete h; delete sec;
-    otaFail(len <= 0 ? "no content length" : "no room for it");
+    otaFail("no ota slot", "needs min spiffs");
+    return;
+  }
+  if ((size_t)len > slot->size || !Update.begin((size_t)len)) {
+    char d[24];
+    snprintf(d, sizeof(d), "%dk into %uk slot",
+             len / 1024, (unsigned)(slot->size / 1024));
+    h->end(); delete h; delete sec;
+    otaFail("will not fit", d);
     return;
   }
 
@@ -2011,7 +2029,7 @@ window.load=async function(){
   rows('wx',{'city':s.city,'temperature':s.temp,'humidity':s.hum,'wind':s.wind,'conditions':s.cond});
   rows('pr',s.prayer);
   $('keyState').textContent=s.hasKey?('key saved · '+s.storyState):'no key yet';
-  rows('sys',{'signal':s.rssi,'address':s.ip,'hotspot':s.ap,'free ram':s.heap+' B',
+  rows('sys',{'signal':s.rssi,'address':s.ip,'hotspot':s.ap,'free ram':s.heap+' B','ota room':s.ota,
               'storage used':s.fsUsed,'uptime':s.up+' s','boots':s.boots,'falls':s.fall,
               'chip':s.chip,'firmware':s.fw,'clock source':s.clockSrc});
   if(!filled){$('ssid').value=s.ssid;$('tz').value=s.tz;filled=true}
@@ -2076,6 +2094,10 @@ static void apiState() {
     if (i < 4) o += ",";
   }
   o += "},";
+  const esp_partition_t* slot_ = esp_ota_get_next_update_partition(NULL);
+  o += "\"ota\":\"" + String(slot_ ? String(slot_->size / 1024) + " kB slot, this build " +
+                                      String(ESP.getSketchSize() / 1024) + " kB"
+                                    : String("no ota slot")) + "\",";
   o += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
   o += "\"fsUsed\":\"" + String(fsOk ? String(LittleFS.usedBytes() / 1024) + " / " +
                                        String(LittleFS.totalBytes() / 1024) + " kB"

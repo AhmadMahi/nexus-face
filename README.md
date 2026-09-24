@@ -96,3 +96,13 @@ MPU6050 0x68.
 
 SETTINGS, then Check update, then two knocks. It reads the latest release
 here, shows the download moving, and restarts into it.
+
+If it says **will not fit**, the second line gives the numbers, for example
+`1352k into 1280k slot`. That means the board was flashed with a partition
+table whose OTA slot is smaller than the build. Only USB can rewrite a
+partition table, so connect it and upload once with **Minimal SPIFFS
+(1.9MB APP with OTA)** selected. Settings and credentials live in NVS at a
+fixed offset that both schemes share, so they survive.
+
+The page shows the ceiling under System as **ota room**, so you can see how
+much headroom is left before it becomes a problem.
