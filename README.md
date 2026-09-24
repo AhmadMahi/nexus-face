@@ -24,7 +24,7 @@ new one, and on the zikr counter, where it starts the hundred again.
 ## Screens
 
 ```
-HOME -> FOCUS -> WEATHER -> MESSAGES -> PRAYER -> FAITH -> SHORT READS -> SETTINGS -> SYSTEM
+HOME -> FOCUS -> WEATHER -> MESSAGES -> PRAYER -> FAITH -> SHORT READS -> GAMES -> SETTINGS -> SYSTEM
 ```
 
 **HOME** the time, the day and the date. With no network there is no clock
@@ -65,6 +65,24 @@ shelf, two more opens one, one knock turns each page. Four knocks writes a
 new one and fills the rest of the shelf quietly afterwards. You can also
 paste your own on the page. They live in the filesystem and survive a
 reboot and an update.
+
+**GAMES** two, both played by tilting.
+
+- **Snake** tilt to steer. It starts slow and works up to a top speed that
+  tilt can still keep up with.
+- **Brick** tilt to slide the paddle. The edges of the paddle send the ball
+  away at an angle, so you steer with it as well as block with it. The ball
+  launches itself if you leave it sitting.
+
+While playing: two knocks pause, three leave, four start again. Best scores
+are kept in flash.
+
+Tilt only means anything relative to how the device is sitting, and this one
+could be upright or flat. So the first time you play it asks once: hold
+still, tilt right, tilt away. That mapping is kept in flash. Four knocks on
+the game list forgets it and asks again. The resting position is measured
+afresh every time a game starts, since that is what changes when you move
+it.
 
 **SETTINGS** brightness, sleep timeout, page turn (by knock or automatic),
 popup time, eye style, hotspot, check for update, reboot.

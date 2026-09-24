@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "1.5.1"
+#define FW_VERSION "1.6.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -89,10 +89,10 @@ float ax, ay, az, amag = 1, mx, my, mz, gxr, gyr, gzr, mtemp;
 
 // ---------------- screens ----------------
 enum { S_HOME = 0, S_FOCUS, S_WEATHER, S_MSG, S_PRAYER,
-       S_FAITH, S_READS, S_SETTINGS, S_SYSTEM, S_COUNT };
+       S_FAITH, S_READS, S_GAMES, S_SETTINGS, S_SYSTEM, S_COUNT };
 const char* S_NAME[S_COUNT] =
   { "HOME", "FOCUS", "WEATHER", "MESSAGES", "PRAYER",
-    "FAITH", "SHORT READS", "SETTINGS", "SYSTEM" };
+    "FAITH", "SHORT READS", "GAMES", "SETTINGS", "SYSTEM" };
 
 // depth 0 the carousel, 1 a list, 2 inside it, 3 one level deeper
 int screen = S_HOME;
@@ -1036,6 +1036,416 @@ static void drawOta() {
   oled.display();
 }
 // ================================================================
+//  GAMES
+// ================================================================
+//  Both are played by tilting. The trouble with tilt is that it only
+//  means anything relative to how the thing happens to be sitting,
+//  and this one could be upright on a desk or lying flat. So rather
+//  than guess, it asks once: hold still, tilt right, tilt away. That
+//  mapping is kept in flash and never asked for again. The resting
+//  position is re-measured every time a game starts, because that is
+//  the part that drifts when you pick it up and put it down.
+// ================================================================
+enum { G_SNAKE = 0, G_BRICK, G_COUNT };
+const char* G_NAME[G_COUNT] = { "Snake", "Brick" };
+
+enum { GS_CAL_STILL = 0, GS_CAL_RIGHT, GS_CAL_AWAY, GS_READY, GS_PLAY, GS_PAUSE, GS_OVER };
+int  gState = GS_READY;
+int  gScore = 0, gBest[G_COUNT] = { 0, 0 };
+unsigned long gNext = 0, gStamp = 0;
+
+int8_t mapAxX = -1, mapSgnX = 1, mapAxY = -1, mapSgnY = 1;   // -1 until taught
+float  restV[3] = { 0, 0, 0 };
+int    gravAx = 2;
+float  calAcc[3] = { 0, 0, 0 };
+int    calN = 0;
+
+static void saveTiltMap() {
+  char b[24];
+  snprintf(b, sizeof(b), "%d,%d,%d,%d", mapAxX, mapSgnX, mapAxY, mapSgnY);
+  prefs.putString("tiltmap", b);
+}
+static void loadTiltMap() {
+  String s = prefs.getString("tiltmap", "");
+  if (!s.length()) return;
+  int v[4] = { -1, 1, -1, 1 }, i = 0, n = 0;
+  while (n < 4 && i <= (int)s.length()) {
+    int c = s.indexOf(',', i); if (c < 0) c = s.length();
+    v[n++] = s.substring(i, c).toInt();
+    i = c + 1;
+  }
+  if (v[0] >= 0 && v[0] < 3 && v[2] >= 0 && v[2] < 3 && v[0] != v[2]) {
+    mapAxX = v[0]; mapSgnX = v[1]; mapAxY = v[2]; mapSgnY = v[3];
+  }
+}
+static bool tiltTaught() { return mapAxX >= 0 && mapAxY >= 0; }
+
+static void tiltRead(float& tx, float& ty) {
+  float v[3] = { ax, ay, az };
+  tx = (mapAxX >= 0) ? mapSgnX * (v[mapAxX] - restV[mapAxX]) : 0;
+  ty = (mapAxY >= 0) ? mapSgnY * (v[mapAxY] - restV[mapAxY]) : 0;
+}
+
+// ---------------- Snake ----------------
+#define SN_CELL 4
+#define SN_COLS 32
+#define SN_TOP  12
+#define SN_ROWS 13
+#define SN_MAX  170
+uint8_t snX[SN_MAX], snY[SN_MAX];
+int  snLen = 3, snDir = 0, snPend = 0;
+uint8_t foodX = 20, foodY = 6;
+unsigned long snPace = 220;
+
+static void snPlaceFood() {
+  for (int tries = 0; tries < 200; tries++) {
+    uint8_t fx = random(SN_COLS), fy = random(SN_ROWS);
+    bool hit = false;
+    for (int i = 0; i < snLen; i++) if (snX[i] == fx && snY[i] == fy) { hit = true; break; }
+    if (!hit) { foodX = fx; foodY = fy; return; }
+  }
+}
+static void snReset() {
+  snLen = 3; snDir = 0; snPend = 0; snPace = 220;
+  for (int i = 0; i < snLen; i++) { snX[i] = 6 - i; snY[i] = SN_ROWS / 2; }
+  gScore = 0;
+  snPlaceFood();
+}
+static void snStep() {
+  float tx, ty;
+  tiltRead(tx, ty);
+  const float T = 0.20f;
+  int want = -1;
+  if (fabsf(tx) > fabsf(ty)) { if (tx > T) want = 0; else if (tx < -T) want = 2; }
+  else                       { if (ty > T) want = 3; else if (ty < -T) want = 1; }
+  if (want >= 0 && (want + 2) % 4 != snDir) snDir = want;   // no doubling back
+
+  int nx = snX[0] + (snDir == 0 ? 1 : snDir == 2 ? -1 : 0);
+  int ny = snY[0] + (snDir == 1 ? 1 : snDir == 3 ? -1 : 0);
+  if (nx < 0 || nx >= SN_COLS || ny < 0 || ny >= SN_ROWS) { gState = GS_OVER; return; }
+  for (int i = 0; i < snLen; i++) if (snX[i] == nx && snY[i] == ny) { gState = GS_OVER; return; }
+
+  bool ate = (nx == foodX && ny == foodY);
+  if (ate && snLen < SN_MAX) snLen++;
+  for (int i = snLen - 1; i > 0; i--) { snX[i] = snX[i - 1]; snY[i] = snY[i - 1]; }
+  snX[0] = nx; snY[0] = ny;
+  if (ate) {
+    gScore++;
+    if (snPace > 120) snPace -= 5;
+    snPlaceFood();
+  }
+}
+static void snDraw() {
+  for (int i = 0; i < snLen; i++)
+    oled.fillRect(snX[i] * SN_CELL, SN_TOP + snY[i] * SN_CELL, 3, 3, SSD1306_WHITE);
+  oled.drawRect(foodX * SN_CELL, SN_TOP + foodY * SN_CELL, 3, 3, SSD1306_WHITE);
+  oled.drawPixel(foodX * SN_CELL + 1, SN_TOP + foodY * SN_CELL + 1, SSD1306_WHITE);
+}
+
+// ---------------- Brick ----------------
+#define BR_COLS 8
+#define BR_ROWS 3
+#define BR_TOP  14
+#define BR_W    16
+#define BR_H    7
+#define PAD_W   22
+#define PAD_Y   59
+bool  brick[BR_ROWS][BR_COLS];
+float bx, by, bvx, bvy, padX;
+int   brLives = 3, brLeft = 0, brLevel = 1;
+bool  brStuck = true;
+unsigned long brStuckAt = 0;
+#define BR_AUTO_LAUNCH 1300UL      // so it never just sits there looking broken
+
+static void brFill() {
+  brLeft = 0;
+  for (int r = 0; r < BR_ROWS; r++)
+    for (int c = 0; c < BR_COLS; c++) { brick[r][c] = true; brLeft++; }
+}
+static void brServe() {
+  brStuck = true;
+  brStuckAt = millis();
+  padX = (SCRW - PAD_W) / 2;
+  bx = padX + PAD_W / 2; by = PAD_Y - 3;
+  float sp = 0.85f + 0.12f * (brLevel - 1);
+  bvx = (random(2) ? sp : -sp) * 0.75f;
+  bvy = -sp;
+}
+static void brReset() {
+  brLives = 3; brLevel = 1; gScore = 0;
+  brFill(); brServe();
+}
+static void brStepGame() {
+  float tx, ty;
+  tiltRead(tx, ty);
+  padX += tx * 26.0f;                       // tilt slides it, proportionally
+  padX = constrain(padX, 0.0f, (float)(SCRW - PAD_W));
+
+  // Waiting on a knock forever is how a game looks broken, so it lets
+  // go by itself after a moment. A knock still launches it early.
+  if (brStuck) {
+    bx = padX + PAD_W / 2; by = PAD_Y - 3;
+    if (millis() - brStuckAt > BR_AUTO_LAUNCH) brStuck = false;
+    return;
+  }
+
+  bx += bvx; by += bvy;
+  if (bx < 1)        { bx = 1;        bvx = -bvx; }
+  if (bx > SCRW - 2) { bx = SCRW - 2; bvx = -bvx; }
+  if (by < 12)       { by = 12;       bvy = -bvy; }
+
+  // the paddle, which also steers: the edges send it away at an angle
+  if (bvy > 0 && by >= PAD_Y - 2 && by <= PAD_Y + 2 &&
+      bx >= padX - 1 && bx <= padX + PAD_W + 1) {
+    by = PAD_Y - 2;
+    bvy = -fabsf(bvy);
+    float off = ((bx - padX) / PAD_W) - 0.5f;          // -0.5 .. 0.5
+    bvx += off * 1.1f;
+    bvx = constrain(bvx, -1.7f, 1.7f);
+  }
+
+  // bricks
+  if (by >= BR_TOP && by < BR_TOP + BR_ROWS * BR_H) {
+    int c = (int)bx / BR_W;
+    int r = (int)(by - BR_TOP) / BR_H;
+    if (c >= 0 && c < BR_COLS && r >= 0 && r < BR_ROWS && brick[r][c]) {
+      brick[r][c] = false;
+      brLeft--;
+      gScore += 10;
+      bvy = -bvy;
+      if (!brLeft) { brLevel++; brFill(); brServe(); return; }
+    }
+  }
+
+  if (by > 63) {
+    brLives--;
+    if (brLives <= 0) { gState = GS_OVER; return; }
+    brServe();
+  }
+}
+static void brDraw() {
+  for (int r = 0; r < BR_ROWS; r++)
+    for (int c = 0; c < BR_COLS; c++)
+      if (brick[r][c]) oled.fillRect(c * BR_W, BR_TOP + r * BR_H, BR_W - 1, BR_H - 2, SSD1306_WHITE);
+  oled.fillRect((int)padX, PAD_Y, PAD_W, 3, SSD1306_WHITE);
+  oled.fillRect((int)bx - 1, (int)by - 1, 2, 2, SSD1306_WHITE);
+}
+
+// ---------------- shared ----------------
+static void gameStart(int which) {
+  gState = tiltTaught() ? GS_CAL_STILL : GS_CAL_STILL;   // rest is measured every time
+  calAcc[0] = calAcc[1] = calAcc[2] = 0; calN = 0;
+  gStamp = millis();
+  if (which == G_SNAKE) snReset(); else brReset();
+}
+
+// the teaching steps, and the short hold that finds the rest position
+static void gameCalibrate(int which) {
+  readSensors();
+  float v[3] = { ax, ay, az };
+
+  if (gState == GS_CAL_STILL) {
+    for (int i = 0; i < 3; i++) calAcc[i] += v[i];
+    calN++;
+    if (millis() - gStamp > 900 && calN > 4) {
+      for (int i = 0; i < 3; i++) restV[i] = calAcc[i] / calN;
+      gravAx = 0;
+      for (int i = 1; i < 3; i++) if (fabsf(restV[i]) > fabsf(restV[gravAx])) gravAx = i;
+      if (tiltTaught() && mapAxX != gravAx && mapAxY != gravAx) {
+        gState = GS_READY; gStamp = millis();
+      } else {
+        mapAxX = mapAxY = -1;
+        gState = GS_CAL_RIGHT;
+      }
+    }
+    return;
+  }
+
+  if (gState == GS_CAL_RIGHT) {
+    int best = -1; float bd = 0.30f;
+    for (int i = 0; i < 3; i++) {
+      if (i == gravAx) continue;
+      float d = v[i] - restV[i];
+      if (fabsf(d) > bd) { bd = fabsf(d); best = i; }
+    }
+    if (best >= 0) {
+      mapAxX = best;
+      mapSgnX = (v[best] - restV[best]) > 0 ? 1 : -1;
+      gState = GS_CAL_AWAY;
+      gStamp = millis();
+    }
+    return;
+  }
+
+  if (gState == GS_CAL_AWAY) {
+    if (millis() - gStamp < 700) return;          // let the hand settle first
+    for (int i = 0; i < 3; i++) {
+      if (i == gravAx || i == mapAxX) continue;
+      float d = v[i] - restV[i];
+      if (fabsf(d) > 0.30f) {
+        mapAxY = i;
+        mapSgnY = d > 0 ? 1 : -1;
+        saveTiltMap();
+        gState = GS_READY;
+        gStamp = millis();
+        Serial.printf("tilt taught: x=axis%d(%+d) y=axis%d(%+d) grav=axis%d\n",
+                      mapAxX, mapSgnX, mapAxY, mapSgnY, gravAx);
+        return;
+      }
+    }
+  }
+}
+
+static void serviceGame() {
+  int which = itemIdx;
+  unsigned long now = millis();
+  readSensors();                       // the tick is faster than the input poll
+
+  if (gState <= GS_CAL_AWAY) { gameCalibrate(which); return; }
+  if (gState == GS_READY) {
+    if (now - gStamp > 1800) { gState = GS_PLAY; gNext = now; }
+    return;
+  }
+  if (gState != GS_PLAY) return;
+
+  if (which == G_SNAKE) {
+    if ((long)(now - gNext) < 0) return;
+    gNext = now + snPace;
+    snStep();
+  } else {
+    if ((long)(now - gNext) < 0) return;
+    gNext = now + 28;
+    brStepGame();
+  }
+
+  if (gState == GS_OVER && gScore > gBest[which]) {
+    gBest[which] = gScore;
+    prefs.putInt(which == G_SNAKE ? "bestSnake" : "bestBrick", gScore);
+  }
+}
+
+// ---------------- the screens ----------------
+static void padIcon(int cx, int cy) {
+  oled.drawRoundRect(cx - 15, cy - 8, 30, 16, 5, SSD1306_WHITE);
+  oled.drawFastHLine(cx - 11, cy, 7, SSD1306_WHITE);      // the cross
+  oled.drawFastVLine(cx - 8, cy - 3, 7, SSD1306_WHITE);
+  oled.fillCircle(cx + 7, cy - 2, 2, SSD1306_WHITE);      // and the buttons
+  oled.fillCircle(cx + 11, cy + 3, 2, SSD1306_WHITE);
+}
+static void snakeIcon(int x, int y) {
+  const int8_t P[8][2] = { {2,4},{6,4},{10,4},{14,4},{14,8},{14,12},{18,12},{22,12} };
+  for (int i = 0; i < 8; i++) oled.fillRect(x + P[i][0], y + P[i][1], 3, 3, SSD1306_WHITE);
+  oled.drawRect(x + 26, y + 12, 3, 3, SSD1306_WHITE);
+}
+static void brickIcon(int x, int y) {
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 4; c++)
+      oled.fillRect(x + 2 + c * 8, y + 2 + r * 5, 7, 3, SSD1306_WHITE);
+  oled.fillRect(x + 9, y + 22, 12, 2, SSD1306_WHITE);
+  oled.fillRect(x + 20, y + 18, 2, 2, SSD1306_WHITE);
+}
+
+static void drawGameList() {
+  oled.clearDisplay();
+  char r[10];
+  snprintf(r, sizeof(r), "%d/%d", itemIdx + 1, G_COUNT);
+  titleBar("GAMES", r);
+  const int TX[2] = { 10, 76 }, TY = 15, TW = 42, TH = 30;
+  for (int i = 0; i < G_COUNT; i++) {
+    if (i == itemIdx) oled.drawRoundRect(TX[i] - 2, TY - 2, TW, TH, 4, SSD1306_WHITE);
+    if (i == G_SNAKE) snakeIcon(TX[i] + 4, TY + 4);
+    else              brickIcon(TX[i] + 4, TY + 3);
+  }
+  char l[26];
+  snprintf(l, sizeof(l), "%s   best %d", G_NAME[itemIdx], gBest[itemIdx]);
+  ctr(l, 50, 1);
+  oled.display();
+}
+
+static void drawGamePlay() {
+  int which = itemIdx;
+  oled.clearDisplay();
+
+  if (gState <= GS_CAL_AWAY) {
+    titleBar("HOLD ON", "");
+    if (gState == GS_CAL_STILL) {
+      ctr("Hold it still", 24, 1);
+      int n = ((millis() - gStamp) / 220) % 4;
+      for (int i = 0; i < 3; i++)
+        oled.fillCircle(52 + i * 12, 44, i < n ? 3 : 1, SSD1306_WHITE);
+    } else if (gState == GS_CAL_RIGHT) {
+      ctr("Now tilt it right", 22, 1);
+      int a = (millis() / 300) % 3;
+      for (int i = 0; i <= a; i++) {
+        int x = 52 + i * 8;
+        oled.drawLine(x, 44, x + 5, 48, SSD1306_WHITE);
+        oled.drawLine(x, 52, x + 5, 48, SSD1306_WHITE);
+      }
+    } else {
+      ctr("Now tilt it away", 22, 1);
+      int a = (millis() / 300) % 3;
+      for (int i = 0; i <= a; i++) {
+        int y = 52 - i * 7;
+        oled.drawLine(60, y, 64, y - 5, SSD1306_WHITE);
+        oled.drawLine(68, y, 64, y - 5, SSD1306_WHITE);
+      }
+    }
+    oled.display();
+    return;
+  }
+
+  if (gState == GS_READY) {
+    titleBar(which == G_SNAKE ? "SNAKE" : "BRICK", "");
+    ctr(which == G_SNAKE ? "Tilt to steer" : "Tilt to slide", 22, 1);
+    long left = 1800 - (long)(millis() - gStamp);
+    char c[4];
+    snprintf(c, sizeof(c), "%ld", left / 600 + 1);
+    ctr(c, 36, 2);
+    oled.display();
+    return;
+  }
+
+  char r[14];
+  if (which == G_SNAKE) snprintf(r, sizeof(r), "%d", gScore);
+  else                  snprintf(r, sizeof(r), "L%d %d", brLives, gScore);
+  titleBar(which == G_SNAKE ? "SNAKE" : "BRICK", r);
+
+  if (which == G_SNAKE) snDraw(); else brDraw();
+  if (which == G_BRICK && brStuck && gState == GS_PLAY) ctr("Knock to launch", 44, 1);
+
+  if (gState == GS_PAUSE) {
+    oled.fillRect(10, 22, 108, 26, SSD1306_BLACK);
+    oled.drawRect(10, 22, 108, 26, SSD1306_WHITE);
+    ctr("PAUSED", 27, 1);
+    ctr("2 go on  3 leave", 38, 1);
+  }
+  if (gState == GS_OVER) {
+    // Brick scores reach four digits, so the two numbers get a line each
+    // rather than sharing one and running out of the box.
+    oled.fillRect(4, 13, 120, 46, SSD1306_BLACK);
+    oled.drawRect(4, 13, 120, 46, SSD1306_WHITE);
+    ctr("GAME OVER", 17, 1);
+    char l[20];
+    snprintf(l, sizeof(l), "Score %d", gScore);       ctr(l, 28, 1);
+    snprintf(l, sizeof(l), "Best %d", gBest[which]);  ctr(l, 38, 1);
+    ctr("2 again  3 leave", 49, 1);
+  }
+  oled.display();
+}
+
+static void drawGames() {
+  if (depth == 0) {
+    oled.clearDisplay();
+    bar("GAMES");
+    padIcon(SCRW / 2, 30);
+    ctr("Two knocks to open", 50, 1);
+    oled.display();
+    return;
+  }
+  if (depth == 1) { drawGameList(); return; }
+  drawGamePlay();
+}
+// ================================================================
 //  NETWORK
 // ================================================================
 static bool httpGetTo(const String& url, bool tls, String& out, int ms) {
@@ -1839,6 +2249,11 @@ static void knockOne() {
     nextPage();
     return;
   }
+  if (screen == S_GAMES) {
+    if (depth == 1) { itemIdx = (itemIdx + 1) % G_COUNT; return; }
+    if (itemIdx == G_BRICK && gState == GS_PLAY) brStuck = false;   // let it go
+    return;
+  }
   if (screen == S_SETTINGS) {
     if (depth == 1) { itemIdx = (itemIdx + 1) % C_COUNT; return; }
     switch (itemIdx) {
@@ -1862,6 +2277,7 @@ static void knockTwo() {
     switch (screen) {
       case S_FAITH:    depth = 1; itemIdx = 0; subIdx = 0; break;
       case S_READS:    if (readCount) { depth = 1; itemIdx = 0; } else refillShelf(); break;
+      case S_GAMES:    depth = 1; itemIdx = 0; break;
       case S_SETTINGS: depth = 1; itemIdx = 0; break;
       case S_HOME:     if (!timeOk) swStart = millis(); break;   // restart the stopwatch
       case S_WEATHER:  nextWx = 0; break;
@@ -1894,6 +2310,13 @@ static void knockTwo() {
     depth = 2;                                   // out of a chapter, back to the list
     return;
   }
+  if (screen == S_GAMES) {
+    if (depth == 1) { gameStart(itemIdx); depth = 2; return; }
+    if (gState == GS_OVER)  { gameStart(itemIdx); return; }
+    if (gState == GS_PLAY)  { gState = GS_PAUSE;  return; }
+    if (gState == GS_PAUSE) { gState = GS_PLAY; gNext = millis(); return; }
+    return;
+  }
   if (screen == S_SETTINGS && depth == 1) {
     switch (itemIdx) {
       case C_REBOOT:  delay(150); ESP.restart(); break;
@@ -1919,6 +2342,12 @@ static void knockThree() {
 
 static void knockFour() {
   cQuad++;
+  if (screen == S_GAMES && depth == 2) { gameStart(itemIdx); return; }
+  if (screen == S_GAMES && depth == 1) {          // forget how it was taught to tilt
+    mapAxX = mapAxY = -1;
+    prefs.remove("tiltmap");
+    return;
+  }
   if (screen == S_READS && depth >= 1) { refillShelf(); depth = readCount ? 2 : 1; return; }
   if (screen == S_FAITH && depth == 2 && itemIdx == F_ZIKR) { zikrReset(); return; }
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
@@ -2105,7 +2534,10 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
     <button class="g" onclick="go(4)">Prayer</button>
     <button class="g" onclick="go(5)">Faith</button>
     <button class="g" onclick="go(6)">Reads</button>
-    <button class="g" onclick="go(8)">System</button>
+    <button class="g" onclick="go(7)">Games</button>
+  </div><div class="row" style="margin-top:8px">
+    <button class="g" onclick="go(8)">Settings</button>
+    <button class="g" onclick="go(9)">System</button>
   </div></div>
 
   <h2>Reading</h2><div class="card">
@@ -2673,6 +3105,10 @@ void setup() {
   loadTasks();
   loadPrayer();
   loadAdj();
+  loadTiltMap();
+  gBest[G_SNAKE] = prefs.getInt("bestSnake", 0);
+  gBest[G_BRICK] = prefs.getInt("bestBrick", 0);
+  randomSeed(esp_random());
   swStart = millis();
 
   // First run: copy what is compiled in into flash. After that flash
@@ -2796,7 +3232,8 @@ void loop() {
   if (sessionRunning() || millis() < flashUntil) { lastActive = now; screen = S_FOCUS; depth = 0; }
 
   // depth only means something on the three screens that have one
-  if (screen != S_FAITH && screen != S_READS && screen != S_SETTINGS && depth) {
+  if (screen != S_FAITH && screen != S_READS && screen != S_GAMES &&
+      screen != S_SETTINGS && depth) {
     depth = 0; itemIdx = 0; subIdx = 0;
   }
 
@@ -2819,6 +3256,15 @@ void loop() {
     return;
   }
 
+  // a game runs its own clock, and holds the screen while it does
+  if (screen == S_GAMES && depth == 2) {
+    lastActive = now;
+    serviceGame();
+    if (now - lastDraw >= 33) { lastDraw = now; drawGames(); }
+    delay(2);
+    return;
+  }
+
   if (now - lastDraw >= 110) {
     lastDraw = now;
     switch (screen) {
@@ -2828,6 +3274,7 @@ void loop() {
       case S_PRAYER:   drawPrayer();   break;
       case S_FAITH:    drawFaith();    break;
       case S_READS:    drawReads();    break;
+      case S_GAMES:    drawGames();    break;
       case S_SETTINGS: drawSettings(); break;
       case S_SYSTEM:   drawSystem();   break;
       default:         drawHome();     break;
