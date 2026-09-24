@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.0.1"
+#define FW_VERSION "2.0.2"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -249,6 +249,8 @@ static bool sessionRunning() { return taskIdx >= 0 && taskIdx < taskCount; }
 bool asleep = false, screenOn = true, timeOk = false, rescueAP = false, fsOk = false;
 unsigned long lastActive = 0, lastDraw = 0, lastPoll = 0, reactUntil = 0, lastShake = 0;
 unsigned long nextTimeTry = 0, swStart = 0, inputMuteUntil = 0;
+unsigned long lastLowG = 0, lastFallAt = 0;
+float lastTx = 0, lastTy = 0;
 uint32_t cTap = 0, cDouble = 0, cTriple = 0, cQuad = 0, cFall = 0, cShake = 0, cBoot = 0;
 uint8_t  burst = 0;
 unsigned long burstStart = 0;
@@ -301,7 +303,11 @@ static void startSensors() {
     wReg(adxl, A_THRESH_TAP, 0x28); wReg(adxl, A_DUR, 0x10);
     wReg(adxl, A_LATENT, 0x30);     wReg(adxl, A_WINDOW, 0xC0);
     wReg(adxl, A_TAP_AXES, 0x07);
-    wReg(adxl, A_THRESH_FF, 0x07);  wReg(adxl, A_TIME_FF, 0x14);
+    // 375mg for 200ms. A drop from desk height is 250ms or more of real
+    // free fall, so this still catches one; the old 438mg for 100ms was
+    // at the sensitive end of the datasheet range and a hand turning the
+    // thing over tripped it constantly.
+    wReg(adxl, A_THRESH_FF, 0x06);  wReg(adxl, A_TIME_FF, 0x28);
     wReg(adxl, A_INT_ENABLE, INT_TAP1 | INT_FF);   // single taps only, we count them
     wReg(adxl, A_POWER_CTL, 0x08);
     delay(20); rReg(adxl, A_INT_SOURCE);
@@ -3268,6 +3274,13 @@ static void tiltNav() {
   tiltRead(tx, ty);
   unsigned long now = millis();
 
+  // Gravity has the same magnitude whichever way up the thing is, so
+  // leaning it never shows up in the movement check that keeps it awake:
+  // it would doze off under your hand mid gesture. Watch the lean itself
+  // change instead. One left standing at an angle still settles down.
+  if (fabsf(tx - lastTx) > 0.03f || fabsf(ty - lastTy) > 0.03f) lastActive = now;
+  lastTx = tx; lastTy = ty;
+
   if (ty > NAV_TILT_ON) {
     if (!upSince) { upSince = now; upConsumed = false; }
     else if (!upConsumed && now - upSince >= NAV_HOME_MS) {
@@ -3333,9 +3346,18 @@ static void input() {
     return;
   }
 
+  if (amag < 0.60f) lastLowG = now;
+
   if (adxl) {
     uint8_t s = rReg(adxl, A_INT_SOURCE);
-    if (s & INT_FF) { wake("fall"); onFall(); return; }
+    // The latch trips on any brief unloading, and a hand turning the
+    // device over produces those constantly. Believe it only if the low
+    // reading is one we saw ourselves, and never twice in a few seconds.
+    if ((s & INT_FF) && lastLowG && now - lastLowG < 400 &&
+        (!lastFallAt || now - lastFallAt > 4000)) {
+      lastFallAt = now;
+      wake("fall"); onFall(); return;
+    }
     if (s & INT_TAP1) {
       wake("knock");
       if (!burst) burstStart = now;
