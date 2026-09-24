@@ -45,7 +45,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.3.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -139,14 +139,20 @@ int  prayerDay = -1;
 unsigned long nextPrayerTry = 0;
 
 // The story is wrapped into lines once, when it arrives, so turning a
-// page later costs nothing.
-#define STORY_LINES 72
+// page later costs nothing. Room for a long one: 200 lines is about
+// fifty pages, or eight hundred words.
+#define STORY_LINES 200
 #define LINES_PER_PAGE 4
+#define STORY_MAX_CHARS 3400          // what fits in one preferences entry
 String storyLine[STORY_LINES];
 int    storyLines = 0, storyPage = 0;
 bool   storyBusy = false;
+bool   reading = false;               // inside the story, turning pages by hand
 String storyState = "no story yet";
-unsigned long nextStory = 0, lastPageTurn = 0;
+String storyTitle = "";               // first few words, shown on the cover
+unsigned long nextStory = 0;
+
+#define READING_SLEEP_SEC 120         // longer fuse while you are reading
 
 // ---------------- work session ----------------
 //  A list of stretches to work through. Each one runs, flashes when it
@@ -472,14 +478,9 @@ static void drawMessage() {
 
 static void drawStory() {
   oled.clearDisplay();
-  char r[12];
-  if (storyLines) {
-    int pages = (storyLines + LINES_PER_PAGE - 1) / LINES_PER_PAGE;
-    snprintf(r, sizeof(r), "%d/%d", storyPage + 1, pages);
-  } else strcpy(r, "");
-  titleBar("STORY", r);
 
   if (storyBusy) {
+    titleBar("STORY", "");
     ctr("writing", 26, 1);
     int a = (millis() / 110) % 8;
     for (int i = 0; i < 8; i++) {
@@ -490,16 +491,39 @@ static void drawStory() {
     oled.display();
     return;
   }
+
   if (!storyLines) {
+    titleBar("STORY", "");
     ctr(storyState.c_str(), 28, 1);
-    // only blame the key when the key really is the problem
     ctr(cfgKey.length() ? "two knocks to retry" : "add a key on the page", 44, 1);
     oled.display();
     return;
   }
+
+  int pages = (storyLines + LINES_PER_PAGE - 1) / LINES_PER_PAGE;
+  char r[12];
+
+  if (!reading) {
+    // the cover: a taste of it, and how to open it
+    snprintf(r, sizeof(r), "%d pages", pages);
+    titleBar("STORY", r);
+    at(2, 18, storyLine[0].c_str());
+    if (storyLines > 1) at(2, 30, storyLine[1].c_str());
+    oled.drawFastHLine(8, 44, SCRW - 16, SSD1306_WHITE);
+    ctr("two knocks to read", 51, 1);
+    oled.display();
+    return;
+  }
+
+  snprintf(r, sizeof(r), "%d/%d", storyPage + 1, pages);
+  titleBar("READING", r);
   int start = storyPage * LINES_PER_PAGE;
   for (int i = 0; i < LINES_PER_PAGE && start + i < storyLines; i++)
-    at(2, 16 + i * 12, storyLine[start + i].c_str());
+    at(2, 15 + i * 12, storyLine[start + i].c_str());
+
+  // a thin thread along the bottom showing how far in you are
+  int w = pages > 1 ? (SCRW - 4) * (storyPage + 1) / pages : SCRW - 4;
+  oled.drawFastHLine(2, 63, w, SSD1306_WHITE);
   oled.display();
 }
 
@@ -756,6 +780,10 @@ static void fetchPrayer() {
 // ================================================================
 // The text is wrapped into lines the moment it arrives, so paging
 // through it later is free.
+static void saveStory(const String& text) {
+  prefs.putString("story", text.substring(0, STORY_MAX_CHARS));
+}
+
 static void layoutStory(const String& text) {
   storyLines = 0;
   storyPage = 0;
@@ -774,6 +802,7 @@ static void layoutStory(const String& text) {
     storyLine[storyLines++] = text.substring(i, i + take);
     i += take;
   }
+  storyTitle = storyLines ? storyLine[0] : String("");
 }
 
 static void fetchStory() {
@@ -793,10 +822,13 @@ static void fetchStory() {
   h.addHeader("Content-Type", "application/json");
   h.addHeader("Authorization", "Bearer " + cfgKey);
 
-  String body = "{\"model\":\"gpt-4o-mini\",\"max_tokens\":700,\"temperature\":0.9,"
+  String body = "{\"model\":\"gpt-4o-mini\",\"max_tokens\":1500,\"temperature\":0.95,"
                 "\"messages\":[{\"role\":\"user\",\"content\":"
-                "\"Write a gentle love story of about 400 words in simple, warm English. "
-                "Plain prose only: no title, no headings, no markdown, no quotation marks.\"}]}";
+                "\"Write a long, warm romantic love story of about 800 words in simple English. "
+                "Give the characters Muslim names such as Ayaan, Zaynab, Bilal, Maryam, Idris, "
+                "Safiya, Yusuf or Aisha. Keep it tender and respectful, the kind of story that "
+                "ends happily. Plain prose only: no title, no headings, no markdown, no lists, "
+                "no quotation marks around the whole thing.\"}]}";
 
   int code = h.POST(body);
   if (code != 200) {
@@ -832,10 +864,21 @@ static void fetchStory() {
   if (!text.length()) { storyBusy = false; storyState = "empty reply"; return; }
 
   layoutStory(text);
+  saveStory(text);
   storyBusy = false;
   storyState = "ready";
-  lastPageTurn = millis();
   Serial.printf("story ready, %d lines\n", storyLines);
+}
+
+// Anything pasted on the page arrives here too, so the device does not
+// care whether a story was written for it or handed to it.
+static void setStory(const String& text) {
+  layoutStory(text);
+  saveStory(text);
+  storyPage = 0;
+  reading = false;
+  storyState = storyLines ? "ready" : "nothing in that";
+  Serial.printf("story set, %d lines\n", storyLines);
 }
 
 // ================================================================
@@ -1029,6 +1072,11 @@ static void react(unsigned long ms) { reactUntil = millis() + ms; }
 
 static void knockOne() {
   cTap++;
+  if (screen == S_STORY && reading) {              // turn the page
+    int pages = (storyLines + LINES_PER_PAGE - 1) / LINES_PER_PAGE;
+    if (pages > 0) storyPage = (storyPage + 1) % pages;
+    return;
+  }
   if (depth == 0) { screen = (screen + 1) % S_COUNT; itemIdx = 0; return; }
   if (depth == 1) { itemIdx = (itemIdx + 1) % C_COUNT; return; }
   switch (itemIdx) {                                  // depth 2: change it
@@ -1049,7 +1097,10 @@ static void knockTwo() {
     if (screen == S_SETTINGS) { depth = 1; itemIdx = 0; }
     else if (screen == S_WEATHER) nextWx = 0;         // refresh now
     else if (screen == S_PRAYER)  nextPrayerTry = 0;
-    else if (screen == S_STORY)   nextStory = 0;
+    else if (screen == S_STORY) {
+      if (storyLines) { reading = true; storyPage = 0; }   // start reading
+      else nextStory = 0;                                   // or ask for one
+    }
     return;
   }
   if (depth == 1) {
@@ -1062,6 +1113,7 @@ static void knockTwo() {
 
 static void knockThree() {
   cTriple++;
+  if (reading) { reading = false; return; }        // close the story
   if (depth > 0) depth--;
   else { screen = S_HOME; itemIdx = 0; }
 }
@@ -1118,7 +1170,12 @@ static void input() {
     lastActive = now;
   }
   if (asleep) return;
-  if (now - lastActive > (unsigned long)sleepSecs() * 1000UL) goSleep();
+
+  // Reading needs a longer fuse: two minutes on a page is normal, and
+  // dozing off mid sentence would be maddening.
+  unsigned long fuse = (screen == S_STORY && reading)
+                       ? (unsigned long)READING_SLEEP_SEC : (unsigned long)sleepSecs();
+  if (now - lastActive > fuse * 1000UL) goSleep();
 }
 
 // ================================================================
@@ -1144,6 +1201,7 @@ h2{font-size:11px;letter-spacing:.2em;color:var(--mut);margin:20px 0 8px;text-tr
 .tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:11px 4px}
 .tile b{display:block;font-size:18px;font-weight:500;font-variant-numeric:tabular-nums}
 .tile span{font-size:10px;color:var(--mut)}
+textarea{width:100%;padding:11px;border-radius:10px;border:1px solid var(--line);background:#0b141c;color:var(--fg);font:inherit;font-size:14px;margin-top:8px;resize:vertical}
 input,select{width:100%;padding:11px;border-radius:10px;border:1px solid var(--line);background:#0b141c;color:var(--fg);font:inherit;text-align:center}
 button{font:inherit;font-weight:600;padding:11px;border:0;border-radius:10px;background:var(--acc);color:#04201c;cursor:pointer;width:100%;margin-top:8px}
 button.g{background:transparent;color:var(--fg);border:1px solid var(--line)}
@@ -1207,8 +1265,11 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
   </div>
 
   <h2>Story</h2><div class="card">
+    <div class="sub" id="stMeta" style="margin-bottom:8px">nothing yet</div>
     <div class="story" id="st">nothing yet</div>
     <button class="g" onclick="act('/api/story')">Write a new one</button>
+    <textarea id="paste" rows="5" placeholder="or paste your own story here"></textarea>
+    <button class="g" onclick="pasteStory()">Put this on the clock</button>
   </div>
 </div>
 
@@ -1284,6 +1345,16 @@ window.addBreak=async function(){
 window.del=async function(i){await post('/api/plan',{del:i});load()}
 window.send=async function(){const m=$('m').value.trim();if(!m){$('t').textContent='type something';return}
   await post('/api/msg',{m:m});$('m').value='';$('t').textContent='sent';load()}
+window.pasteStory=async function(){
+  const t=$('paste').value.trim();
+  if(t.length<40){$('t').textContent='paste a bit more than that';return}
+  $('t').textContent='storing';
+  const r=await post('/api/paste',{text:t});
+  const j=await r.json().catch(()=>({}));
+  $('paste').value='';
+  $('t').textContent='stored, '+(j.lines||0)+' lines';
+  load();
+}
 window.saveKey=async function(){
   const k=$('key').value.trim(); if(!k){$('t').textContent='paste a key first';return}
   await post('/api/key',{key:k});$('key').value='';$('t').textContent='key saved';load()}
@@ -1311,6 +1382,7 @@ window.load=async function(){
   rows('wx',{'city':s.city,'temperature':s.temp,'humidity':s.hum,'wind':s.wind,'conditions':s.cond});
   rows('pr',s.prayer);
   $('st').textContent=s.story;
+  $('stMeta').textContent=s.lines?(s.lines+' lines · '+s.pages+' pages'+(s.reading?' · reading':'')):'nothing yet';
   $('keyState').textContent=s.hasKey?('key saved · '+s.storyState):'no key yet';
   rows('sys',{'signal':s.rssi,'address':s.ip,'free ram':s.heap+' B','uptime':s.up+' s',
               'boots':s.boots,'chip':s.chip,'firmware':s.fw});
@@ -1363,6 +1435,9 @@ static void apiState() {
   }
   o += "],";
   o += "\"hasKey\":" + String(cfgKey.length() ? "true" : "false") + ",";
+  o += "\"reading\":" + String(reading ? "true" : "false") + ",";
+  o += "\"pages\":" + String((storyLines + LINES_PER_PAGE - 1) / LINES_PER_PAGE) + ",";
+  o += "\"lines\":" + String(storyLines) + ",";
   o += "\"storyState\":\"" + storyState + "\",";
   o += "\"prayer\":{";
   for (int i = 0; i < 5; i++) {
@@ -1451,6 +1526,19 @@ static void setupWeb() {
     web.send(200, "application/json", "{\"ok\":true}");
   });
   web.on("/api/story",   HTTP_POST, []() { nextStory = 0; web.send(200, "application/json", "{\"ok\":true}"); });
+
+  // paste your own: it is wrapped and stored exactly like a written one
+  web.on("/api/paste", HTTP_POST, []() {
+    String t = web.arg("text");
+    t.trim();
+    if (t.length()) {
+      setStory(t.substring(0, STORY_MAX_CHARS));
+      screen = S_STORY; depth = 0;
+      wake("story");
+    }
+    web.send(200, "application/json",
+             String("{\"ok\":true,\"lines\":") + String(storyLines) + "}");
+  });
   web.on("/api/time", HTTP_POST, []() {
     long e = web.arg("e").toInt();
     int  z = web.arg("o").toInt();
@@ -1557,6 +1645,10 @@ void setup() {
   cfgKey      = prefs.getString("key", "");
   message     = prefs.getString("msg", "");
   loadTasks();
+  {
+    String saved = prefs.getString("story", "");
+    if (saved.length()) { layoutStory(saved); storyState = "ready"; }
+  }
 
   // First run: copy what is compiled in into flash. After that flash
   // wins, so an update can never take the network away.
@@ -1677,12 +1769,7 @@ void loop() {
 
   if (asleep) { delay(6); return; }
 
-  // the story turns its own pages, since one knock means next screen
-  if (screen == S_STORY && storyLines > LINES_PER_PAGE && now - lastPageTurn > 5000) {
-    lastPageTurn = now;
-    int pages = (storyLines + LINES_PER_PAGE - 1) / LINES_PER_PAGE;
-    storyPage = (storyPage + 1) % pages;
-  }
+  if (screen != S_STORY && reading) reading = false;
 
   if (now - lastDraw >= 110) {
     lastDraw = now;

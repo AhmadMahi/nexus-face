@@ -86,11 +86,21 @@ NEXUS-RESCUE / password  ->  http://192.168.4.1
 
 ## Stories
 
-Put an OpenAI key in the settings section of the page and the STORY screen
-fills itself from **gpt-4o-mini**, refreshing every six hours or on demand.
-The text is wrapped into lines the moment it arrives, so turning a page
-costs nothing. The key is kept in flash and never appears in the published
-binary.
+Put an OpenAI key in the Configuration tab and the STORY screen fills
+itself from **gpt-4o-mini**: long, warm romances of around eight hundred
+words, with Muslim names. It refreshes every six hours or on demand.
+
+The story screen shows a couple of lines as a cover. **Two knocks** opens
+it, **one knock** turns each page, **three knocks** closes it. While you
+are reading, the idle timeout stretches to two minutes so it will not doze
+off mid sentence.
+
+You can also paste your own text on the page and it is wrapped and stored
+exactly the same way, up to about 3400 characters, or fifty pages.
+
+Everything is wrapped into lines the moment it arrives, so turning a page
+costs nothing. The story survives a reboot. The key lives in flash and
+never appears in the published binary.
 
 The clock syncs over NTP. If it has no route to a time server, the panel
 quietly hands over your phone's own clock and timezone as soon as you open
