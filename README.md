@@ -155,8 +155,19 @@ MPU6050 0x68.
 
 ## Updating
 
-SETTINGS, then Check update, then two knocks. It reads the latest release
-here, shows the download moving, and restarts into it.
+SETTINGS, then Check update, then two knocks. That opens two choices:
+
+**Newest release** looks up what is current here. If it is something you
+are not already on, it names it and asks. One knock moves between Yes and
+No, two knocks answers.
+
+**Earlier releases** lists the last eight, with the one you are running
+marked. One knock walks the list, two knocks picks one, and it asks the
+same question. Putting an older build back is allowed on purpose, so there
+is always a way off a release you did not get on with.
+
+Nothing is written until the answer is Yes. Then it shows the download
+moving and restarts into it.
 
 If it says **will not fit**, the second line gives the numbers, for example
 `1352k into 1280k slot`. That means the board was flashed with a partition

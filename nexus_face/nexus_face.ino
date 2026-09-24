@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "2.0.1"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -253,6 +253,17 @@ uint32_t cTap = 0, cDouble = 0, cTriple = 0, cQuad = 0, cFall = 0, cShake = 0, c
 uint8_t  burst = 0;
 unsigned long burstStart = 0;
 String   otaStatus = "", otaStatus2 = "";
+
+// Updating is a little conversation now rather than one button: which
+// release, then yes or no, and only then does anything get written.
+enum { U_OFF = 0, U_MENU, U_ASK, U_LIST, U_NONE, U_FAIL };
+int    upState = U_OFF;
+int    upPick = 0;                  // 0 the latest one, 1 the older ones
+bool   upYes = true;
+String upTag = "", upUrl = "", upMsg = "";
+#define UP_MAX 8
+String relTag[UP_MAX], relUrl[UP_MAX];
+int    relCount = 0, relSel = 0;
 String   clockSrc = "not set";
 int      otaPct = -1;
 
@@ -1069,6 +1080,105 @@ static void drawOta() {
     snprintf(p, sizeof(p), "%d%%", otaPct);
     ctr(p, 50, 1);
   } else spinner(otaStatus2.length() ? 48 : 44);
+  oled.display();
+}
+
+// ================================================================
+//  CHOOSING AN UPDATE
+// ================================================================
+static void dlIcon(int cx, int cy) {
+  oled.drawFastVLine(cx, cy - 8, 9, SSD1306_WHITE);
+  oled.drawLine(cx - 4, cy - 3, cx, cy + 2, SSD1306_WHITE);
+  oled.drawLine(cx + 4, cy - 3, cx, cy + 2, SSD1306_WHITE);
+  oled.drawFastHLine(cx - 8, cy + 6, 17, SSD1306_WHITE);
+  oled.drawFastVLine(cx - 8, cy + 2, 5, SSD1306_WHITE);
+  oled.drawFastVLine(cx + 8, cy + 2, 5, SSD1306_WHITE);
+}
+static void histIcon(int cx, int cy) {
+  oled.drawCircle(cx, cy, 9, SSD1306_WHITE);
+  oled.drawFastVLine(cx, cy - 6, 7, SSD1306_WHITE);
+  oled.drawFastHLine(cx - 5, cy, 6, SSD1306_WHITE);
+  oled.drawLine(cx - 9, cy - 5, cx - 5, cy - 9, SSD1306_WHITE);
+  oled.drawLine(cx - 9, cy - 5, cx - 4, cy - 2, SSD1306_WHITE);
+}
+static void yesNo(bool yes) {
+  // Yes on the left, No on the right, whichever is picked filled in
+  // RoboEyes already owns N, NE, E, SE, S, SW, W and NW as direction
+  // macros, so nothing here gets a two letter capital name.
+  const int yesX = 29, yesW = 32, noX = 73, noW = 26, boxY = 36, boxH = 14;
+  if (yes) { oled.fillRect(yesX, boxY, yesW, boxH, SSD1306_WHITE);
+             oled.drawRect(noX, boxY, noW, boxH, SSD1306_WHITE); }
+  else     { oled.drawRect(yesX, boxY, yesW, boxH, SSD1306_WHITE);
+             oled.fillRect(noX, boxY, noW, boxH, SSD1306_WHITE); }
+  oled.setTextSize(1);
+  oled.setTextColor(yes ? SSD1306_BLACK : SSD1306_WHITE);
+  oled.setCursor(yesX + 7, boxY + 4); oled.print("Yes");
+  oled.setTextColor(yes ? SSD1306_WHITE : SSD1306_BLACK);
+  oled.setCursor(noX + 7, boxY + 4); oled.print("No");
+  oled.setTextColor(SSD1306_WHITE);
+}
+static void drawUpdateUI() {
+  oled.clearDisplay();
+  char r[12];
+  switch (upState) {
+    case U_MENU: {
+      snprintf(r, sizeof(r), "%d/2", upPick + 1);
+      titleBar("UPDATE", r);
+      const int TX[2] = { 14, 74 };
+      for (int i = 0; i < 2; i++) {
+        if (i == upPick) oled.drawRoundRect(TX[i] - 2, 13, 42, 28, 4, SSD1306_WHITE);
+        if (i == 0) dlIcon(TX[i] + 19, 27);
+        else        histIcon(TX[i] + 19, 27);
+      }
+      ctr(upPick == 0 ? "Newest release" : "Earlier releases", 45, 1);
+      ctr("1 next   2 open", 55, 1);
+      break;
+    }
+    case U_ASK:
+      titleBar("INSTALL", "");
+      ctr(upTag.length() ? upTag.c_str() : "unknown", 15, 1);
+      ctr("Put this one on?", 26, 1);
+      yesNo(upYes);
+      ctr("1 moves  2 confirms", 55, 1);
+      break;
+    case U_LIST: {
+      snprintf(r, sizeof(r), "%d/%d", relSel + 1, relCount);
+      titleBar("RELEASES", r);
+      int first = relSel > 3 ? relSel - 3 : 0;
+      if (first > relCount - 4) first = relCount - 4;
+      if (first < 0) first = 0;
+      for (int k = 0; k < 4 && first + k < relCount; k++) {
+        int i = first + k, y = 14 + k * 12;
+        bool on = (i == relSel);
+        if (on) { oled.fillRect(0, y - 2, SCRW, 12, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
+        else      oled.setTextColor(SSD1306_WHITE);
+        String t = relTag[i];
+        if (t == String("v" FW_VERSION) || t == String(FW_VERSION)) t += " (on now)";
+        oled.setTextSize(1);
+        oled.setCursor(3, y);
+        for (int c = 0; c < 20 && c < (int)t.length(); c++) oled.write(t[c]);
+        oled.setTextColor(SSD1306_WHITE);
+      }
+      if (relCount > 4) {
+        int h = max(4, 48 * 4 / relCount);
+        int yy = 14 + (48 - h) * relSel / max(1, relCount - 1);
+        oled.drawFastVLine(126, 14, 48, SSD1306_WHITE);
+        oled.fillRect(125, yy, 3, h, SSD1306_WHITE);
+      }
+      break;
+    }
+    case U_NONE:
+      titleBar("UPDATE", "");
+      ctr("Already current", 20, 1);
+      ctr(upTag.c_str(), 32, 1);
+      ctr("Knock to go back", 50, 1);
+      break;
+    default:
+      titleBar("UPDATE", "");
+      ctr(upMsg.length() ? upMsg.c_str() : "Something went wrong", 24, 1);
+      ctr("Knock to go back", 46, 1);
+      break;
+  }
   oled.display();
 }
 // ================================================================
@@ -2595,26 +2705,78 @@ static void otaFail(const char* why, const char* detail = "") {
   Update.abort();
 }
 
-static void runUpdate() {
-  if (!online()) { otaStatus = "No network"; otaPct = -1; drawOta(); delay(1800); return; }
-  otaStatus = "Checking"; otaPct = -1; drawOta();
+// GitHub returns compact JSON to the device, because the device sends no
+// Accept header, and pretty printed JSON to anything that sends one. The
+// whole update path used to rest on that staying true. It reads either
+// way now, which costs four lines and removes the assumption.
+static String jsonStr(const String& b, const char* key, int from = 0) {
+  int k = b.indexOf(key, from);
+  if (k < 0) return "";
+  int i = k + (int)strlen(key);
+  while (i < (int)b.length() &&
+         (b[i] == ' ' || b[i] == ':' || b[i] == '\t' || b[i] == '\n' || b[i] == '\r')) i++;
+  if (i >= (int)b.length() || b[i] != '"') return "";
+  i++;
+  int e = b.indexOf('"', i);
+  return e < 0 ? String("") : b.substring(i, e);
+}
 
+// Ask GitHub what the newest release is. Only fills in the answer; it
+// does not install anything.
+static bool otaFetchLatest() {
+  if (!online()) { upMsg = "No network"; return false; }
   String b;
   if (!httpGetTo("https://api.github.com/repos/" OTA_REPO "/releases/latest", true, b, 12000)) {
-    otaStatus = "GitHub unreachable"; drawOta(); delay(2200); return;
+    upMsg = "GitHub unreachable"; return false;
   }
-  int i = b.indexOf("\"tag_name\":\"");
-  String tag = i < 0 ? "" : b.substring(i + 12, b.indexOf('"', i + 12));
+  upTag = jsonStr(b, "\"tag_name\"");
   int a = b.indexOf(OTA_ASSET);
-  int u = a < 0 ? -1 : b.indexOf("\"browser_download_url\":\"", a);
-  String url = u < 0 ? "" : b.substring(u + 24, b.indexOf('"', u + 24));
-  b = String();                                  // let the reply go before we need the room
-  if (!tag.length() || !url.length()) { otaStatus = "No release"; drawOta(); delay(2200); return; }
-  if (verNum(tag) <= verNum(FW_VERSION)) { otaStatus = "Already newest"; drawOta(); delay(1800); return; }
+  upUrl = a < 0 ? "" : jsonStr(b, "\"browser_download_url\"", a);
+  b = String();
+  if (!upTag.length() || !upUrl.length()) { upMsg = "No release found"; return false; }
+  return true;
+}
 
-  otaStatus = tag; otaPct = 0; drawOta();
+// The last few releases, so an older one can be put back deliberately.
+static bool otaFetchList() {
+  if (!online()) { upMsg = "No network"; return false; }
+  String b;
+  if (!httpGetTo("https://api.github.com/repos/" OTA_REPO
+                 "/releases?per_page=8", true, b, 15000)) {
+    upMsg = "GitHub unreachable"; return false;
+  }
+  relCount = 0; relSel = 0;
+  int i = 0;
+  while (relCount < UP_MAX) {
+    int t = b.indexOf("\"tag_name\"", i);
+    if (t < 0) break;
+    String tag = jsonStr(b, "\"tag_name\"", t);
+    int nextT = b.indexOf("\"tag_name\"", t + 10);
+    int limit = nextT < 0 ? (int)b.length() : nextT;
+    int a = b.indexOf(OTA_ASSET, t);
+    String url = "";
+    if (a >= 0 && a < limit) {
+      int u = b.indexOf("\"browser_download_url\"", a);
+      if (u >= 0 && u < limit) url = jsonStr(b, "\"browser_download_url\"", a);
+    }
+    if (tag.length() && url.length()) {
+      relTag[relCount] = tag; relUrl[relCount] = url; relCount++;
+    }
+    i = t + 10;
+  }
+  b = String();
+  if (!relCount) { upMsg = "No releases found"; return false; }
+  return true;
+}
 
-  // ---- follow the redirects by hand, a fresh client for each host ----
+// Writes whatever was chosen. No version comparison lives here on
+// purpose: putting an older build back is a thing you are allowed to
+// want, and the asking has already happened by this point.
+static void otaInstall() {
+  if (!online() || !upUrl.length()) { otaFail("No network"); return; }
+  otaStatus = upTag; otaPct = 0; drawOta();
+
+  String url = upUrl;
   WiFiClientSecure* sec = nullptr;
   HTTPClient*       h   = nullptr;
   int  len = 0;
@@ -2624,7 +2786,7 @@ static void runUpdate() {
     sec = new WiFiClientSecure();
     if (!sec) { otaFail("Out of memory"); return; }
     sec->setInsecure();
-    sec->setTimeout(30);                         // seconds, for the socket itself
+    sec->setTimeout(30);
     h = new HTTPClient();
     h->setReuse(false);
     h->setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
@@ -2655,26 +2817,17 @@ static void runUpdate() {
   }
   if (!open) { otaFail("Too many redirects"); return; }
 
-  // "no room" used to be the whole story, which told you nothing. The
-  // slot an update lands in is fixed by the partition table that was
-  // written over USB, and only USB can change it, so say the numbers.
   const esp_partition_t* slot = esp_ota_get_next_update_partition(NULL);
   if (len <= 0) { h->end(); delete h; delete sec; otaFail("No content length"); return; }
-  if (!slot) {
-    h->end(); delete h; delete sec;
-    otaFail("No OTA slot", "Needs min SPIFFS");
-    return;
-  }
+  if (!slot)    { h->end(); delete h; delete sec; otaFail("No OTA slot", "Needs min SPIFFS"); return; }
   if ((size_t)len > slot->size || !Update.begin((size_t)len)) {
     char d[24];
-    snprintf(d, sizeof(d), "%dk into %uk slot",
-             len / 1024, (unsigned)(slot->size / 1024));
+    snprintf(d, sizeof(d), "%dk into %uk slot", len / 1024, (unsigned)(slot->size / 1024));
     h->end(); delete h; delete sec;
     otaFail("Will not fit", d);
     return;
   }
 
-  // ---- pull it down in pieces, repainting as we go ----
   WiFiClient* st = h->getStreamPtr();
   static uint8_t buf[2048];
   size_t done = 0;
@@ -2682,12 +2835,11 @@ static void runUpdate() {
   bool bad = false;
 
   otaStatus = "Downloading"; drawOta();
-
   while (done < (size_t)len) {
     size_t avail = st->available();
     if (avail) {
-      int want = (int)min(avail, sizeof(buf));
-      int got = st->readBytes(buf, want);
+      int want2 = (int)min(avail, sizeof(buf));
+      int got = st->readBytes(buf, want2);
       if (got > 0) {
         if (Update.write(buf, got) != (size_t)got) { bad = true; break; }
         done += got;
@@ -2697,7 +2849,7 @@ static void runUpdate() {
       }
     } else {
       if (!st->connected() && !st->available()) break;
-      if (millis() - lastByte > 20000UL) { bad = true; break; }   // stalled, not slow
+      if (millis() - lastByte > 20000UL) { bad = true; break; }
       delay(2);
     }
   }
@@ -2713,6 +2865,17 @@ static void runUpdate() {
   otaStatus = "Installed"; otaPct = 100; drawOta();
   delay(1400);
   ESP.restart();
+}
+
+// what the page's button still does: newest, straight away
+static void runUpdate() {
+  otaStatus = "Checking"; otaPct = -1; drawOta();
+  if (!otaFetchLatest()) { otaFail(upMsg.c_str()); return; }
+  if (upTag == FW_VERSION || upTag == String("v" FW_VERSION)) {
+    otaStatus = "Already current"; otaStatus2 = upTag; otaPct = -1;
+    drawOta(); delay(2400); otaStatus2 = ""; return;
+  }
+  otaInstall();
 }
 
 // ================================================================
@@ -2993,7 +3156,7 @@ static void knockTwo() {
   if (screen == S_SETTINGS && depth == 1) {
     switch (itemIdx) {
       case C_REBOOT:  delay(150); ESP.restart(); break;
-      case C_UPDATE:  if (online()) runUpdate();
+      case C_UPDATE:  if (online()) { upState = U_MENU; upPick = 0; upMsg = ""; }
                       else { otaStatus = "No network"; otaPct = -1; drawOta(); delay(1600); }
                       break;
       case C_HOTSPOT: startHotspot(); break;
@@ -3026,7 +3189,70 @@ static void knockFour() {
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
 }
 
-static void navHome() { screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; nTiltHome++; }
+static void updateKnock(uint8_t n) {
+  switch (upState) {
+    case U_MENU:
+      if (n == 1) { upPick = (upPick + 1) % 2; return; }
+      if (n == 2) {
+        otaStatus = "Checking"; otaStatus2 = ""; otaPct = -1; drawOta();
+        if (upPick == 0) {
+          if (!otaFetchLatest()) { upState = U_FAIL; return; }
+          if (upTag == String("v" FW_VERSION) || upTag == String(FW_VERSION)) {
+            upState = U_NONE; return;
+          }
+          upYes = true; upState = U_ASK; return;
+        }
+        if (!otaFetchList()) { upState = U_FAIL; return; }
+        upState = U_LIST; return;
+      }
+      upState = U_OFF;
+      return;
+
+    case U_ASK:
+      if (n == 1) { upYes = !upYes; return; }
+      if (n == 2) {
+        if (upYes) { upState = U_OFF; otaInstall(); upState = U_MENU; }  // returns only if it failed
+        else upState = U_MENU;
+        return;
+      }
+      upState = U_MENU;
+      return;
+
+    case U_LIST:
+      if (n == 1) { if (relCount) relSel = (relSel + 1) % relCount; return; }
+      if (n == 2) {
+        upTag = relTag[relSel]; upUrl = relUrl[relSel];
+        upYes = true; upState = U_ASK;
+        return;
+      }
+      upState = U_MENU;
+      return;
+
+    default:                                   // nothing to do, or it went wrong
+      upState = U_MENU;
+      return;
+  }
+}
+
+static void navHome() { upState = U_OFF; screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; nTiltHome++; }
+
+// While the update conversation is up it takes the leans too, so there is
+// never a screen that only answers to one of the two.
+static void navAct(uint8_t n) {
+  if (upState != U_OFF) { updateKnock(n); return; }
+  if (n == 1) knockOne();
+  else if (n == 2) knockTwo();
+  else knockThree();
+}
+static void navPrevAct() {
+  switch (upState) {
+    case U_OFF:  knockPrev(); return;
+    case U_LIST: if (relCount) relSel = (relSel + relCount - 1) % relCount; return;
+    case U_MENU: upPick = (upPick + 1) % 2; return;
+    case U_ASK:  upYes = !upYes; return;
+    default: return;
+  }
+}
 
 // Down for the next thing, up for the one before, left to go in, right to
 // come out, and up held for three seconds for home. Up does double duty,
@@ -3048,14 +3274,14 @@ static void tiltNav() {
       navHome(); upConsumed = true; lastActive = now;
     }
   } else if (upSince && fabsf(ty) < NAV_TILT_OFF) {
-    if (!upConsumed) { knockPrev(); nTiltPrev++; lastActive = now; }
+    if (!upConsumed) { navPrevAct(); nTiltPrev++; lastActive = now; }
     upSince = 0; upConsumed = false;
   }
 
   if (!navLatch) {
-    if (ty < -NAV_TILT_ON)      { knockOne();   nTiltNext++; navLatch = true; lastActive = now; }
-    else if (tx < -NAV_TILT_ON) { knockTwo();   nTiltIn++;   navLatch = true; lastActive = now; }
-    else if (tx >  NAV_TILT_ON) { knockThree(); nTiltOut++;  navLatch = true; lastActive = now; }
+    if (ty < -NAV_TILT_ON)      { navAct(1); nTiltNext++; navLatch = true; lastActive = now; }
+    else if (tx < -NAV_TILT_ON) { navAct(2); nTiltIn++;   navLatch = true; lastActive = now; }
+    else if (tx >  NAV_TILT_ON) { navAct(3); nTiltOut++;  navLatch = true; lastActive = now; }
   }
   if (fabsf(tx) < NAV_TILT_OFF && fabsf(ty) < NAV_TILT_OFF) navLatch = false;
 }
@@ -3080,6 +3306,12 @@ static void settleBurst() {
   if (!burst || millis() - burstStart < TAP_WINDOW_MS) return;
   uint8_t n = burst;
   burst = 0;
+  if (upState != U_OFF) {
+    updateKnock(n);
+    lastActive = millis();
+    Serial.printf("knock x%u -> update state %d\n", n, upState);
+    return;
+  }
   if      (n == 1) knockOne();
   else if (n == 2) knockTwo();
   else if (n == 3) knockThree();
@@ -3990,6 +4222,13 @@ void loop() {
   }
   // pages turn themselves when you asked them to
   if (cfgAutoTurn && inReader() && (long)(now - rdTurn) >= 0) nextPage();
+
+  if (upState != U_OFF) {                      // choosing what to install
+    lastActive = now;
+    if (now - lastDraw >= 90) { lastDraw = now; drawUpdateUI(); }
+    delay(2);
+    return;
+  }
 
   if (navCal != NC_OFF) {                      // learning the leans
     lastActive = now;
