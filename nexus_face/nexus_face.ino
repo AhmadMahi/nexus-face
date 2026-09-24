@@ -487,9 +487,15 @@ static void drawSystem() {
   int bw = SCRW - 8, fill = bw * (tot - heap) / tot;
   oled.drawRect(4, 34, bw, 5, SSD1306_WHITE);
   if (fill > 2) oled.fillRect(5, 35, fill - 2, 3, SSD1306_WHITE);
-  snprintf(l, sizeof(l), "up %lus  boots %lu",
-           (unsigned long)(millis() / 1000UL), (unsigned long)cBoot);
+  // a long uptime in seconds would run off the edge, so it folds to hours
+  unsigned long up = millis() / 1000UL;
+  char u[12];
+  if (up >= 3600) snprintf(u, sizeof(u), "%luh%02lum", up / 3600, (up % 3600) / 60);
+  else            snprintf(u, sizeof(u), "%lus", up);
+  snprintf(l, sizeof(l), "up %s", u);
   at(4, 43, l);
+  snprintf(l, sizeof(l), "boot %lu", (unsigned long)cBoot);
+  rightAt(43, l);
   snprintf(l, sizeof(l), "%s", WiFi.status() == WL_CONNECTED
            ? WiFi.localIP().toString().c_str() : "192.168.4.1");
   at(4, 53, l);
