@@ -25,24 +25,37 @@ jobs:
           arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" \
             "FluxGarage RoboEyes" "ArduinoJson"
 
+      # A tag ending in -test builds the stripped input test sketch instead
+      # of the real firmware. The asset keeps its name either way, because
+      # that is what the firmware already out there looks for.
+      - name: Choose the sketch
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == *-test ]]; then
+            echo "SKETCH=rafiq_test" >> $GITHUB_ENV
+          else
+            echo "SKETCH=nexus_face" >> $GITHUB_ENV
+          fi
+
       - name: Compile
         run: |
+          echo "building $SKETCH"
           arduino-cli compile \
             --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs \
-            --output-dir out nexus_face
-          cp out/nexus_face.ino.bin nexus_face.bin
+            --output-dir out "$SKETCH"
+          cp "out/$SKETCH.ino.bin" nexus_face.bin
           ls -l nexus_face.bin
 
       - name: Check the tag matches FW_VERSION
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          FW=$(grep -oE '#define FW_VERSION "[^"]+"' nexus_face/nexus_face.ino | cut -d'"' -f2)
+          FW=$(grep -oE '#define FW_VERSION "[^"]+"' "$SKETCH/$SKETCH.ino" | cut -d'"' -f2)
           TAG="${GITHUB_REF_NAME#v}"
-          echo "FW_VERSION=$FW  tag=$TAG"
+          echo "sketch=$SKETCH  FW_VERSION=$FW  tag=$TAG"
           [ "$FW" = "$TAG" ] || { echo "::error::FW_VERSION ($FW) != tag ($TAG)"; exit 1; }
 
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: nexus_face.bin
+          prerelease: false
           generate_release_notes: true

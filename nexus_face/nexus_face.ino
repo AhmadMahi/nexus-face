@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "1.7.0"
+#define FW_VERSION "1.7.2"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -1325,9 +1325,14 @@ static void carStep() {
   }
 }
 static void carBody(int x, int y, bool mine) {
-  oled.drawRoundRect(x, y, CAR_W, CAR_H, 3, SSD1306_WHITE);
-  if (mine) { oled.fillRect(x + 3, y + 3, CAR_W - 6, 3, SSD1306_WHITE); }
-  else      { oled.fillRect(x + 2, y + 2, CAR_W - 4, CAR_H - 4, SSD1306_WHITE); }
+  // four wheels and a roof, so it reads as a car rather than a block
+  oled.fillRect(x, y + 1, 2, 3, SSD1306_WHITE);
+  oled.fillRect(x + CAR_W - 2, y + 1, 2, 3, SSD1306_WHITE);
+  oled.fillRect(x, y + CAR_H - 4, 2, 3, SSD1306_WHITE);
+  oled.fillRect(x + CAR_W - 2, y + CAR_H - 4, 2, 3, SSD1306_WHITE);
+  oled.drawRoundRect(x + 2, y, CAR_W - 4, CAR_H, 3, SSD1306_WHITE);
+  if (mine) oled.fillRect(x + 4, y + 3, CAR_W - 8, CAR_H - 6, SSD1306_WHITE);
+  else      oled.drawFastHLine(x + 4, y + CAR_H / 2, CAR_W - 8, SSD1306_WHITE);
 }
 static void carDraw() {
   oled.drawFastVLine(CAR_LEFT - 2, 12, 52, SSD1306_WHITE);
@@ -1719,12 +1724,16 @@ static void brickIcon(int x, int y) {
   oled.fillRect(x + 20, y + 18, 2, 2, SSD1306_WHITE);
 }
 static void carIcon(int x, int y) {
-  for (int k = 0; k < 2; k++)
-    for (int yy = y + 1; yy < y + 23; yy += 6)
-      oled.drawFastVLine(x + 8 + k * 14, yy, 3, SSD1306_WHITE);
-  oled.drawRoundRect(x + 11, y + 13, 9, 10, 2, SSD1306_WHITE);
-  oled.fillRect(x + 13, y + 15, 5, 3, SSD1306_WHITE);
-  oled.fillRect(x + 12, y + 2, 7, 7, SSD1306_WHITE);
+  // seen from above: wheels either side, a roof, and a windscreen
+  int cx = x + 15, cy = y + 12;
+  oled.fillRect(cx - 8, cy - 8, 3, 5, SSD1306_WHITE);
+  oled.fillRect(cx + 5, cy - 8, 3, 5, SSD1306_WHITE);
+  oled.fillRect(cx - 8, cy + 3, 3, 5, SSD1306_WHITE);
+  oled.fillRect(cx + 5, cy + 3, 3, 5, SSD1306_WHITE);
+  oled.drawRoundRect(cx - 6, cy - 11, 13, 23, 4, SSD1306_WHITE);
+  oled.fillRect(cx - 3, cy - 4, 7, 8, SSD1306_WHITE);
+  oled.drawFastHLine(cx - 4, cy - 6, 9, SSD1306_WHITE);
+  oled.drawFastHLine(cx - 4, cy + 6, 9, SSD1306_WHITE);
 }
 static void catchIcon(int x, int y) {
   oled.drawFastHLine(x + 8, y + 21, 14, SSD1306_WHITE);
