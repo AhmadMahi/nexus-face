@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "1.5.0"
+#define FW_VERSION "1.5.1"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -2109,7 +2109,7 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
   </div></div>
 
   <h2>Reading</h2><div class="card">
-    <table><tr><td>pages turn</td><td id="turnNow">by knock</td></tr></table>
+    <table><tr><td>Pages turn</td><td id="turnNow">by knock</td></tr></table>
     <div class="row" style="margin-top:8px">
       <button class="g" onclick="post('/api/turn',{a:0}).then(load)">By knock</button>
       <button class="g" onclick="post('/api/turn',{a:1}).then(load)">Automatically</button>
@@ -2224,7 +2224,7 @@ window.load=async function(){
     +'<button class="d" onclick="dropRead('+i+')">x</button></div>').join('')
     :'<div style="color:var(--mut);font-size:13px;padding:6px 0">nothing on the shelf yet</div>';
   $('shelfMeta').textContent=s.reads.length?(s.reads.length+' stored · '+s.storyState):s.storyState;
-  rows('wx',{'city':s.city,'temperature':s.temp,'humidity':s.hum,'wind':s.wind,'conditions':s.cond});
+  rows('wx',{'City':s.city,'Temperature':s.temp,'Humidity':s.hum,'Wind':s.wind,'Conditions':s.cond});
   rows('pr',s.prayer);
   if(!adjFilled){
     $('adj').innerHTML=Object.keys(s.prayer).map((n,i)=>
@@ -2232,9 +2232,9 @@ window.load=async function(){
     adjFilled=true;
   }
   $('keyState').textContent=s.hasKey?('key saved · '+s.storyState):'no key yet';
-  rows('sys',{'signal':s.rssi,'address':s.ip,'hotspot':s.ap,'free ram':s.heap+' B','ota room':s.ota,
-              'storage used':s.fsUsed,'uptime':s.up+' s','boots':s.boots,'falls':s.fall,
-              'chip':s.chip,'firmware':s.fw,'clock source':s.clockSrc});
+  rows('sys',{'Signal':s.rssi,'Address':s.ip,'Hotspot':s.ap,'Free ram':s.heap+' B','OTA room':s.ota,
+              'Storage used':s.fsUsed,'Uptime':s.up+' s','Boots':s.boots,'Falls':s.fall,
+              'Chip':s.chip,'Firmware':s.fw,'Clock source':s.clockSrc});
   if(!filled){$('ssid').value=s.ssid;$('tz').value=s.tz;filled=true}
 }
 load();setInterval(load,1000);
