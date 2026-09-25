@@ -118,15 +118,29 @@ final class Updater: ObservableObject {
         // for this process to go and then does the swap and relaunch.
         let here = Bundle.main.bundleURL
         let script = work.appendingPathComponent("swap.sh")
+        // The old bundle is moved aside rather than deleted, and put back
+        // if the copy fails. Deleting first would mean one failed ditto
+        // left no Rafiq at all.
         let sh = """
         #!/bin/bash
+        DEST="\(here.path)"
+        NEW="\(staged.path)"
+        BAK="$DEST.replacing"
         for _ in $(seq 1 100); do
           kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null || break
           sleep 0.2
         done
-        /bin/rm -rf "\(here.path)"
-        /usr/bin/ditto "\(staged.path)" "\(here.path)" || exit 1
-        /usr/bin/open "\(here.path)"
+        /bin/rm -rf "$BAK"
+        if [ -e "$DEST" ]; then /bin/mv "$DEST" "$BAK" || exit 1; fi
+        if ! /usr/bin/ditto "$NEW" "$DEST"; then
+          /bin/rm -rf "$DEST"
+          [ -e "$BAK" ] && /bin/mv "$BAK" "$DEST"
+          /usr/bin/open "$DEST"
+          exit 1
+        fi
+        /bin/rm -rf "$BAK"
+        /usr/bin/xattr -dr com.apple.quarantine "$DEST" 2>/dev/null
+        /usr/bin/open "$DEST"
         /bin/rm -rf "\(work.path)"
         """
         try sh.write(to: script, atomically: true, encoding: .utf8)
