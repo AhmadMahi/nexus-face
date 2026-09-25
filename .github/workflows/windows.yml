@@ -42,11 +42,12 @@ jobs:
               --self-contained true `
               -p:PublishSingleFile=false -p:DebugType=none `
               -o "out/$rid"
-            dotnet publish cli/Rafiq.Cli.csproj -c Release -r $rid `
-              --self-contained false `
-              -p:PublishSingleFile=true -p:DebugType=none `
-              -o "out/$rid-cli"
-            Copy-Item "out/$rid-cli/rafiq.exe" "out/$rid/rafiq.exe" -ErrorAction SilentlyContinue
+            # The command is the same binary, so a shim gives it its name.
+            # A rafiq.exe here would BE Rafiq.exe: Windows ignores case.
+            Set-Content -Path "out/$rid/rafiq.cmd" -Encoding ASCII -Value @(
+              '@echo off',
+              '"%~dp0Rafiq.exe" %*'
+            )
             Compress-Archive -Path "out/$rid/*" -DestinationPath "out/Rafiq-$rid.zip" -Force
           }
           Get-ChildItem out/*.zip | ForEach-Object { "{0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB) }
@@ -70,8 +71,14 @@ jobs:
           }
           Write-Host "Rafiq started and is still running after 8s"
           Stop-Process -Id $p.Id -Force
-          # and the command line helper answers
-          & "out/win-x64/rafiq.exe" | Select-Object -First 2
+          # and the same binary answers as a command
+          $help = & "out/win-x64/Rafiq.exe" --help 2>&1 | Out-String
+          if ($help -notmatch 'send something to the robot') {
+            Write-Host $help
+            throw "the command line side did not answer"
+          }
+          Write-Host "the rafiq command answers too"
+          if (-not (Test-Path "out/win-x64/rafiq.cmd")) { throw "rafiq.cmd is missing" }
 
       - uses: actions/upload-artifact@v4
         with:

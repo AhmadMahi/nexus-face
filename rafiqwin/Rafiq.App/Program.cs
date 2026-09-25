@@ -22,15 +22,18 @@ static class Program
     }
 
     [STAThread]
-    static void Main()
+    static int Main(string[] args)
     {
+        // Given arguments, this is the command rather than the tray app.
+        if (args.Length > 0) return Cli.Run(args).GetAwaiter().GetResult();
+
         AppDomain.CurrentDomain.UnhandledException += (_, a) => LogCrash(a.ExceptionObject);
         Application.ThreadException += (_, a) => LogCrash(a.Exception);
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
 
         // One Rafiq at a time, or two tray icons fight over the same robot.
         using var only = new Mutex(true, "Local\\RafiqMenuBarApp", out bool first);
-        if (!first) return;
+        if (!first) return 0;
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
@@ -51,6 +54,7 @@ static class Program
             LogCrash(e);
             throw;
         }
+        return 0;
     }
 }
 
