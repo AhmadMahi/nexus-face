@@ -111,6 +111,18 @@ public sealed class Services : IDisposable
 
     // ---- the rest ----
 
+    /// <summary>
+    /// Called when the break setting changes. The interval itself is read
+    /// fresh every minute, so all this has to do is start the count again
+    /// rather than have a new setting fire immediately off an old total.
+    /// </summary>
+    public void SyncBreaks()
+    {
+        _worked = 0;
+        _lastNudge = DateTime.MinValue;
+        _lastTick = DateTime.UtcNow;
+    }
+
     public void SyncClipboard()
     {
         _clip?.Dispose(); _clip = null;
