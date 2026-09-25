@@ -48,7 +48,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.4.0"
+#define FW_VERSION "2.4.1"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -3792,51 +3792,6 @@ static void knockOne() {
   }
 }
 
-// The other way round the carousel, and back up a list. Leaning gives
-// this for nothing; knocking never had it.
-static void knockPrev() {
-  if (depth == 0) { screen = (screen + S_COUNT - 1) % S_COUNT; itemIdx = 0; subIdx = 0; return; }
-  if (screen == S_READS) {
-    if (depth == 1) { if (readCount) itemIdx = (itemIdx + readCount - 1) % readCount; return; }
-    prevPage(); return;
-  }
-  if (screen == S_FAITH) {
-    if (depth == 1) { itemIdx = (itemIdx + F_COUNT - 1) % F_COUNT; subIdx = 0; return; }
-    if (depth == 2) {
-      switch (itemIdx) {
-        case F_ZIKR:    return;                                     // it paces itself
-        case F_NAMES:   subIdx = (subIdx + 98) % 99; return;
-        case F_QURAN:   subIdx = (subIdx + 113) % 114; return;
-        case F_MORNING: subIdx = (subIdx + MORNING_N - 1) % MORNING_N; return;
-        default:        subIdx = (subIdx + EVENING_N - 1) % EVENING_N; return;
-      }
-    }
-    prevPage(); return;
-  }
-  if (screen == S_GAMES) {
-    if (depth == 1) itemIdx = (itemIdx + G_COUNT - 1) % G_COUNT;
-    return;
-  }
-  if (screen == S_SETTINGS) {
-    if (depth == 1) { itemIdx = (itemIdx + C_COUNT - 1) % C_COUNT; return; }
-    switch (itemIdx) {
-      case C_BRIGHT: { int i = 0;
-                       for (int k = 0; k < BRIGHT_N; k++) if (BRIGHT_OPTS[k] == cfgBright) i = k;
-                       cfgBright = BRIGHT_OPTS[(i + BRIGHT_N - 1) % BRIGHT_N];
-                       applyBright(); prefs.putInt("bri", cfgBright); break; }
-      case C_FACE:   cfgFace = (cfgFace + FACE_N - 1) % FACE_N;
-                     prefs.putInt("face", cfgFace); break;
-      case C_SLEEP:  cfgSleepIdx = (cfgSleepIdx + SLEEP_N - 1) % SLEEP_N;
-                     prefs.putInt("slpi", cfgSleepIdx); break;
-      case C_POPUP:  cfgPopupIdx = (cfgPopupIdx + POPUP_N - 1) % POPUP_N;
-                     prefs.putInt("popi", cfgPopupIdx); break;
-      case C_EYES:   applyEyes(cfgEyes - 1); prefs.putInt("eye", cfgEyes); break;
-      case C_TURN:   cfgAutoTurn = !cfgAutoTurn; prefs.putBool("turn", cfgAutoTurn); break;
-      default: break;
-    }
-  }
-}
-
 static void knockTwo() {
   cDouble++;
   // Told to stand up and not able to just yet. Ten minutes and it asks
@@ -4212,16 +4167,6 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
     <button class="g" onclick="go(9)">System</button>
   </div></div>
 
-  <h2>Control</h2><div class="card">
-    <table><tr><td>Driven by</td><td id="ctrlNow">taps</td></tr></table>
-    <div class="row" style="margin-top:8px">
-    </div>
-    <div style="font-size:12px;color:var(--mut);margin-top:8px;text-align:left">
-      Switching tilt on here keeps the leans it already learned, and turns
-      the fall animation off, which a hand sets off constantly. To teach
-      the leans again, use Control on the device itself.</div>
-  </div>
-
   <h2>Reading</h2><div class="card">
     <table><tr><td>Pages turn</td><td id="turnNow">by knock</td></tr></table>
     <div class="row" style="margin-top:8px">
@@ -4233,8 +4178,8 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
   <h2>Why it sleeps</h2><div class="card"><table id="diag"></table>
     <div style="font-size:12px;color:var(--mut);margin-top:8px;text-align:left">
       Live. If it dozes off while you are using it, look at <b>idle</b>
-      climbing and at <b>lean seen</b>: that number has to cross its
-      threshold for a lean to count as you being there.</div>
+      climbing and at <b>movement</b>: that number has to cross its
+      threshold for the device to count you as still there.</div>
   </div>
 
   <h2>Knocks</h2>
@@ -4372,7 +4317,6 @@ window.load=async function(){
   $('sub').textContent=(s.asleep?'asleep':'awake')+' · '+s.screen+' · fw '+s.fw;
   $('k1').textContent=s.k1;$('k2').textContent=s.k2;$('k3').textContent=s.k3;$('k4').textContent=s.k4;
   $('turnNow').textContent=s.autoTurn?'automatically':'by knock';
-  $('ctrlNow').textContent=s.control;
   $('nowLabel').textContent=s.running?(s.taskName+'  ·  '+(s.taskIdx+1)+' of '+s.plan.length):'nothing running';
   $('nowTime').textContent=s.running?s.left:'--:--';
   $('nowBar').style.width=(s.running?s.taskPct:0)+'%';
@@ -4390,7 +4334,7 @@ window.load=async function(){
   rows('diag',{'State':s.asleep?'asleep':'awake','Idle':s.idle+' s of '+s.sleepAfter,
                'Woke by':s.wokeBy,'Times slept':s.slept,
                'Sensors':s.sensors,'Gravity':s.accel,
-               'Lean seen':s.dirD+' (needs 0.12)','Lean now':s.tilt});
+               'Movement':s.dirD+' (needs 0.12)','Tilt, for the games':s.tilt});
   rows('wx',{'City':s.city,'Temperature':s.temp,'Humidity':s.hum,'Wind':s.wind,'Conditions':s.cond});
   rows('pr',s.prayer);
   if(!adjFilled){
@@ -4399,7 +4343,7 @@ window.load=async function(){
     adjFilled=true;
   }
   $('keyState').textContent=s.hasKey?('key saved · '+s.storyState):'no key yet';
-  rows('sys',{'Signal':s.rssi,'Address':s.ip,'Hotspot':s.ap,'Control':s.control,'Tilts':s.tilts,'Free ram':s.heap+' B','OTA room':s.ota,
+  rows('sys',{'Signal':s.rssi,'Address':s.ip,'Hotspot':s.ap,'Free ram':s.heap+' B','OTA room':s.ota,
               'Storage used':s.fsUsed,'Uptime':s.up+' s','Boots':s.boots,'Falls':s.fall,
               'Chip':s.chip,'Firmware':s.fw,'Clock source':s.clockSrc});
   if(!filled){$('ssid').value=s.ssid;$('tz').value=s.tz;filled=true}
