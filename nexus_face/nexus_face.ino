@@ -48,7 +48,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.4.1"
+#define FW_VERSION "2.4.2"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -3321,15 +3321,42 @@ static String jsonStr(const String& b, const char* key, int from = 0) {
 
 // Ask GitHub what the newest release is. Only fills in the answer; it
 // does not install anything.
+// Deliberately NOT /releases/latest.
+//
+// That endpoint means "most recently published", and this repository
+// also carries the Mac and Windows apps. Asking for the latest worked
+// only while a firmware release happened to be the newest thing in it:
+// publish a Rafiq update and the next check would be handed a zip full
+// of Windows with no firmware in it at all, and report that there was
+// no release to be found. So walk the list and take the newest one that
+// actually carries a firmware image.
+//
+// Twelve is measured rather than guessed. It is enough to fill the
+// earlier releases list even with app releases interleaved, and small
+// enough that the reply still fits in memory comfortably.
 static bool otaFetchLatest() {
   if (!online()) { upMsg = "No network"; return false; }
   String b;
-  if (!httpGetTo("https://api.github.com/repos/" OTA_REPO "/releases/latest", true, b, 12000)) {
+  if (!httpGetTo("https://api.github.com/repos/" OTA_REPO
+                 "/releases?per_page=12", true, b, 15000)) {
     upMsg = "GitHub unreachable"; return false;
   }
-  upTag = jsonStr(b, "\"tag_name\"");
-  int a = b.indexOf(OTA_ASSET);
-  upUrl = a < 0 ? "" : jsonStr(b, "\"browser_download_url\"", a);
+  upTag = ""; upUrl = "";
+  int i = 0;
+  while (true) {
+    int t = b.indexOf("\"tag_name\"", i);
+    if (t < 0) break;
+    String tag = jsonStr(b, "\"tag_name\"", t);
+    // only this release's own assets, never the next one's
+    int nextT = b.indexOf("\"tag_name\"", t + 10);
+    int limit = nextT < 0 ? (int)b.length() : nextT;
+    int a = b.indexOf(OTA_ASSET, t);
+    if (a >= 0 && a < limit) {
+      String url = jsonStr(b, "\"browser_download_url\"", a);
+      if (url.length()) { upTag = tag; upUrl = url; break; }
+    }
+    i = t + 10;
+  }
   b = String();
   if (!upTag.length() || !upUrl.length()) { upMsg = "No release found"; return false; }
   return true;
@@ -3340,7 +3367,7 @@ static bool otaFetchList() {
   if (!online()) { upMsg = "No network"; return false; }
   String b;
   if (!httpGetTo("https://api.github.com/repos/" OTA_REPO
-                 "/releases?per_page=8", true, b, 15000)) {
+                 "/releases?per_page=12", true, b, 15000)) {
     upMsg = "GitHub unreachable"; return false;
   }
   relCount = 0; relSel = 0;
