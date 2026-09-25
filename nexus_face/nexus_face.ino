@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.0.4"
+#define FW_VERSION "2.0.5"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -124,7 +124,7 @@ const char* C_NAME[C_COUNT] =
 const int BRIGHT_OPTS[] = { 0, 20, 60, 110, 160, 210, 255 };
 const int BRIGHT_N = sizeof(BRIGHT_OPTS) / sizeof(BRIGHT_OPTS[0]);
 
-const int SLEEP_OPTS[] = { 15, 30, 45, 60, 120, 180, 300, 600 };
+const int SLEEP_OPTS[] = { 15, 30, 45, 60, 120, 180, 300, 600, 0 };   // 0 = never
 const int SLEEP_N = sizeof(SLEEP_OPTS) / sizeof(SLEEP_OPTS[0]);
 const int POPUP_OPTS[] = { 0, 5, 10, 20, 30, 60 };
 const int POPUP_N = sizeof(POPUP_OPTS) / sizeof(POPUP_OPTS[0]);
@@ -269,6 +269,9 @@ String upTag = "", upUrl = "", upMsg = "";
 String relTag[UP_MAX], relUrl[UP_MAX];
 int    relCount = 0, relSel = 0;
 String   clockSrc = "not set";
+String   wokeBy = "boot";
+float    lastDirD = 0;
+uint32_t nSlept = 0;
 int      otaPct = -1;
 
 static bool online() { return WiFi.status() == WL_CONNECTED; }
@@ -1064,8 +1067,9 @@ static void drawSettings() {
       case C_BRIGHT: snprintf(v, sizeof(v), "%d", cfgBright); break;
       case C_CONTROL:snprintf(v, sizeof(v), "%s", cfgTilt ? "tilt" : "taps"); break;
       case C_ABOUT:  snprintf(v, sizeof(v), "x2"); break;
-      case C_SLEEP:  if (sleepSecs() < 60) snprintf(v, sizeof(v), "%ds", sleepSecs());
-                     else snprintf(v, sizeof(v), "%dm", sleepSecs() / 60); break;
+      case C_SLEEP:  if (!sleepSecs())         snprintf(v, sizeof(v), "never");
+                     else if (sleepSecs() < 60) snprintf(v, sizeof(v), "%ds", sleepSecs());
+                     else                       snprintf(v, sizeof(v), "%dm", sleepSecs() / 60); break;
       case C_TURN:   snprintf(v, sizeof(v), "%s", cfgAutoTurn ? "auto" : "knock"); break;
       case C_POPUP:  if (!popupSecs()) snprintf(v, sizeof(v), "off");
                      else snprintf(v, sizeof(v), "%ds", popupSecs()); break;
@@ -2924,10 +2928,16 @@ static void goSleep() {
   eyes.setMood(TIRED); eyes.close();
   for (int i = 0; i < 26; i++) { eyesFrame(); delay(16); }
   screenPower(false);
-  setCpuFrequencyMhz(80);
+  nSlept++;
+  // The clock used to drop to 80MHz here. That saves almost nothing on a
+  // desk and changes the bus timing at exactly the moment the sensors
+  // have to stay readable, because noticing a lean means reading them
+  // continuously while asleep. Not worth the risk.
+  if (!cfgTilt) setCpuFrequencyMhz(80);
 }
 static void wake(const char* why) {
   lastActive = millis();
+  wokeBy = why;
   if (!asleep) return;
   asleep = false;
   setCpuFrequencyMhz(160);
@@ -3428,6 +3438,7 @@ static void input() {
   // even handed, so it never accumulates. The mark creeps very slowly so
   // that thermal drift is absorbed without masking a real lean.
   float dirD = fabsf(ax - refAx) + fabsf(ay - refAy) + fabsf(az - refAz);
+  lastDirD = dirD;
   if (dirD > 0.12f) {   // three times what a still device wanders
     refAx = ax; refAy = ay; refAz = az;
     if (asleep) wake("moved");
@@ -3446,7 +3457,7 @@ static void input() {
   // dozing off mid sentence would be maddening.
   unsigned long fuse = inReader() ? (unsigned long)READING_SLEEP_SEC
                                   : (unsigned long)sleepSecs();
-  if (now - lastActive > fuse * 1000UL) goSleep();
+  if (fuse && now - lastActive > fuse * 1000UL) goSleep();   // 0 means never
 }
 
 // ================================================================
@@ -3585,6 +3596,13 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
     </div>
   </div>
 
+  <h2>Why it sleeps</h2><div class="card"><table id="diag"></table>
+    <div style="font-size:12px;color:var(--mut);margin-top:8px;text-align:left">
+      Live. If it dozes off while you are using it, look at <b>idle</b>
+      climbing and at <b>lean seen</b>: that number has to cross its
+      threshold for a lean to count as you being there.</div>
+  </div>
+
   <h2>Knocks</h2>
   <div class="g4">
     <div class="tile"><b id="k1">0</b><span>ONE</span></div>
@@ -3716,6 +3734,10 @@ window.load=async function(){
     +'<button class="d" onclick="dropRead('+i+')">x</button></div>').join('')
     :'<div style="color:var(--mut);font-size:13px;padding:6px 0">nothing on the shelf yet</div>';
   $('shelfMeta').textContent=s.reads.length?(s.reads.length+' stored · '+s.storyState):s.storyState;
+  rows('diag',{'State':s.asleep?'asleep':'awake','Idle':s.idle+' s of '+s.sleepAfter,
+               'Woke by':s.wokeBy,'Times slept':s.slept,
+               'Sensors':s.sensors,'Gravity':s.accel,
+               'Lean seen':s.dirD+' (needs 0.12)','Lean now':s.tilt});
   rows('wx',{'City':s.city,'Temperature':s.temp,'Humidity':s.hum,'Wind':s.wind,'Conditions':s.cond});
   rows('pr',s.prayer);
   if(!adjFilled){
@@ -3796,6 +3818,22 @@ static void apiState() {
   o += "\"ota\":\"" + String(slot_ ? String(slot_->size / 1024) + " kB slot, this build " +
                                       String(ESP.getSketchSize() / 1024) + " kB"
                                     : String("No OTA slot")) + "\",";
+  o += "\"idle\":" + String((millis() - lastActive) / 1000UL) + ",";
+  o += "\"sleepAfter\":\"" + String(sleepSecs() ? String(sleepSecs()) + " s" : String("never")) + "\",";
+  o += "\"wokeBy\":\"" + wokeBy + "\",\"slept\":" + String(nSlept) + ",";
+  o += "\"sensors\":\"" + String(adxl ? "adxl ok" : "NO ADXL") + ", " +
+       String(mpu ? "mpu ok" : "no mpu") + "\",";
+  {
+    char ab[48];
+    snprintf(ab, sizeof(ab), "%.2f %.2f %.2f  |a| %.2f", ax, ay, az, amag);
+    o += "\"accel\":\"" + String(ab) + "\",";
+    snprintf(ab, sizeof(ab), "%.3f", lastDirD);
+    o += "\"dirD\":\"" + String(ab) + "\",";
+    float tx = 0, ty = 0;
+    if (tiltTaught()) tiltRead(tx, ty);
+    snprintf(ab, sizeof(ab), "%+.2f across  %+.2f up", tx, ty);
+    o += "\"tilt\":\"" + String(tiltTaught() ? ab : "not taught") + "\",";
+  }
   o += "\"adj\":[";
   for (int i = 0; i < 5; i++) { o += String(prayerAdj[i]); if (i < 4) o += ","; }
   o += "],";
