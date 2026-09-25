@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Rafiq</AssemblyName>
+    <RootNamespace>Rafiq.App</RootNamespace>
+    <ApplicationIcon>rafiq.ico</ApplicationIcon>
+    <Version>1.2.0</Version>
+    <Product>Rafiq</Product>
+    <Company>iotcart.in</Company>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Rafiq.Core\Rafiq.Core.csproj" />
+  </ItemGroup>
+</Project>

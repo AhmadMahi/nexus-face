@@ -1,0 +1,99 @@
+name: Build and release Rafiq for Windows
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'win-v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # Compiles on a real Windows machine rather than being cross built
+      # blind, so anything that only breaks there breaks here first.
+      - name: Build
+        working-directory: rafiqwin
+        run: dotnet build Rafiq.App/Rafiq.App.csproj -c Release
+
+      # Pure logic and a stand-in robot on localhost: no hardware, no
+      # screen, but the shipping code rather than a copy of it.
+      - name: Test
+        working-directory: rafiqwin
+        run: dotnet run --project Rafiq.Tests/Rafiq.Tests.csproj -c Release
+
+      - name: Publish
+        working-directory: rafiqwin
+        shell: pwsh
+        run: |
+          foreach ($rid in @('win-x64','win-arm64')) {
+            # Self contained, so nothing has to be installed first. WinForms
+            # is not trim safe, so this is deliberately untrimmed.
+            dotnet publish Rafiq.App/Rafiq.App.csproj -c Release -r $rid `
+              --self-contained true `
+              -p:PublishSingleFile=false -p:DebugType=none `
+              -o "out/$rid"
+            dotnet publish cli/Rafiq.Cli.csproj -c Release -r $rid `
+              --self-contained false `
+              -p:PublishSingleFile=true -p:DebugType=none `
+              -o "out/$rid-cli"
+            Copy-Item "out/$rid-cli/rafiq.exe" "out/$rid/rafiq.exe" -ErrorAction SilentlyContinue
+            Compress-Archive -Path "out/$rid/*" -DestinationPath "out/Rafiq-$rid.zip" -Force
+          }
+          Get-ChildItem out/*.zip | ForEach-Object { "{0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB) }
+
+      - name: Smoke test the built app
+        working-directory: rafiqwin
+        shell: pwsh
+        run: |
+          # It is a tray app with no window, so the check is that it starts,
+          # stays up, and is still running a few seconds later.
+          $exe = "out/win-x64/Rafiq.exe"
+          if (-not (Test-Path $exe)) { throw "Rafiq.exe was not produced" }
+          $p = Start-Process $exe -PassThru
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) { throw "Rafiq exited straight away with code $($p.ExitCode)" }
+          Write-Host "Rafiq started and is still running after 8s"
+          Stop-Process -Id $p.Id -Force
+          # and the command line helper answers
+          & "out/win-x64/rafiq.exe" | Select-Object -First 2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rafiq-windows
+          path: rafiqwin/out/*.zip
+
+      - name: Check the tag matches the version
+        if: startsWith(github.ref, 'refs/tags/win-v')
+        shell: pwsh
+        run: |
+          $csproj = Get-Content rafiqwin/Rafiq.App/Rafiq.App.csproj -Raw
+          $ver = [regex]::Match($csproj, '<Version>([^<]+)</Version>').Groups[1].Value
+          $tag = "${{ github.ref_name }}" -replace '^win-v',''
+          Write-Host "csproj=$ver tag=$tag"
+          if ($ver -ne $tag) { throw "Version ($ver) does not match tag ($tag)" }
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/win-v')
+        with:
+          files: rafiqwin/out/*.zip
+          name: Rafiq ${{ github.ref_name }} for Windows
+          body: |
+            Rafiq for Windows: the tray companion for the robot.
+
+            Download the zip for your machine, unblock it (right-click the
+            zip, Properties, tick Unblock), extract it anywhere, and run
+            Rafiq.exe. It sits in the tray. Nothing needs installing first.
+
+            Rafiq updates itself from here: Settings, then Check.
+
+            Needs Windows 10 or 11.
