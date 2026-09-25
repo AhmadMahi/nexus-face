@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.0.3"
+#define FW_VERSION "2.0.4"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -251,6 +251,7 @@ unsigned long lastActive = 0, lastDraw = 0, lastPoll = 0, reactUntil = 0, lastSh
 unsigned long nextTimeTry = 0, swStart = 0, inputMuteUntil = 0;
 unsigned long lastLowG = 0, lastFallAt = 0;
 float lastRawX = 0, lastRawY = 0, lastRawZ = 0;
+float refAx = 0, refAy = 0, refAz = 1;
 unsigned long steadySince = 0;
 uint32_t cTap = 0, cDouble = 0, cTriple = 0, cQuad = 0, cFall = 0, cShake = 0, cBoot = 0;
 uint8_t  burst = 0;
@@ -2935,6 +2936,9 @@ static void wake(const char* why) {
   applyEyes(cfgEyes); eyes.open();
   for (int i = 0; i < 18; i++) { eyesFrame(); delay(16); }
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
+  navLatch = true;                     // the lean that woke it is not also a command
+  upSince = 0; upConsumed = false;
+  steadySince = 0;
   Serial.printf("awake (%s)\n", why);
 }
 
@@ -3408,6 +3412,32 @@ static void input() {
     if (asleep) wake("picked up");
     lastActive = now;
   }
+
+  // Everything above watches the MAGNITUDE of the acceleration, and
+  // gravity has the same magnitude whichever way the thing is turned:
+  // leaning it changes the direction, not the size. A forty five degree
+  // lean moves |a| by about a hundredth, so none of those checks can see
+  // one at all. The gyro term was the only one that could, and it reads
+  // zero unless you are actually rotating, and zero altogether if the
+  // gyro is not answering. That is why shaking woke it, leaning never
+  // did, and it dozed off under your hand and did it again every time.
+  //
+  // Compare the direction against a reference rather than against the
+  // previous reading: a slow lean arrives in steps too small to notice
+  // one at a time, but it still adds up against a fixed mark. Noise is
+  // even handed, so it never accumulates. The mark creeps very slowly so
+  // that thermal drift is absorbed without masking a real lean.
+  float dirD = fabsf(ax - refAx) + fabsf(ay - refAy) + fabsf(az - refAz);
+  if (dirD > 0.12f) {   // three times what a still device wanders
+    refAx = ax; refAy = ay; refAz = az;
+    if (asleep) wake("moved");
+    lastActive = now;
+  } else {
+    refAx += (ax - refAx) * 0.005f;
+    refAy += (ay - refAy) * 0.005f;
+    refAz += (az - refAz) * 0.005f;
+  }
+
   if (asleep) return;
 
   tiltNav();
