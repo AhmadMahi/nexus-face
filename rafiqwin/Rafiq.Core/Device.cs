@@ -265,7 +265,7 @@ public static class Json
 /// fresh handshake each time would drown the robot, and a lost reading
 /// costs nothing because another is a tenth of a second behind it.
 /// </summary>
-public sealed class Cursor : IDisposable
+public sealed class PointerStream : IDisposable
 {
     UdpClient? _udp;
     IPEndPoint? _to;

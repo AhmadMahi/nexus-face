@@ -13,7 +13,7 @@ public sealed class Services : IDisposable
     readonly Device _dev;
     readonly Store _cfg;
     readonly Reminders _rem;
-    readonly Cursor _cursor = new();
+    readonly PointerStream _cursor = new();
 
     System.Windows.Forms.Timer? _slow, _fast;
     ClipboardWatcher? _clip;
