@@ -69,7 +69,9 @@ without a pause and it asks you to walk for a minute.
 **MESSAGES** whatever was last sent from the page.
 
 **PRAYER** five times from AlAdhan, with the next one picked out. They are
-kept in flash, so they are still there with no network.
+kept in flash and are not fetched again unless you ask, or once every
+fiftieth boot, so they survive a network that is down. On a Friday the
+midday prayer is named Jumuah.
 
 Calculated times and the local masjid rarely agree, so each prayer carries
 its own correction in minutes, set on the page and kept in flash.
@@ -124,14 +126,25 @@ the game list forgets it and asks again. The resting position is measured
 afresh every time a game starts, since that is what changes when you move
 it.
 
-**SETTINGS** brightness (down to 0, which is the dimmest the panel goes
-rather than off), control method, sleep timeout, page turn (by knock or automatic),
+**SETTINGS** brightness (dim, then quarters), watch face, control method,
+prayer refresh, a live accelerometer view, sleep timeout, page turn (by knock or automatic),
 popup time, eye style, hotspot, check for update, reboot.
 
 **SYSTEM** uptime, network, memory and address. The full detail lives on
 the page.
 
 **ABOUT**, the last thing in SETTINGS: who made it, and where to find him.
+
+## Watch faces
+
+Ten, for the clock screen only, chosen in SETTINGS. Six laid out by hand,
+two that lean the way you lean and right themselves a couple of seconds
+after you set the thing down, and two with something that pours: water
+that sloshes and sand that tips. Whatever the fill covers is inverted
+rather than swallowed, so it stays readable as the level moves.
+
+The faces read the sensor for themselves, so they work whether or not
+leaning is switched on as a way of driving the device.
 
 ## The page
 

@@ -47,7 +47,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.0.5"
+#define FW_VERSION "2.1.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -113,16 +113,45 @@ unsigned long zikrNext = 0;      // when the next count lands
 #define ZIKR_LONG_MS 9000        // the last one is long, give it room
 
 // ---------------- settings ----------------
-enum { C_BRIGHT = 0, C_CONTROL, C_SLEEP, C_TURN, C_POPUP, C_EYES, C_HOTSPOT,
-       C_UPDATE, C_REBOOT, C_ABOUT, C_COUNT };
+enum { C_BRIGHT = 0, C_FACE, C_CONTROL, C_SLEEP, C_TURN, C_POPUP, C_EYES,
+       C_PRAYER, C_HOTSPOT, C_ACCEL, C_UPDATE, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
-  { "Brightness", "Control", "Sleep after", "Page turn", "Popup time", "Eye style",
-    "Hotspot", "Check update", "Reboot", "About" };
+  { "Brightness", "Watch face", "Control", "Sleep after", "Page turn", "Popup time",
+    "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Check update",
+    "Reboot", "About" };
 
 // Zero is the dimmest the panel goes, not off: the SSD1306 still shows
-// faintly at contrast zero.
-const int BRIGHT_OPTS[] = { 0, 20, 60, 110, 160, 210, 255 };
+// faintly at contrast zero. After that, quarters.
+const int BRIGHT_OPTS[] = { 0, 64, 128, 191, 255 };
+const char* BRIGHT_NAME[] = { "dim", "25%", "50%", "75%", "100%" };
 const int BRIGHT_N = sizeof(BRIGHT_OPTS) / sizeof(BRIGHT_OPTS[0]);
+
+// ---------------- watch faces ----------------
+//  Six laid out by hand, two that lean with the device, and two with
+//  something that pours. Only the clock screen is affected.
+enum { F_CLASSIC = 0, F_STACK, F_DATEUP, F_MINIMAL, F_SIDE, F_BANNER,
+       F_DRIFT, F_PARALLAX, F_WATER, F_SAND, FACE_N };
+const char* FACE_NAME[FACE_N] =
+  { "classic", "stacked", "date up", "minimal", "side", "banner",
+    "drift", "parallax", "water", "sand" };
+int cfgFace = F_CLASSIC;
+
+// The faces read the sensor for themselves, so they work whether or not
+// leaning is switched on as a way of driving the thing. The reference
+// follows slowly, which is what makes everything settle back to the
+// middle a couple of seconds after it is set down.
+float faceRef[3] = { 0, 0, 1 };
+static void faceTilt(float& tx, float& ty);
+
+// Which way round the thing is sitting. Shared by the games, by leaning
+// as a way to drive it, and by the faces that react to being tilted, so
+// it is only ever learned once.
+int8_t mapAxX = -1, mapSgnX = 1, mapAxY = -1, mapSgnY = 1;   // -1 until taught
+float  restV[3] = { 0, 0, 0 };
+int    gravAx = 2;
+float  calAcc[3] = { 0, 0, 0 };
+int    calN = 0;
+static bool tiltTaught() { return mapAxX >= 0 && mapAxY >= 0; }
 
 const int SLEEP_OPTS[] = { 15, 30, 45, 60, 120, 180, 300, 600, 0 };   // 0 = never
 const int SLEEP_N = sizeof(SLEEP_OPTS) / sizeof(SLEEP_OPTS[0]);
@@ -197,6 +226,12 @@ uint8_t alertDone[5] = { 0, 0, 0, 0, 0 };     // bit 1 ten, 2 five, 4 now
 bool prayerOk = false;
 int  prayerDay = -1;
 unsigned long nextPrayerTry = 0;
+// Prayer times barely move week to week, and refetching them daily meant
+// losing them whenever the network was down. They are kept in flash and
+// only refreshed on request, or once every fiftieth boot.
+uint32_t prayerBoot = 0;
+bool     prayerWanted = false;
+#define PRAYER_REFRESH_BOOTS 50
 
 // ---------------- the reader ----------------
 // One buffer serves every paged thing on the device: a short read, a
@@ -276,7 +311,7 @@ int      otaPct = -1;
 
 static bool online() { return WiFi.status() == WL_CONNECTED; }
 
-#define TAP_WINDOW_MS 560          // room to land four knocks
+#define TAP_WINDOW_MS 450          // room to land four knocks, without dawdling
 #define TILT 0.35f
 #define SHAKE_G 0.60f
 
@@ -370,7 +405,7 @@ static void at(int x, int y, const char* s, int size = 1) {
 }
 static void clockStr(char* o, size_t n, bool sec) {
   struct tm t;
-  if (!timeOk || !getLocalTime(&t, 5)) { snprintf(o, n, sec ? "--:--:--" : "--:--"); return; }
+  if (!timeOk || !getLocalTime(&t, 0)) { snprintf(o, n, sec ? "--:--:--" : "--:--"); return; }
   if (sec) snprintf(o, n, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
   else     snprintf(o, n, "%02d:%02d", t.tm_hour, t.tm_min);
 }
@@ -607,13 +642,159 @@ static void swStr(char* o, size_t n) {
   else             snprintf(o, n, "%lu:%02lu", s / 60UL, s % 60UL);
 }
 
-// The clock when there is one. Without a network there is no clock to
-// show, so it runs a stopwatch instead of four dashes.
+// ================================================================
+//  WATCH FACES
+//    Ten ways to show the same few things. No frames and no boxes:
+//    the panel is small enough that a border is only lost pixels.
+// ================================================================
+struct Bits { char hm[8], hh[4], mm[4], ss[4], day[12], dlong[20], dshort[14],
+                   dmon[10], dyear[6]; bool ok; };
+
+static Bits fb;                         // what the faces draw from
+static void loadBits() {
+  Bits& b = fb;
+  struct tm t;
+  fb.ok = timeOk && getLocalTime(&t, 0);
+  if (!fb.ok) {
+    strcpy(fb.hm, "--:--"); strcpy(fb.hh, "--"); strcpy(fb.mm, "--"); strcpy(fb.ss, "--");
+    strcpy(fb.day, "waiting"); strcpy(fb.dlong, "for the clock"); strcpy(fb.dshort, "--");
+    return;
+  }
+  snprintf(fb.hm, sizeof(fb.hm), "%02d:%02d", t.tm_hour, t.tm_min);
+  snprintf(fb.hh, sizeof(fb.hh), "%02d", t.tm_hour);
+  snprintf(fb.mm, sizeof(fb.mm), "%02d", t.tm_min);
+  snprintf(fb.ss, sizeof(fb.ss), "%02d", t.tm_sec);
+  strftime(fb.day,    sizeof(fb.day),    "%A", &t);
+  strftime(fb.dlong,  sizeof(fb.dlong),  "%d %B %Y", &t);
+  strftime(fb.dshort, sizeof(fb.dshort), "%d %b %Y", &t);
+}
+
+// A level that follows slowly, so however the thing happens to be
+// sitting counts as flat, and everything drifts back to the middle a
+// couple of seconds after it is set down. A face needs no calibration
+// of its own, and works whether or not leaning drives the device.
+static void faceTilt(float& tx, float& ty) {
+  float v[3] = { ax, ay, az };
+  for (int i = 0; i < 3; i++) faceRef[i] += (v[i] - faceRef[i]) * 0.05f;
+  if (tiltTaught()) {
+    tx = mapSgnX * (v[mapAxX] - faceRef[mapAxX]);
+    ty = mapSgnY * (v[mapAxY] - faceRef[mapAxY]);
+  } else {
+    tx = v[0] - faceRef[0];
+    ty = v[1] - faceRef[1];
+  }
+  tx = constrain(tx, -0.6f, 0.6f);
+  ty = constrain(ty, -0.6f, 0.6f);
+}
+
+// Flip every pixel under a line that moves per column, so whatever the
+// fill covers stays readable instead of disappearing into it.
+static void invertUnder(const int* topAt) {
+  uint8_t* buf = oled.getBuffer();
+  for (int x = 0; x < SCRW; x++) {
+    int top = constrain(topAt[x], 0, SCRH);
+    for (int y = top; y < SCRH; y++) buf[x + (y >> 3) * SCRW] ^= (1 << (y & 7));
+  }
+}
+
+static void faceClassic() {
+  int bw = 5 * 18;
+  int x0 = (SCRW - bw - 14) / 2;
+  oled.setTextSize(3); oled.setCursor(x0, 8); oled.print(fb.hm);
+  at(x0 + bw + 5, 18, fb.ss);
+  oled.drawFastHLine(22, 36, SCRW - 44, SSD1306_WHITE);
+  ctr(fb.day, 41, 1);
+  ctr(fb.dlong, 53, 1);
+}
+static void faceStack() {
+  ctr(fb.hh, 3, 3);
+  ctr(fb.mm, 28, 3);
+  ctr(fb.dshort, 55, 1);
+}
+static void faceDateUp() {
+  ctr(fb.day, 3, 1);
+  ctr(fb.dshort, 14, 1);
+  ctr(fb.hm, 27, 3);
+  ctr(fb.ss, 54, 1);
+}
+static void faceMinimal() {
+  ctr(fb.hm, 16, 4);
+}
+static void faceSide() {
+  // the date goes on two short lines, because "30 September 2026" beside
+  // a size two clock does not fit and never will
+  at(4, 20, fb.hm, 2);
+  at(4, 40, fb.ss, 1);
+  oled.drawFastVLine(64, 14, 38, SSD1306_WHITE);
+  at(68, 16, fb.day);
+  at(68, 30, fb.dmon);
+  at(68, 42, fb.dyear);
+}
+static void faceBanner() {
+  ctr(fb.day, 4, 1);
+  oled.fillRect(0, 16, SCRW, 28, SSD1306_WHITE);
+  oled.setTextColor(SSD1306_BLACK);
+  ctr(fb.hm, 20, 3);
+  oled.setTextColor(SSD1306_WHITE);
+  ctr(fb.dshort, 50, 1);
+}
+// everything leans the way you do, and rights itself when you stop
+static void faceDrift() {
+  float tx, ty;
+  faceTilt(tx, ty);
+  int dx = constrain((int)(tx * 40.0f), -22, 22);
+  int dy = constrain((int)(-ty * 18.0f), -10, 10);
+  int w = 5 * 18;
+  oled.setTextSize(3);
+  oled.setCursor((SCRW - w) / 2 + dx, 14 + dy);
+  oled.print(fb.hm);
+  oled.setTextSize(1);
+  int dw = (int)strlen(fb.dshort) * 6;
+  oled.setCursor((SCRW - dw) / 2 + dx, 46 + dy);
+  oled.print(fb.dshort);
+}
+// the same idea, except the lines lean by different amounts
+static void faceParallax() {
+  float tx, ty;
+  faceTilt(tx, ty);
+  int d1 = constrain((int)(tx * 46.0f), -24, 24);
+  int d2 = constrain((int)(tx * -20.0f), -12, 12);
+  int w = 5 * 18;
+  oled.setTextSize(3);
+  oled.setCursor((SCRW - w) / 2 + d1, 10);
+  oled.print(fb.hm);
+  oled.setTextSize(1);
+  int dw = (int)strlen(fb.day) * 6;
+  oled.setCursor((SCRW - dw) / 2 + d2, 40);
+  oled.print(fb.day);
+  dw = (int)strlen(fb.dshort) * 6;
+  oled.setCursor((SCRW - dw) / 2 + d1 / 2, 52);
+  oled.print(fb.dshort);
+}
+// one that sloshes, and one that simply tips
+static void faceFill(bool wavy) {
+  ctr(fb.day, 2, 1);
+  ctr(fb.dshort, 13, 1);
+  ctr(fb.hm, 26, 2);
+  float tx, ty;
+  faceTilt(tx, ty);
+  static int topAt[SCRW];
+  float slope = tx * 30.0f;
+  float ph = millis() * 0.004f;
+  for (int x = 0; x < SCRW; x++) {
+    float w = wavy ? sinf(x * 0.13f + ph) * 2.4f + sinf(x * 0.05f - ph * 0.7f) * 1.6f : 0.0f;
+    // lean right and it should pool on the right, so the surface sits
+    // higher up the screen on that side
+    topAt[x] = 46 - (int)(slope * (x - SCRW / 2) / (SCRW / 2)) + (int)w;
+  }
+  invertUnder(topAt);
+}
+
 static void drawHome() {
   oled.clearDisplay();
-  struct tm t;
+  loadBits();
 
-  if (!timeOk || !getLocalTime(&t, 5)) {
+  if (!fb.ok) {                          // no clock yet, so it counts instead
     char e[14];
     swStr(e, sizeof(e));
     ctr("STOPWATCH", 6, 1);
@@ -627,24 +808,21 @@ static void drawHome() {
     return;
   }
 
-  char big[8], sec[4], day[14], date[20];
-  snprintf(big, sizeof(big), "%02d:%02d", t.tm_hour, t.tm_min);
-  snprintf(sec, sizeof(sec), "%02d", t.tm_sec);
-  strftime(day, sizeof(day), "%A", &t);
-  strftime(date, sizeof(date), "%d %B %Y", &t);
-
-  int bw = 5 * 18;
-  int x0 = (SCRW - bw - 14) / 2;
-  oled.setTextSize(3);
-  oled.setCursor(x0, 8);
-  oled.print(big);
-  at(x0 + bw + 5, 18, sec);
-
-  oled.drawFastHLine(22, 36, SCRW - 44, SSD1306_WHITE);
-  ctr(day, 41, 1);
-  ctr(date, 53, 1);
+  switch (cfgFace) {
+    case F_STACK:    faceStack();       break;
+    case F_DATEUP:    faceDateUp();      break;
+    case F_MINIMAL:    faceMinimal();     break;
+    case F_SIDE:    faceSide();        break;
+    case F_BANNER:    faceBanner();      break;
+    case F_DRIFT:    faceDrift();       break;
+    case F_PARALLAX:    faceParallax();    break;
+    case F_WATER:    faceFill(true);  break;
+    case F_SAND:    faceFill(false); break;
+    default:         faceClassic();     break;
+  }
   oled.display();
 }
+
 
 static void drawWeather() {
   oled.clearDisplay();
@@ -679,6 +857,10 @@ static void fmt12(char* o, size_t n, int mins) {
   int d = h % 12; if (!d) d = 12;
   snprintf(o, n, "%2d:%02d%s", d, m, h >= 12 ? "pm" : "am");
 }
+static bool isFriday() {
+  struct tm t;
+  return timeOk && getLocalTime(&t, 0) && t.tm_wday == 5;
+}
 static int nextPrayer(int nowMin) {
   for (int i = 0; i < 5; i++) if (prayerAt(i) > nowMin) return i;
   return 0;
@@ -693,7 +875,7 @@ static void drawPrayer() {
     return;
   }
   struct tm t;
-  int nowMin = (timeOk && getLocalTime(&t, 5)) ? t.tm_hour * 60 + t.tm_min : -1;
+  int nowMin = (timeOk && getLocalTime(&t, 0)) ? t.tm_hour * 60 + t.tm_min : -1;
   int nx = nowMin >= 0 ? nextPrayer(nowMin) : -1;
 
   char v[12];
@@ -703,7 +885,8 @@ static void drawPrayer() {
       oled.fillRect(0, y - 1, SCRW, 10, SSD1306_WHITE);
       oled.setTextColor(SSD1306_BLACK);
     } else oled.setTextColor(SSD1306_WHITE);
-    at(4, y, PRAYERS[i]);
+    // on a Friday the midday prayer goes by its own name
+    at(4, y, (i == 1 && isFriday()) ? "Jumuah" : PRAYERS[i]);
     fmt12(v, sizeof(v), prayerAt(i));
     oled.setCursor(SCRW - 3 - (int)strlen(v) * 6, y);
     oled.print(v);
@@ -724,7 +907,8 @@ static void drawPrayerAlert() {
   } else oled.setTextColor(SSD1306_WHITE);
   uint16_t ink = flash ? SSD1306_BLACK : SSD1306_WHITE;
 
-  const char* nm = (alertWhich >= 0 && alertWhich < 5) ? PRAYERS[alertWhich] : "Prayer";
+  const char* nm = (alertWhich == 1 && isFriday()) ? "Jumuah"
+                 : (alertWhich >= 0 && alertWhich < 5) ? PRAYERS[alertWhich] : "Prayer";
   if (alertPhase == AL_NOW) {
     ctr(nm, 12, 2);
     oled.drawFastHLine(24, 34, SCRW - 48, ink);
@@ -1030,6 +1214,37 @@ static void drawFocus() {
   oled.display();
 }
 
+static void drawAccel() {
+  oled.clearDisplay();
+  titleBar("ACCELEROMETER", "");
+  // a live dot for where it is leaning
+  oled.drawRect(2, 14, 30, 30, SSD1306_WHITE);
+  oled.drawFastHLine(14, 29, 7, SSD1306_WHITE);
+  oled.drawFastVLine(17, 26, 7, SSD1306_WHITE);
+  float tx, ty;
+  faceTilt(tx, ty);
+  int px = 17 + (int)constrain(tx * 22.0f, -12.0f, 12.0f);
+  int py = 29 - (int)constrain(ty * 22.0f, -12.0f, 12.0f);
+  oled.fillCircle(px, py, 2, SSD1306_WHITE);
+
+  char l[24];
+  snprintf(l, sizeof(l), "x %+.2f", ax); at(38, 15, l);
+  snprintf(l, sizeof(l), "y %+.2f", ay); at(38, 26, l);
+  snprintf(l, sizeof(l), "z %+.2f", az); at(38, 37, l);
+
+  snprintf(l, sizeof(l), "taps %lu %lu %lu %lu",
+           (unsigned long)min(99UL, (unsigned long)cTap),
+           (unsigned long)min(99UL, (unsigned long)cDouble),
+           (unsigned long)min(99UL, (unsigned long)cTriple),
+           (unsigned long)min(99UL, (unsigned long)cQuad));
+  ctr(l, 46, 1);
+  snprintf(l, sizeof(l), "falls %lu  shakes %lu",
+           (unsigned long)min(99UL, (unsigned long)cFall),
+           (unsigned long)min(99UL, (unsigned long)cShake));
+  ctr(l, 55, 1);
+  oled.display();
+}
+
 static void drawAbout() {
   oled.clearDisplay();
   titleBar("ABOUT", FW_VERSION);
@@ -1051,6 +1266,7 @@ static void drawSettings() {
     return;
   }
   if (depth == 2 && itemIdx == C_ABOUT) { drawAbout(); return; }
+  if (depth == 2 && itemIdx == C_ACCEL) { drawAccel(); return; }
   bar(depth == 2 ? "CHANGE" : "SETTINGS");
 
   char v[18];
@@ -1064,7 +1280,12 @@ static void drawSettings() {
     else      oled.setTextColor(SSD1306_WHITE);
     at(3, y, C_NAME[i]);
     switch (i) {
-      case C_BRIGHT: snprintf(v, sizeof(v), "%d", cfgBright); break;
+      case C_BRIGHT: { int k = 0;
+                       for (int j = 0; j < BRIGHT_N; j++) if (BRIGHT_OPTS[j] == cfgBright) k = j;
+                       snprintf(v, sizeof(v), "%s", BRIGHT_NAME[k]); break; }
+      case C_FACE:   snprintf(v, sizeof(v), "%s", FACE_NAME[cfgFace]); break;
+      case C_PRAYER: snprintf(v, sizeof(v), "%s", prayerOk ? "saved" : "none"); break;
+      case C_ACCEL:  snprintf(v, sizeof(v), "x2"); break;
       case C_CONTROL:snprintf(v, sizeof(v), "%s", cfgTilt ? "tilt" : "taps"); break;
       case C_ABOUT:  snprintf(v, sizeof(v), "x2"); break;
       case C_SLEEP:  if (!sleepSecs())         snprintf(v, sizeof(v), "never");
@@ -1220,14 +1441,10 @@ const char* G_NAME[G_COUNT] = { "Snake", "Brick", "Car", "Catch", "Pong", "Roll"
 
 enum { GS_CAL_STILL = 0, GS_CAL_RIGHT, GS_CAL_AWAY, GS_READY, GS_PLAY, GS_PAUSE, GS_OVER };
 int  gState = GS_READY;
+int  gamePending = -1;
 int  gScore = 0, gBest[G_COUNT] = { 0, 0, 0, 0, 0, 0 };
 unsigned long gNext = 0, gStamp = 0;
 
-int8_t mapAxX = -1, mapSgnX = 1, mapAxY = -1, mapSgnY = 1;   // -1 until taught
-float  restV[3] = { 0, 0, 0 };
-int    gravAx = 2;
-float  calAcc[3] = { 0, 0, 0 };
-int    calN = 0;
 
 static void saveTiltMap() {
   char b[24];
@@ -1247,7 +1464,6 @@ static void loadTiltMap() {
     mapAxX = v[0]; mapSgnX = v[1]; mapAxY = v[2]; mapSgnY = v[3];
   }
 }
-static bool tiltTaught() { return mapAxX >= 0 && mapAxY >= 0; }
 
 static void tiltRead(float& tx, float& ty) {
   float v[3] = { ax, ay, az };
@@ -1780,8 +1996,7 @@ static void gameReset(int g) {
   }
 }
 static void gameStart(int which) {
-  gState = GS_CAL_STILL;                 // the rest position is measured every time
-  calAcc[0] = calAcc[1] = calAcc[2] = 0; calN = 0;
+  gState = GS_READY;                     // the leans were just checked on the way in
   gStamp = millis();
   gameReset(which);
 }
@@ -2166,7 +2381,7 @@ static void drawNavCal() {
     oled.display();
     return;
   }
-  titleBarC(navCal == NC_HOLD ? "HOLD IT STILL" : "SHOW ME HOW YOU LEAN");
+  titleBarC(navCal == NC_HOLD ? "HOLD IT FIRMLY" : "SHOW ME HOW YOU LEAN");
   const char* ask = "";
   switch (navCal) {
     case NC_HOLD:  ask = "Keep it steady"; break;
@@ -2345,6 +2560,7 @@ static void savePrayer() {
   for (int i = 0; i < 5; i++) { s += String(prayerMin[i]); if (i < 4) s += ","; }
   prefs.putString("pray", s);
   prefs.putInt("prayd", prayerDay);
+  prefs.putUInt("prayb", prayerBoot);
 }
 static void loadPrayer() {
   String s = prefs.getString("pray", "");
@@ -2359,6 +2575,7 @@ static void loadPrayer() {
   for (int k = 0; k < 5; k++) { if (tmp[k] < 0 || tmp[k] > 1439) return; prayerMin[k] = tmp[k]; }
   prayerOk = true;
   prayerDay = prefs.getInt("prayd", -1);
+  prayerBoot = prefs.getUInt("prayb", 0);
 }
 static void saveAdj() {
   String o;
@@ -2378,7 +2595,7 @@ static void loadAdj() {
 
 static void fetchPrayer() {
   struct tm t;
-  if (!timeOk || !getLocalTime(&t, 5)) return;
+  if (!timeOk || !getLocalTime(&t, 0)) return;
   if (!locate()) return;
 
   char d[16];
@@ -2404,6 +2621,8 @@ static void fetchPrayer() {
   for (int i = 0; i < 5; i++) prayerMin[i] = tmp[i];
   prayerOk = true;
   prayerDay = t.tm_yday;
+  prayerBoot = cBoot;
+  prayerWanted = false;
   savePrayer();
   Serial.println("prayer times updated");
 }
@@ -2960,7 +3179,7 @@ static void wake(const char* why) {
 //  minute and then leaves you alone. Each step fires once a day.
 static void servicePrayerAlert() {
   struct tm t;
-  if (!prayerOk || !timeOk || !getLocalTime(&t, 5)) return;
+  if (!prayerOk || !timeOk || !getLocalTime(&t, 0)) return;
 
   if (alertDay != t.tm_yday) {                 // a new day, a clean slate
     alertDay = t.tm_yday;
@@ -3079,6 +3298,8 @@ static void knockOne() {
                        for (int k = 0; k < BRIGHT_N; k++) if (BRIGHT_OPTS[k] == cfgBright) i = k;
                        cfgBright = BRIGHT_OPTS[(i + 1) % BRIGHT_N];
                        applyBright(); prefs.putInt("bri", cfgBright); break; }
+      case C_FACE:   cfgFace = (cfgFace + 1) % FACE_N;
+                     prefs.putInt("face", cfgFace); break;
       case C_CONTROL: cfgTilt = !cfgTilt;
                      prefs.putBool("ctrl", cfgTilt);
                      applyFallInt();
@@ -3128,6 +3349,8 @@ static void knockPrev() {
                        for (int k = 0; k < BRIGHT_N; k++) if (BRIGHT_OPTS[k] == cfgBright) i = k;
                        cfgBright = BRIGHT_OPTS[(i + BRIGHT_N - 1) % BRIGHT_N];
                        applyBright(); prefs.putInt("bri", cfgBright); break; }
+      case C_FACE:   cfgFace = (cfgFace + FACE_N - 1) % FACE_N;
+                     prefs.putInt("face", cfgFace); break;
       case C_SLEEP:  cfgSleepIdx = (cfgSleepIdx + SLEEP_N - 1) % SLEEP_N;
                      prefs.putInt("slpi", cfgSleepIdx); break;
       case C_POPUP:  cfgPopupIdx = (cfgPopupIdx + POPUP_N - 1) % POPUP_N;
@@ -3145,7 +3368,7 @@ static void knockTwo() {
     switch (screen) {
       case S_FAITH:    depth = 1; itemIdx = 0; subIdx = 0; break;
       case S_READS:    if (readCount) { depth = 1; itemIdx = 0; } else refillShelf(); break;
-      case S_GAMES:    depth = 1; itemIdx = 0; break;
+      case S_GAMES:    depth = 1; itemIdx = 0; navCalBegin(false); break;
       case S_SETTINGS: depth = 1; itemIdx = 0; break;
       case S_HOME:     if (!timeOk) swStart = millis(); break;   // restart the stopwatch
       case S_WEATHER:  nextWx = 0; break;
@@ -3179,7 +3402,7 @@ static void knockTwo() {
     return;
   }
   if (screen == S_GAMES) {
-    if (depth == 1) { gameStart(itemIdx); depth = 2; return; }
+    if (depth == 1) { gamePending = itemIdx; navCalBegin(true); return; }
     if (gState == GS_OVER)  { gameStart(itemIdx); return; }
     if (gState == GS_PLAY)  { gState = GS_PAUSE;  return; }
     if (gState == GS_PAUSE) { gState = GS_PLAY; gNext = millis(); return; }
@@ -3192,6 +3415,8 @@ static void knockTwo() {
                       else { otaStatus = "No network"; otaPct = -1; drawOta(); delay(1600); }
                       break;
       case C_HOTSPOT: startHotspot(); break;
+      case C_PRAYER:  prayerWanted = true; nextPrayerTry = 0; break;
+      case C_ACCEL:   depth = 2; break;
       default:        depth = 2; break;
     }
   }
@@ -3362,7 +3587,8 @@ static void onFall() {
 }
 
 static void settleBurst() {
-  if (!burst || millis() - burstStart < TAP_WINDOW_MS) return;
+  if (!burst) return;
+  if (burst < 4 && millis() - burstStart < TAP_WINDOW_MS) return;   // four is all there is
   uint8_t n = burst;
   burst = 0;
   if (upState != U_OFF) {
@@ -3457,6 +3683,13 @@ static void input() {
   // dozing off mid sentence would be maddening.
   unsigned long fuse = inReader() ? (unsigned long)READING_SLEEP_SEC
                                   : (unsigned long)sleepSecs();
+  // Five seconds before it drops off, come back to the clock, so it is
+  // always the clock you find when you glance at it. Not while you are
+  // reading or mid game: that would lose your place.
+  if (fuse && fuse > 6 && !inReader() && !(screen == S_GAMES && depth == 2) &&
+      now - lastActive > (fuse - 5) * 1000UL && screen != S_HOME) {
+    screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
+  }
   if (fuse && now - lastActive > fuse * 1000UL) goSleep();   // 0 means never
 }
 
@@ -4227,6 +4460,7 @@ void setup() {
   cfgPopupIdx = constrain(prefs.getInt("popi", 2), 0, POPUP_N - 1);
   cfgEyes     = constrain(prefs.getInt("eye", 0), 0, STYLE_N - 1);
   cfgAutoTurn = prefs.getBool("turn", false);
+  cfgFace     = constrain(prefs.getInt("face", F_CLASSIC), 0, FACE_N - 1);
   cfgTilt     = prefs.getBool("ctrl", false);
   cfgTz       = prefs.getString("tz", DEF_TZ);
   cfgSsid     = prefs.getString("ssid", "");
@@ -4372,9 +4606,13 @@ void loop() {
     if (!asleep && idle && (long)(now - nextWx) >= 0) { nextWx = now + 900000UL; fetchWeather(); }
 
     struct tm t;
-    bool haveDay = timeOk && getLocalTime(&t, 5);
+    bool haveDay = timeOk && getLocalTime(&t, 0);
+    // They barely move week to week, and refetching daily meant losing
+    // them whenever the network was down. Keep what is in flash; refresh
+    // when asked, or once every fiftieth boot.
+    bool dueByBoot = (cBoot >= prayerBoot + PRAYER_REFRESH_BOOTS);
     if (idle && (long)(now - nextPrayerTry) >= 0 && haveDay &&
-        (!prayerOk || prayerDay != t.tm_yday)) {
+        (!prayerOk || prayerWanted || dueByBoot)) {
       nextPrayerTry = now + 300000UL;
       fetchPrayer();
     }
@@ -4426,6 +4664,12 @@ void loop() {
     if (now - lastDraw >= 60) { lastDraw = now; drawNavCal(); }
     delay(2);
     return;
+  }
+  if (gamePending >= 0) {                      // leans checked, on with the game
+    itemIdx = gamePending;
+    gamePending = -1;
+    gameStart(itemIdx);
+    depth = 2;
   }
 
   if (alertPhase != AL_NONE) {                 // the call takes the screen
