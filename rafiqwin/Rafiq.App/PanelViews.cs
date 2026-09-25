@@ -116,29 +116,79 @@ public sealed partial class PanelForm
             PlaceholderText = "What about?" };
         _body.Controls.Add(text);
 
+        // Either in a while, or at a time. Two plain menus for the clock
+        // rather than a date control: they always take a click, and they
+        // are quicker than typing a time anyway.
         int chosen = 15;
+        bool atTime = false;
         var chips = new List<Button>();
         int[] quick = { 5, 10, 15, 30, 45, 60, 90, 120 };
         int gap = Scale(5), cw = (_body.Width - gap * 3) / 4, ch = Scale(26);
+
+        var mode = new ComboBox {
+            Left = 0, Top = Scale(56), Width = Scale(70), DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = new Font("Segoe UI", Scale(11), FontStyle.Regular, GraphicsUnit.Pixel) };
+        mode.Items.AddRange(new object[] { "In", "At" });
+        mode.SelectedIndex = 0;
+        _body.Controls.Add(mode);
+
+        var hour = new ComboBox {
+            Left = Scale(78), Top = Scale(56), Width = Scale(64), DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = new Font("Segoe UI", Scale(11), FontStyle.Regular, GraphicsUnit.Pixel), Visible = false };
+        for (int h = 0; h < 24; h++) hour.Items.Add(h.ToString("00"));
+        hour.SelectedIndex = DateTime.Now.AddHours(1).Hour;
+        var minute = new ComboBox {
+            Left = Scale(148), Top = Scale(56), Width = Scale(64), DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = new Font("Segoe UI", Scale(11), FontStyle.Regular, GraphicsUnit.Pixel), Visible = false };
+        for (int m = 0; m < 60; m += 5) minute.Items.Add(m.ToString("00"));
+        minute.SelectedIndex = 0;
+        var dayNote = new Label {
+            Left = Scale(218), Top = Scale(59), Width = Scale(80), Height = Scale(18),
+            Font = new Font("Segoe UI", Scale(10), FontStyle.Regular, GraphicsUnit.Pixel),
+            ForeColor = _skin.Dim, BackColor = Color.Transparent, Visible = false };
+        _body.Controls.Add(hour); _body.Controls.Add(minute); _body.Controls.Add(dayNote);
+
+        // The next time the clock shows this. One already gone means
+        // tomorrow, which is what anyone setting 7am at midnight expects.
+        DateTime NextAt()
+        {
+            var now = DateTime.Now;
+            var t = new DateTime(now.Year, now.Month, now.Day,
+                                 hour.SelectedIndex, minute.SelectedIndex * 5, 0);
+            return t <= now ? t.AddDays(1) : t;
+        }
+        void Day() => dayNote.Text = NextAt().Date == DateTime.Today ? "today" : "tomorrow";
+        hour.SelectedIndexChanged += (_, __) => Day();
+        minute.SelectedIndexChanged += (_, __) => Day();
+        Day();
+
         for (int i = 0; i < quick.Length; i++)
         {
             int m = quick[i];
             var b = Chip(m >= 60 && m % 60 == 0 ? $"{m / 60}h" : $"{m}m",
-                         (i % 4) * (cw + gap), Scale(58) + (i / 4) * (ch + gap), cw, ch,
-                         () => { chosen = m; foreach (var c in chips)
-                                 { c.BackColor = _skin.Card; c.ForeColor = _skin.Text; }
+                         (i % 4) * (cw + gap), Scale(88) + (i / 4) * (ch + gap), cw, ch,
+                         () => { chosen = m;
+                                 foreach (var c in chips) { c.BackColor = _skin.Card; c.ForeColor = _skin.Text; }
                                  var me = chips[Array.IndexOf(quick, m)];
                                  me.BackColor = _skin.CardOn; me.ForeColor = _skin.Accent; });
             chips.Add(b);
         }
         chips[2].BackColor = _skin.CardOn; chips[2].ForeColor = _skin.Accent;
 
-        int y = Scale(58) + 2 * (ch + gap) + Scale(6);
+        mode.SelectedIndexChanged += (_, __) =>
+        {
+            atTime = mode.SelectedIndex == 1;
+            hour.Visible = minute.Visible = dayNote.Visible = atTime;
+            foreach (var c in chips) c.Visible = !atTime;
+        };
+
+        int y = Scale(88) + 2 * (ch + gap) + Scale(6);
         void Add()
         {
             var t = text.Text.Trim();
             if (t.Length == 0) return;
-            _rem.AddInMinutes(t, chosen);
+            if (atTime) _rem.Add(t, NextAt());
+            else        _rem.AddInMinutes(t, chosen);
             text.Text = "";
             _dev.Flash("Reminder set");
             Build(); Refill();

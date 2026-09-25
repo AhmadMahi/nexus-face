@@ -118,6 +118,33 @@ Console.WriteLine("\nthe token is kept encrypted, not in the settings file");
     Check(Store.GetToken() == "", "clearing it works");
 }
 
+Console.WriteLine("\nwhat can run beside what");
+{
+    var c = new Store();
+    var dv = new Device(c);
+    Check(dv.Blocked(Device.Tool.BreakNow) == null, "nothing running: on a break is free");
+    Check(dv.Blocked(Device.Tool.DeepSleep) == null, "nothing running: deep sleep is free");
+
+    dv.FocusLeft = 900;
+    Check(dv.FocusRunning, "focus reads as running");
+    Check(dv.Blocked(Device.Tool.BreakNow) == "during focus", "on a break is blocked, and says why");
+    Check(dv.Blocked(Device.Tool.DeepSleep) == "after focus", "deep sleep is blocked, and says why");
+    Check(dv.Blocked(Device.Tool.Relax) == null, "relax still allowed beside focus");
+    Check(dv.Blocked(Device.Tool.Follow) == null, "follow still allowed beside focus");
+    dv.FocusLeft = 0;
+
+    dv.Following = true;
+    Check(dv.Blocked(Device.Tool.Relax) == "following", "relax is blocked while following");
+    Check(dv.Blocked(Device.Tool.Follow) == null, "follow stays clickable, so it can be turned off");
+    dv.Following = false; dv.Relaxing = true;
+    Check(dv.Blocked(Device.Tool.Follow) == "relaxing", "follow is blocked while relaxing");
+    dv.Relaxing = false;
+
+    dv.DndLeft = 600;
+    Check(dv.Blocked(Device.Tool.DeepSleep) == "on a break", "deep sleep waits for a break");
+    dv.DndLeft = 0;
+}
+
 Console.WriteLine("\nend to end against a stand-in robot");
 {
     var listener = new HttpListener();

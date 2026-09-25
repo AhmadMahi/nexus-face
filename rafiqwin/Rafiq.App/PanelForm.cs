@@ -239,14 +239,17 @@ public sealed partial class PanelForm : Form
 
         // row one
         Tile(0, 0, "", "Phrases", "saved lines", false, true, () => { _view = View.Phrases; Build(); Refill(); });
-        Tile(1, 0, "", "Focus", _dev.FocusLeft > 0 ? $"{_dev.FocusLeft / 60 + 1} min left" : "",
-             _dev.FocusLeft > 0, true,
-             () => { if (_dev.FocusLeft > 0) Fire(_dev.StopFocus); else { _view = View.Focus; Build(); Refill(); } });
-        Tile(2, 0, "", "Follow", "the pointer", _dev.Following, true,
+        Tile(1, 0, _dev.FocusRunning ? "" : "", "Focus",
+             _dev.FocusRunning ? $"{_dev.FocusLeft / 60 + 1} min left  ·  stop" : "",
+             _dev.FocusRunning, true,
+             () => { if (_dev.FocusRunning) Fire(_dev.StopFocus); else { _view = View.Focus; Build(); Refill(); } });
+        Tile(2, 0, "", "Follow", _dev.Blocked(Device.Tool.Follow) ?? "the pointer",
+             _dev.Following, _dev.Blocked(Device.Tool.Follow) == null,
              () => Fire(async () => { await _dev.SetFollow(!_dev.Following); _svc.SyncCursor(); }));
 
         // row two
-        Tile(0, 1, "", "Relax", "screensaver", _dev.Relaxing, true,
+        Tile(0, 1, "", "Relax", _dev.Blocked(Device.Tool.Relax) ?? "screensaver",
+             _dev.Relaxing, _dev.Blocked(Device.Tool.Relax) == null,
              () => Fire(async () => await _dev.SetRelax(!_dev.Relaxing)));
         Tile(1, 1, "", "Clipboard", _cfg.WatchClipboard ? "mirroring" : "off",
              _cfg.WatchClipboard, true,
@@ -259,8 +262,9 @@ public sealed partial class PanelForm : Form
         Tile(0, 2, "", "Remind me", pend == 0 ? "nothing set" : $"{pend} waiting", pend > 0, true,
              () => { _view = View.Remind; Build(); Refill(); });
         Tile(1, 2, "", "On a break",
-             _dev.DndLeft > 0 ? $"{_dev.DndLeft / 60 + 1} min left" : "locks this PC",
-             _dev.DndLeft > 0, true,
+             _dev.DndLeft > 0 ? $"{_dev.DndLeft / 60 + 1} min left"
+                              : (_dev.Blocked(Device.Tool.BreakNow) ?? "locks this PC"),
+             _dev.DndLeft > 0, _dev.Blocked(Device.Tool.BreakNow) == null,
              () => { if (_dev.DndLeft > 0) Fire(_dev.EndBreak); else { _view = View.Break; Build(); Refill(); } });
         Tile(2, 2, "", "Camera & mic",
              _cfg.WatchAv ? (_svc.AvLive ? "live now" : "watching") : "off", _cfg.WatchAv, true,
@@ -268,7 +272,8 @@ public sealed partial class PanelForm : Form
 
         // row four
         Tile(0, 3, "", "Update", "the robot", false, true, () => Fire(_dev.CheckUpdate));
-        Tile(1, 3, "", "Deep sleep", "power to wake", false, true, () => Fire(_dev.DeepSleep));
+        Tile(1, 3, "", "Deep sleep", _dev.Blocked(Device.Tool.DeepSleep) ?? "power to wake",
+             false, _dev.Blocked(Device.Tool.DeepSleep) == null, () => Fire(_dev.DeepSleep));
         // Wired up and tested, but deliberately inert for now.
         Tile(2, 3, "", "Draw", "not yet", false, false, () => { });
 
@@ -302,8 +307,7 @@ public sealed partial class PanelForm : Form
         if (_view == View.Grid && _tiles.Count == 12)
         {
             var pend = _rem.Pending.Count;
-            _tiles[1].Detail = _dev.FocusLeft > 0 ? $"{_dev.FocusLeft / 60 + 1} min left" : "";
-            _tiles[1].On = _dev.FocusLeft > 0;
+            _tiles[1].On = _dev.FocusRunning;
             _tiles[2].On = _dev.Following;
             _tiles[3].On = _dev.Relaxing;
             _tiles[4].Detail = _cfg.WatchClipboard ? "mirroring" : "off"; _tiles[4].On = _cfg.WatchClipboard;
@@ -313,6 +317,20 @@ public sealed partial class PanelForm : Form
             _tiles[7].On = _dev.DndLeft > 0;
             _tiles[8].Detail = _cfg.WatchAv ? (_svc.AvLive ? "live now" : "watching") : "off";
             _tiles[8].On = _cfg.WatchAv;
+            // Whether a tile is clickable can change from under us, and
+            // that is wired at build time rather than paint time.
+            bool want2 = _dev.Blocked(Device.Tool.Follow) == null;
+            bool want3 = _dev.Blocked(Device.Tool.Relax) == null;
+            bool want7 = _dev.Blocked(Device.Tool.BreakNow) == null;
+            bool want10 = _dev.Blocked(Device.Tool.DeepSleep) == null;
+            if (_tiles[2].Available != want2 || _tiles[3].Available != want3
+             || _tiles[7].Available != want7 || _tiles[10].Available != want10)
+            {
+                Build();
+                return;
+            }
+            _tiles[1].Glyph = _dev.FocusRunning ? "" : "";
+            _tiles[1].Detail = _dev.FocusRunning ? $"{_dev.FocusLeft / 60 + 1} min left  ·  stop" : "";
             foreach (var t in _tiles) t.Invalidate();
         }
         if (_dev.Pairing && _view != View.Pair) { _view = View.Pair; Build(); }

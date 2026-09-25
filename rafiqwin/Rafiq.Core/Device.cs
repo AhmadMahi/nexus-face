@@ -42,6 +42,33 @@ public sealed class Device
         if (Status.Length > 0 && DateTime.UtcNow > _statusUntil) { Status = ""; Changed?.Invoke(); }
     }
 
+    // ---- what can run beside what ----
+    //
+    // A few of these cannot sensibly be on at once. The rules live here
+    // rather than inside the buttons, so the tiles and the robot can never
+    // end up disagreeing about what is allowed.
+
+    public enum Tool { BreakNow, DeepSleep, Relax, Follow }
+
+    public bool FocusRunning => FocusLeft > 0;
+    public bool BreakRunning => DndLeft > 0;
+
+    /// <summary>
+    /// Null when the tile is free to use, otherwise the reason it is not.
+    /// A greyed out tile with no explanation is just a broken tile.
+    /// </summary>
+    public string? Blocked(Tool t) => t switch
+    {
+        // A break locks the screen, which is the opposite of focusing.
+        Tool.BreakNow  => FocusRunning ? "during focus" : null,
+        // Sleeping would take the countdown with it.
+        Tool.DeepSleep => FocusRunning ? "after focus" : (BreakRunning ? "on a break" : null),
+        // The robot can only hold one of these on its panel.
+        Tool.Relax     => Following ? "following" : null,
+        Tool.Follow    => Relaxing ? "relaxing" : null,
+        _              => null
+    };
+
     // ---- text ----
 
     public const int MaxLen = 84;
