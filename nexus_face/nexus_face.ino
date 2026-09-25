@@ -48,7 +48,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.2.0"
+#define FW_VERSION "2.3.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -340,7 +340,23 @@ bool cfgFollow = false;
 //  A copy, a paste, a nudge to stand up. None of it disturbs the stored
 //  message, which is yours and stays where it is.
 String toastText = "", toastKind = "";
-unsigned long toastUntil = 0;
+unsigned long toastUntil = 0, toastFlash = 0;
+
+// ---------------- on a break ----------------
+//  The Mac locks itself and the robot holds the sign, so anyone walking
+//  past knows without having to ask.
+unsigned long dndUntil = 0;
+const char* DND_LINES[] = {
+  "Back shortly", "Stretching", "Away from the desk", "Tea", "Walking" };
+const int DND_N = sizeof(DND_LINES) / sizeof(DND_LINES[0]);
+int dndLine = 0;
+
+// ---------------- camera and microphone ----------------
+//  Nothing is listened to or looked at here. The Mac reads one flag per
+//  device from the system and forwards it, and the robot holds the panel
+//  lit while either is live so you can see it across the desk.
+bool busyCam = false, busyMic = false;
+unsigned long busyAt = 0;
 
 // ---------------- a page of pixels ----------------
 //  One screenful straight from the Mac. Whatever the Mac can draw, the
@@ -1273,34 +1289,109 @@ static void drawFocus() {
     if (left < 0) left = 0;
     char m[20];
     snprintf(m, sizeof(m), "%ld min left", (left + 59) / 60);
-    bar("FOCUS");
-    ctr(fzLine, 26, 1);
-    ctr(m, 44, 1);
+    at(6, 4, "FOCUS");
+    ctr(fzLine, 27, 1);
+    ctr(m, 45, 1);
     oled.display();
     return;
   }
 
+  // Rebuilt to stop it looking like a form. The inverted bar, the boxed
+  // progress rail and the scrolling name were three hard edges stacked
+  // on a panel this small. What is left is a word, the time, and a line
+  // showing how far in you are, with room around all three.
   const Task& t = tasks[taskIdx];
   bool brk = isBreak(t.name);
-  char r[12];
-  snprintf(r, sizeof(r), "%d/%d", taskIdx + 1, taskCount);
-  titleBar(brk ? "BREAK" : "FOCUS", r);
 
   long left = (long)(taskEnd - millis()) / 1000L;
   if (left < 0) left = 0;
-  char big[10];
-  snprintf(big, sizeof(big), "%ld:%02ld", left / 60, left % 60);
+
+  at(6, 4, brk ? "BREAK" : "FOCUS");
+  if (taskCount > 1) {                       // only worth saying when there is a list
+    char r[12];
+    snprintf(r, sizeof(r), "%d/%d", taskIdx + 1, taskCount);
+    at(SCRW - 6 - (int)strlen(r) * 6, 4, r);
+  }
+
+  // Hours only appear once there are hours, so a short run is not padded
+  // out with a leading zero that never changes.
+  char big[12];
+  if (left >= 3600) snprintf(big, sizeof(big), "%ld:%02ld", left / 3600, (left % 3600) / 60);
+  else              snprintf(big, sizeof(big), "%ld:%02ld", left / 60, left % 60);
+  int bw = (int)strlen(big) * 18;
   oled.setTextSize(3);
-  oled.setCursor((SCRW - (int)strlen(big) * 18) / 2, 16);
+  oled.setCursor((SCRW - bw) / 2, 22);
   oled.print(big);
+  oled.setTextSize(1);
 
+  // A thin rail with a thicker run along it, and no box around either.
   long total = (long)t.mins * 60;
-  int bw = SCRW - 16;
-  int fill = total > 0 ? (int)((bw - 2) * (total - left) / total) : 0;
-  oled.drawRect(8, 40, bw, 6, SSD1306_WHITE);
-  if (fill > 0) oled.fillRect(9, 41, fill, 4, SSD1306_WHITE);
+  const int RX = 14, RW = SCRW - 28;
+  int fill = total > 0 ? (int)((long)RW * (total - left) / total) : 0;
+  fill = constrain(fill, 0, RW);
+  oled.drawFastHLine(RX, 57, RW, SSD1306_WHITE);
+  if (fill > 0) oled.fillRect(RX, 55, fill, 4, SSD1306_WHITE);
+  oled.display();
+}
 
-  marquee(t.name.c_str(), 54, 1);
+// ================================================================
+//  ON A BREAK
+// ================================================================
+//  The Mac locks itself the moment this starts. The panel holds the
+//  sign so anyone at the desk can see it without waking anything.
+static void drawDnd() {
+  oled.clearDisplay();
+  long left = (long)(dndUntil - millis()) / 1000L;
+  if (left < 0) left = 0;
+
+  // a mug, because it reads at a glance from across a room
+  int cx = 22, cy = 20;
+  oled.drawRoundRect(cx - 9, cy - 6, 18, 14, 3, SSD1306_WHITE);
+  oled.drawCircle(cx + 12, cy + 1, 4, SSD1306_WHITE);
+  for (int i = 0; i < 3; i++)
+    oled.drawFastVLine(cx - 5 + i * 5, cy - 12, 4, SSD1306_WHITE);
+
+  at(44, 10, "ON A", 2);
+  at(44, 27, "BREAK", 2);
+
+  char m[24];
+  if (left >= 60) snprintf(m, sizeof(m), "%ld min left", (left + 59) / 60);
+  else            snprintf(m, sizeof(m), "%ld sec left", left);
+  ctr(m, 48, 1);
+  ctr(DND_LINES[dndLine], 57, 1);
+  oled.display();
+}
+
+// ================================================================
+//  CAMERA AND MICROPHONE
+// ================================================================
+//  Shown large and held awake, because the whole value of it is being
+//  readable from wherever you are sitting.
+static void drawBusy() {
+  oled.clearDisplay();
+  bool both = busyCam && busyMic;
+  int cx = both ? 36 : 64;
+
+  if (busyCam) {                             // a camera body with a lens
+    oled.fillRoundRect(cx - 22, 14, 36, 26, 4, SSD1306_WHITE);
+    oled.fillCircle(cx - 4, 27, 9, SSD1306_BLACK);
+    oled.fillCircle(cx - 4, 27, 4, SSD1306_WHITE);
+    oled.fillRect(cx + 14, 20, 8, 14, SSD1306_WHITE);
+  }
+  if (busyMic) {                             // a capsule on a stand
+    int mx = both ? 94 : cx;
+    oled.fillRoundRect(mx - 6, 12, 12, 20, 6, SSD1306_WHITE);
+    oled.drawCircle(mx, 28, 11, SSD1306_WHITE);
+    oled.drawFastVLine(mx, 39, 5, SSD1306_WHITE);
+    oled.drawFastHLine(mx - 7, 44, 15, SSD1306_WHITE);
+  }
+
+  const char* w = both ? "CAMERA AND MIC ON" : (busyCam ? "CAMERA ON" : "MIC ON");
+  int tw = (int)strlen(w) * 6;
+  oled.fillRect((SCRW - tw) / 2 - 3, 52, tw + 6, 11, SSD1306_WHITE);
+  oled.setTextColor(SSD1306_BLACK);
+  ctr(w, 54, 1);
+  oled.setTextColor(SSD1306_WHITE);
   oled.display();
 }
 
@@ -1413,13 +1504,28 @@ static void drawPair() {
 static void drawToast() {
   oled.clearDisplay();
   const char* head = "FROM YOUR MAC";
-  if (toastKind == "copy")  head = "COPIED";
-  if (toastKind == "paste") head = "PASTED";
-  if (toastKind == "break") head = "TAKE A BREAK";
+  if (toastKind == "copy")   head = "COPIED";
+  if (toastKind == "paste")  head = "PASTED";
+  if (toastKind == "break")  head = "TAKE A BREAK";
+  if (toastKind == "remind") head = "REMINDER";
   bar(head);
-  if (toastKind == "break") {
+
+  // A reminder you did not see is not a reminder, so the first half
+  // second of one is inverted. It catches the eye from across a desk
+  // the way a quiet change of screen never does.
+  bool loud = (toastKind == "remind" || toastKind == "break");
+  if (loud && toastFlash && (long)(millis() - toastFlash) < 500) {
+    bool on = ((millis() - toastFlash) / 125) % 2 == 0;
+    if (on) {
+      oled.fillRect(0, 0, SCRW, SCRH, SSD1306_WHITE);
+      oled.display();
+      return;
+    }
+  }
+  if (toastKind == "break" || toastKind == "remind") {
     long m = (long)(toastUntil - millis()) / 1000L;
-    ctr(toastText.length() ? toastText.c_str() : "Stand up, look away", 24, 1);
+    ctr(toastText.length() ? toastText.c_str()
+                           : "Stand up, look away", 24, 1);
     ctr("Knock twice to snooze", 40, 1);
     int bw = SCRW - 30;
     oled.drawRect(15, 52, bw, 5, SSD1306_WHITE);
@@ -3478,9 +3584,11 @@ static bool authed() {
   if (!t.length()) t = web.header("X-Rafiq-Token");
   return t.length() && t == cfgTok;
 }
-// Every call that carries the token is also a heartbeat.
+// Rafiq says who it is on every call, so the panel can tell the Mac apart
+// from a browser tab left open on the page. Without that marker a tab
+// polling once a second would look exactly like a laptop arriving.
 static void sawMac() {
-  if (!cfgLock) return;
+  if (web.header("X-Rafiq-App") != "1") return;
   macSeen = millis();
   if (!macLinked) {
     macLinked = true;
@@ -3630,6 +3738,7 @@ static void knockOne() {
   cTap++;
   // Anything the Mac put on the screen goes away on one knock. It is
   // the Mac's idea of what you want to see, and this is the desk.
+  if (dndUntil)    { dndUntil = 0;      return; }
   if (relaxOn)     { relaxOn = false;    return; }
   if (canvasUntil) { canvasUntil = 0;    return; }
   if (toastUntil)  { toastUntil = 0; toastText = ""; toastKind = ""; return; }
@@ -3738,7 +3847,7 @@ static void knockTwo() {
   cDouble++;
   // Told to stand up and not able to just yet. Ten minutes and it asks
   // again, which is the difference between a reminder and a nag.
-  if (toastUntil && toastKind == "break") {
+  if (toastUntil && (toastKind == "break" || toastKind == "remind")) {
     toastUntil = 0; toastKind = ""; toastText = "";
     flash("SNOOZED", 1200);
     return;
@@ -4487,6 +4596,10 @@ static void apiState() {
   o += "\"follow\":" + String(cfgFollow ? "true" : "false") + ",";
   o += "\"relax\":" + String(relaxOn ? "true" : "false") + ",";
   o += "\"webui\":" + String(webUiOn ? "true" : "false") + ",";
+  o += "\"dndLeft\":" + String(dndUntil && millis() < dndUntil
+          ? (long)((dndUntil - millis()) / 1000UL) : 0L) + ",";
+  o += "\"cam\":" + String(busyCam ? "true" : "false") + ",";
+  o += "\"mic\":" + String(busyMic ? "true" : "false") + ",";
   o += "\"focusLeft\":" + String(sessionRunning()
           ? (long)((taskEnd - millis()) / 1000UL) : 0L) + ",";
   o += "\"ssid\":\"" + cfgSsid + "\",\"tz\":\"" + cfgTz + "\"}";
@@ -4559,7 +4672,8 @@ static void setupWeb() {
     toastKind = web.arg("k");
     toastText = m.substring(0, 84);
     int secs = web.arg("s").toInt(); if (secs <= 0) secs = 4;
-    toastUntil = millis() + (unsigned long)constrain(secs, 1, 60) * 1000UL;
+    toastUntil = millis() + (unsigned long)constrain(secs, 1, 300) * 1000UL;
+    toastFlash = millis();
     wake("mac");
     okJson();
   });
@@ -4603,6 +4717,24 @@ static void setupWeb() {
     int secs = web.arg("s").toInt(); if (secs <= 0) secs = 8;
     canvasUntil = millis() + (unsigned long)constrain(secs, 1, 300) * 1000UL;
     wake("canvas");
+    okJson();
+  });
+  // On a break. The Mac locks itself; this holds the sign.
+  web.on("/api/dnd", HTTP_POST, []() {
+    if (!guard()) return;
+    int m = constrain((int)web.arg("m").toInt(), 0, 480);
+    dndUntil = m ? millis() + (unsigned long)m * 60000UL : 0;
+    dndLine = (int)random(DND_N);
+    if (m) wake("break");
+    okJson();
+  });
+  // One flag per device, read from the system by the Mac. Nothing is
+  // heard or seen here, and nothing is recorded anywhere.
+  web.on("/api/busy", HTTP_POST, []() {
+    if (!guard()) return;
+    bool c = web.arg("cam").toInt() != 0, m = web.arg("mic").toInt() != 0;
+    if ((c || m) && !(busyCam || busyMic)) { busyAt = millis(); wake("live"); }
+    busyCam = c; busyMic = m;
     okJson();
   });
   web.on("/api/webui", HTTP_POST, []() {
@@ -4809,8 +4941,8 @@ static void setupWeb() {
     delay(300); ESP.restart();
   });
   {
-    const char* keep[] = { "X-Rafiq-Token" };
-    web.collectHeaders(keep, 1);
+    const char* keep[] = { "X-Rafiq-Token", "X-Rafiq-App" };
+    web.collectHeaders(keep, 2);
   }
   web.onNotFound([]() { web.send(404, "text/plain", "not found"); });
   web.begin();
@@ -5282,6 +5414,19 @@ void loop() {
   // What the Mac asked for. The call to prayer is checked above this
   // and returns first, so nothing sent from a laptop can ever sit on
   // top of the adhan.
+  if (dndUntil) {
+    if (now >= dndUntil) { dndUntil = 0; }
+    else {
+      lastActive = now;
+      if (now - lastDraw >= 200) { lastDraw = now; drawDnd(); }
+      delay(2); return;
+    }
+  }
+  if (busyCam || busyMic) {
+    lastActive = now;
+    if (now - lastDraw >= 200) { lastDraw = now; drawBusy(); }
+    delay(2); return;
+  }
   if (now < linkCardUntil) {
     lastActive = now;
     if (now - lastDraw >= 60) { lastDraw = now; drawLinkCard(); }
