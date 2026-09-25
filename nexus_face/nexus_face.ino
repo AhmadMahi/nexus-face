@@ -48,7 +48,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.4.2"
+#define FW_VERSION "2.5.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -201,8 +201,19 @@ unsigned long popupUntil = 0;
 
 float wTemp = NAN, wHum = NAN, wWind = NAN;
 int   wCode = -1;
-String wCity = "";
+// A plain array rather than a String, because the network task writes
+// this and the screen reads it. A String can move in memory as it is
+// reassigned, and the reader would follow the old pointer. It was never
+// longer than thirteen characters anyway.
+char wCity[16] = "";
 bool  wxOk = false;
+
+// ---------------- the network task ----------------
+// What the loop asks for and the task gets on with. Plain flags: only
+// the loop ever sets them and only the task ever clears them, so there
+// is nothing here for two tasks to disagree about.
+TaskHandle_t netTask = nullptr;
+volatile bool wantTime = false, wantWx = false, wantPrayerNow = false;
 unsigned long nextWx = 0;
 float locLat = NAN, locLon = NAN;
 
@@ -394,7 +405,10 @@ String upTag = "", upUrl = "", upMsg = "";
 #define UP_MAX 8
 String relTag[UP_MAX], relUrl[UP_MAX];
 int    relCount = 0, relSel = 0;
-String   clockSrc = "not set";
+// A pointer to a literal rather than a String: the network task sets
+// this and the page reads it, and swapping a pointer is one instruction
+// that cannot be caught half done. The literals never move.
+const char* clockSrc = "not set";
 String   wokeBy = "boot";
 float    lastDirD = 0;
 uint32_t nSlept = 0;
@@ -921,7 +935,7 @@ static void drawWeather() {
   bar("WEATHER");
   if (!wxOk) {
     ctr(online() ? "Fetching" : "No network", 28, 1);
-    ctr(wCity.length() ? wCity.c_str() : "Offline for now", 44, 1);
+    ctr(wCity[0] ? wCity : "Offline for now", 44, 1);
     oled.display();
     return;
   }
@@ -939,7 +953,7 @@ static void drawWeather() {
   at(30 + tw + 10, 30, l);
 
   ctr(wxWord(wCode), 44, 1);
-  snprintf(l, sizeof(l), "%s  %.0f km/h", wCity.c_str(), wWind);
+  snprintf(l, sizeof(l), "%s  %.0f km/h", wCity, wWind);
   ctr(l, 54, 1);
   oled.display();
 }
@@ -2855,8 +2869,15 @@ static bool trySyncTime(int sntpWaitMs) {
   struct tm t;
   unsigned long t0 = millis();
   while (millis() - t0 < (unsigned long)sntpWaitMs) {
-    if (getLocalTime(&t, 120) && t.tm_year > 120) { timeOk = true; clockSrc = "ntp"; Serial.println("clock set from ntp"); return true; }
-    web.handleClient();
+    if (getLocalTime(&t, 120) && t.tm_year > 120) {
+      timeOk = true; clockSrc = "ntp";
+      Serial.println("clock set from ntp");
+      return true;
+    }
+    // No web.handleClient() here. This runs on the network task now, and
+    // the web server belongs to the loop: two tasks inside the same
+    // request state machine would be a far worse bug than the pause this
+    // was added to paper over. The loop keeps the page alive by itself.
     delay(30);
   }
   if (timeFromHttp() && getLocalTime(&t, 200) && t.tm_year > 120) { timeOk = true; return true; }
@@ -2879,11 +2900,16 @@ static bool locate() {
   int i = b.indexOf("\"lat\":"); if (i >= 0) locLat = b.substring(i + 6).toFloat();
   i = b.indexOf("\"lon\":");     if (i >= 0) locLon = b.substring(i + 6).toFloat();
   i = b.indexOf("\"city\":\"");
-  if (i >= 0) { int e = b.indexOf('"', i + 8); wCity = b.substring(i + 8, e); }
-  if (wCity.length() > 13) wCity = wCity.substring(0, 13);
+  if (i >= 0) {
+    int e = b.indexOf('"', i + 8);
+    String c = b.substring(i + 8, e);
+    if (c.length() > 13) c = c.substring(0, 13);
+    strncpy(wCity, c.c_str(), sizeof(wCity) - 1);
+    wCity[sizeof(wCity) - 1] = 0;
+  }
   if (!isnan(locLat) && locLat != 0) {
     prefs.putFloat("lat", locLat); prefs.putFloat("lon", locLon);
-    prefs.putString("city", wCity);
+    prefs.putString("city", String(wCity));
     return true;
   }
   return false;
@@ -4385,12 +4411,12 @@ static void apiState() {
   String o = "{";
   o += "\"time\":\"" + String(t) + "\",\"screen\":\"" + String(S_NAME[screen]) + "\",";
   o += "\"timeOk\":" + String(timeOk ? "true" : "false") + ",";
-  o += "\"clockSrc\":\"" + clockSrc + "\",";
+  o += "\"clockSrc\":\"" + String(clockSrc) + "\",";
   o += "\"asleep\":" + String(asleep ? "true" : "false") + ",\"fw\":\"" FW_VERSION "\",";
   o += "\"k1\":" + String(cTap) + ",\"k2\":" + String(cDouble) + ",\"k3\":" + String(cTriple) +
        ",\"k4\":" + String(cQuad) + ",\"fall\":" + String(cFall) + ",\"boots\":" + String(cBoot) + ",";
   o += "\"autoTurn\":" + String(cfgAutoTurn ? "true" : "false") + ",";
-  o += "\"city\":\"" + wCity + "\",";
+  o += "\"city\":\"" + String(wCity) + "\",";
   o += "\"temp\":\"" + String(wxOk ? String(wTemp, 1) + " C" : String("--")) + "\",";
   o += "\"hum\":\"" + String(wxOk ? String(wHum, 0) + " %" : String("--")) + "\",";
   o += "\"wind\":\"" + String(wxOk ? String(wWind, 1) + " km/h" : String("--")) + "\",";
@@ -4985,6 +5011,38 @@ static void offlineWelcome() {
 // ================================================================
 //  SETUP
 // ================================================================
+// ================================================================
+//  THE NETWORK TASK
+// ================================================================
+//  Fetching blocks for seconds at a time, and it used to do that on the
+//  very loop that reads your knocks and draws the screen. Worse, it was
+//  held back until you had been still for a couple of seconds, so the
+//  usual way to meet it was to come back to the clock, stop touching the
+//  thing, and find it dead to the touch. The timeouts are set twice over,
+//  once to connect and once to read, so a single weather fetch could hold
+//  the whole device for the better part of half a minute.
+//
+//  This chip has one core, but FreeRTOS still preempts, so the fetching
+//  happens here instead, underneath the loop. The loop is raised above it
+//  and yields on every pass, which is what keeps knocks and redraws
+//  answering while something is downloading.
+//
+//  Nothing is shared but a few numbers and three flags. The loop only
+//  ever sets a flag and the task only ever clears it, so there is nothing
+//  for the two of them to disagree about.
+static void netLoop(void*) {
+  for (;;) {
+    if (!online()) {
+      wantTime = wantWx = wantPrayerNow = false;
+    } else {
+      if (wantTime)      { wantTime = false;      trySyncTime(1500); }
+      if (wantWx)        { wantWx = false;        fetchWeather(); }
+      if (wantPrayerNow) { wantPrayerNow = false; fetchPrayer(); }
+    }
+    vTaskDelay(pdMS_TO_TICKS(40));
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -5015,7 +5073,11 @@ void setup() {
   message     = prefs.getString("msg", "");
   locLat      = prefs.getFloat("lat", NAN);
   locLon      = prefs.getFloat("lon", NAN);
-  wCity       = prefs.getString("city", "");
+  {
+    String c = prefs.getString("city", "");
+    strncpy(wCity, c.c_str(), sizeof(wCity) - 1);
+    wCity[sizeof(wCity) - 1] = 0;
+  }
   loadTasks();
   loadPrayer();
   loadAdj();
@@ -5109,6 +5171,15 @@ void setup() {
   // on. The card stayed up and the device looked wedged. Stagger them.
   if (cfgFollow && online()) cursorUdp.begin(CURSOR_PORT);
 
+  // The screen has to outrank the network or a download would still take
+  // it. Raising this task rather than lowering the other one leaves the
+  // network comfortably above idle, so it still gets on with things.
+  vTaskPrioritySet(NULL, 2);
+  if (xTaskCreate(netLoop, "rafiq-net", 12288, nullptr, 1, &netTask) != pdPASS) {
+    Serial.println("no network task; fetching will block the screen");
+    netTask = nullptr;
+  }
+
   nextWx        = millis() + 3000;
   nextPrayerTry = millis() + 8000;
   nextStory     = millis() + 25000;
@@ -5144,17 +5215,16 @@ void loop() {
   if (!webUiOn && (now - (macSeen > webOffAt ? macSeen : webOffAt)) > WEBUI_RETURN_MS)
     webUiOn = true;
 
-  // Fetching blocks for seconds at a time, so it waits for a lull rather
-  // than freezing the screen under someone's hand.
-  bool idle = (now - lastActive) > 2500;
-
+  // These used to wait for a lull, because each one froze the screen
+  // while it ran. They are handed to the network task now, so they can
+  // simply go when they are due and the screen carries on regardless.
   if (online()) {
     // keep trying for a clock until one lands, then leave it alone
-    if (!timeOk && idle && (long)(now - nextTimeTry) >= 0) {
+    if (!timeOk && (long)(now - nextTimeTry) >= 0) {
       nextTimeTry = now + 20000;
-      trySyncTime(1500);
+      wantTime = true;
     }
-    if (!asleep && idle && (long)(now - nextWx) >= 0) { nextWx = now + 900000UL; fetchWeather(); }
+    if ((long)(now - nextWx) >= 0) { nextWx = now + 900000UL; wantWx = true; }
 
     struct tm t;
     bool haveDay = timeOk && getLocalTime(&t, 0);
@@ -5162,18 +5232,23 @@ void loop() {
     // them whenever the network was down. Keep what is in flash; refresh
     // when asked, or once every fiftieth boot.
     bool dueByBoot = (cBoot >= prayerBoot + PRAYER_REFRESH_BOOTS);
-    if (idle && (long)(now - nextPrayerTry) >= 0 && haveDay &&
+    if ((long)(now - nextPrayerTry) >= 0 && haveDay &&
         (!prayerOk || prayerWanted || dueByBoot)) {
       nextPrayerTry = now + 300000UL;
-      fetchPrayer();
+      wantPrayerNow = true;
     }
     // a fresh read every six hours, and the queue left over from a reload
-    if (idle && (long)(now - nextStory) >= 0 && cfgKey.length() && !storyBusy && readCount < READS_MAX) {
+    // The longest fetch of the lot, and the only one that writes into
+    // the shelf the reader draws from. It stays on this loop, where
+    // nothing can be halfway through reading that, and only runs while
+    // asleep so it cannot freeze a screen you are looking at.
+    if (asleep && (long)(now - nextStory) >= 0 && cfgKey.length() &&
+        !storyBusy && readCount < READS_MAX) {
       nextStory = now + 21600000UL;
-      fetchStory(!asleep && screen == S_READS);
+      fetchStory(false);
     }
     if (refillWant > 0 && !storyBusy && cfgKey.length() &&
-        (long)(now - nextRefill) >= 0 && (asleep || screen != S_READS)) {
+        (long)(now - nextRefill) >= 0 && asleep) {
       refillWant--;
       nextRefill = now + 5000;
       fetchStory(false);                       // quietly, while you are elsewhere
