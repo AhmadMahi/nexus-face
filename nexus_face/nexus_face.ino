@@ -27,6 +27,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -47,7 +48,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.1.0"
+#define FW_VERSION "2.2.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -114,11 +115,11 @@ unsigned long zikrNext = 0;      // when the next count lands
 
 // ---------------- settings ----------------
 enum { C_BRIGHT = 0, C_FACE, C_CONTROL, C_SLEEP, C_TURN, C_POPUP, C_EYES,
-       C_PRAYER, C_HOTSPOT, C_ACCEL, C_UPDATE, C_REBOOT, C_ABOUT, C_COUNT };
+       C_PRAYER, C_HOTSPOT, C_ACCEL, C_PAIR, C_UPDATE, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Control", "Sleep after", "Page turn", "Popup time",
-    "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Check update",
-    "Reboot", "About" };
+    "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Pair a Mac",
+    "Check update", "Reboot", "About" };
 
 // Zero is the dimmest the panel goes, not off: the SSD1306 still shows
 // faintly at contrast zero. After that, quarters.
@@ -279,6 +280,80 @@ static bool isBreak(const String& n) {
   return l.indexOf("break") >= 0 || l.indexOf("rest") >= 0 || l.indexOf("walk") >= 0;
 }
 static bool sessionRunning() { return taskIdx >= 0 && taskIdx < taskCount; }
+
+// ================================================================
+//  THE MAC
+// ================================================================
+//  Rafiq on the Mac speaks the same API the page does. The device knows
+//  whether it is being spoken to and says so, but nothing here depends
+//  on it: close the laptop and the clock, the prayer times, the reads
+//  and every knock carry on exactly as they did before.
+
+String   cfgTok;                       // what a paired Mac has to present
+bool     cfgLock = false;              // whether anything is checked at all
+int      pairCode = -1;                // six digits, on the panel, for three minutes
+unsigned long pairUntil = 0;
+#define PAIR_WINDOW_MS 180000UL
+
+unsigned long macSeen = 0;             // the last call that carried the token
+bool     macLinked = false;
+unsigned long linkCardUntil = 0;
+bool     linkCardJoin = false;
+#define MAC_GONE_MS 25000UL            // two missed heartbeats, then it is gone
+
+// ---------------- focus ----------------
+//  A countdown held on an OLED for half an hour is how a panel gets
+//  burned into, so focus spends most of its time dark and surfaces
+//  every so often to show where it has got to.
+enum { FZ_SHOW = 0, FZ_DARK, FZ_QUOTE };
+int  fzPhase = FZ_SHOW;
+int  fzCycle = 0;
+unsigned long fzNext = 0;
+const char* fzLine = "";
+#define FZ_SHOW_MS  12000UL
+#define FZ_DARK_MS  10000UL
+#define FZ_QUOTE_MS  5000UL
+const char* FZ_LINES[] = {
+  "Good work", "Keep going", "Still here", "Nearly there",
+  "One thing at a time", "Steady", "This is the hard part", "Stay with it" };
+const int FZ_N = sizeof(FZ_LINES) / sizeof(FZ_LINES[0]);
+
+// ---------------- relax ----------------
+//  Nothing to read and nothing to do: something slow to rest your eyes
+//  on. Knock once to leave.
+bool relaxOn = false;
+int  relaxKind = 0;
+unsigned long relaxNext = 0;
+
+// ---------------- the pointer ----------------
+//  Sent over UDP rather than HTTP. Ten a second through a fresh
+//  handshake each time would drown it, and a lost one costs nothing
+//  because another is a tenth of a second behind.
+WiFiUDP cursorUdp;
+#define CURSOR_PORT 4210
+float curX = 0, curY = 0;              // -1 to 1, where the pointer sits
+unsigned long curUntil = 0;            // tracking lapses if the Mac goes quiet
+bool cfgFollow = false;
+#define CURSOR_HOLD_MS 2500UL
+
+// ---------------- what the Mac wants shown for a moment ----------------
+//  A copy, a paste, a nudge to stand up. None of it disturbs the stored
+//  message, which is yours and stays where it is.
+String toastText = "", toastKind = "";
+unsigned long toastUntil = 0;
+
+// ---------------- a page of pixels ----------------
+//  One screenful straight from the Mac. Whatever the Mac can draw, the
+//  robot can show, with no new firmware for it.
+uint8_t* canvasBuf = nullptr;
+unsigned long canvasUntil = 0;
+
+// The page is the way back in when anything else fails, so it is never
+// gone for good: switched off from the Mac, it returns by itself after
+// a quarter of an hour with nobody home.
+bool webUiOn = true;
+unsigned long webOffAt = 0;
+#define WEBUI_RETURN_MS 900000UL
 
 // ---------------- runtime ----------------
 bool asleep = false, screenOn = true, timeOk = false, rescueAP = false, fsOk = false;
@@ -1190,6 +1265,21 @@ static void drawFocus() {
     return;
   }
 
+  // Between showings it says something instead of counting. Same
+  // screen, different thing to look at, and the panel is spared a
+  // countdown burned into one place.
+  if (fzPhase == FZ_QUOTE) {
+    long left = (long)(taskEnd - millis()) / 1000L;
+    if (left < 0) left = 0;
+    char m[20];
+    snprintf(m, sizeof(m), "%ld min left", (left + 59) / 60);
+    bar("FOCUS");
+    ctr(fzLine, 26, 1);
+    ctr(m, 44, 1);
+    oled.display();
+    return;
+  }
+
   const Task& t = tasks[taskIdx];
   bool brk = isBreak(t.name);
   char r[12];
@@ -1256,6 +1346,165 @@ static void drawAbout() {
   oled.display();
 }
 
+// ================================================================
+//  THE MAC
+// ================================================================
+//  A robot head, because that is what is on the menu bar at the other
+//  end. The eyes are what carry the state: two of them when the link
+//  is up, closed when it goes.
+static void robotHead(int cx, int cy, bool linked) {
+  oled.drawRoundRect(cx - 19, cy - 15, 38, 30, 6, SSD1306_WHITE);
+  oled.drawFastVLine(cx, cy - 21, 6, SSD1306_WHITE);
+  oled.fillCircle(cx, cy - 23, 2, SSD1306_WHITE);
+  oled.drawFastHLine(cx - 23, cy - 2, 4, SSD1306_WHITE);   // ears
+  oled.drawFastHLine(cx + 19, cy - 2, 4, SSD1306_WHITE);
+  if (linked) {
+    oled.fillCircle(cx - 8, cy - 3, 4, SSD1306_WHITE);
+    oled.fillCircle(cx + 8, cy - 3, 4, SSD1306_WHITE);
+  } else {                                     // asleep, not broken
+    oled.drawFastHLine(cx - 12, cy - 3, 8, SSD1306_WHITE);
+    oled.drawFastHLine(cx + 4, cy - 3, 8, SSD1306_WHITE);
+  }
+  oled.drawFastHLine(cx - 6, cy + 7, 12, SSD1306_WHITE);
+}
+
+//  Said once when the Mac arrives and once when it goes. Both are
+//  short, because neither is news you have to act on.
+static void drawLinkCard() {
+  oled.clearDisplay();
+  long since = (long)(linkCardUntil - millis());
+  robotHead(SCRW / 2, 26, linkCardJoin);
+  if (linkCardJoin) {
+    int step = (int)((1600 - since) / 200);   // arcs go out as it settles
+    for (int i = 0; i < 3; i++)
+      if (step > i) {
+        oled.drawCircle(SCRW / 2, 26, 26 + i * 5, SSD1306_WHITE);
+        oled.fillRect(0, 0, SCRW, 10, SSD1306_BLACK);
+        oled.fillRect(0, 48, SCRW, 16, SSD1306_BLACK);
+      }
+    ctr("Connected to Mac", 54, 1);
+  } else ctr("Mac disconnected", 54, 1);
+  oled.display();
+}
+
+//  Six digits, big enough to read across a desk. They live for three
+//  minutes and are never the same twice.
+static void drawPair() {
+  oled.clearDisplay();
+  bar("PAIR");
+  if (pairCode < 0 || millis() > pairUntil) {
+    ctr("Two knocks for a code", 26, 1);
+    ctr(cfgLock ? "A Mac is paired" : "Open to any Mac", 44, 1);
+    oled.display();
+    return;
+  }
+  char c[8];
+  snprintf(c, sizeof(c), "%06d", pairCode);
+  ctr(c, 22, 2);
+  long left = ((long)(pairUntil - millis())) / 1000L;
+  char t[24];
+  snprintf(t, sizeof(t), "Type it in, %lds", left < 0 ? 0L : left);
+  ctr(t, 48, 1);
+  oled.display();
+}
+
+//  What the Mac copied, what it pasted, or a word about standing up.
+//  Held for a few seconds and then gone, leaving the message alone.
+static void drawToast() {
+  oled.clearDisplay();
+  const char* head = "FROM YOUR MAC";
+  if (toastKind == "copy")  head = "COPIED";
+  if (toastKind == "paste") head = "PASTED";
+  if (toastKind == "break") head = "TAKE A BREAK";
+  bar(head);
+  if (toastKind == "break") {
+    long m = (long)(toastUntil - millis()) / 1000L;
+    ctr(toastText.length() ? toastText.c_str() : "Stand up, look away", 24, 1);
+    ctr("Knock twice to snooze", 40, 1);
+    int bw = SCRW - 30;
+    oled.drawRect(15, 52, bw, 5, SSD1306_WHITE);
+    if (m > 0) oled.fillRect(16, 53, (bw - 2) * constrain((int)m, 0, 20) / 20, 3, SSD1306_WHITE);
+  } else {
+    // two lines of it, and no more: this is a glance, not a read
+    String t = toastText;
+    if (t.length() <= 21) ctr(t.c_str(), 28, 1);
+    else {
+      int cut = 21;
+      for (int i = 21; i > 8; i--) if (t[i] == ' ') { cut = i; break; }
+      String a = t.substring(0, cut); a.trim();
+      String b = t.substring(cut);    b.trim();
+      if (b.length() > 21) { b = b.substring(0, 20); b += "…"; }
+      ctr(a.c_str(), 22, 1);
+      ctr(b.c_str(), 34, 1);
+    }
+  }
+  oled.display();
+}
+
+//  Where the pointer is on the Mac, drawn as somewhere to look. The
+//  eyes are hand drawn here rather than left to the library, because
+//  the library moves them on its own schedule and this has to follow
+//  the hand exactly.
+static void drawFollow() {
+  oled.clearDisplay();
+  bool live = millis() < curUntil;
+  float fx = live ? curX : 0, fy = live ? curY : 0;
+  for (int e = 0; e < 2; e++) {
+    int cx = e ? 86 : 42, cy = 32;
+    oled.fillRoundRect(cx - 21, cy - 21, 42, 42, 10, SSD1306_WHITE);
+    int px = cx + (int)(fx * 11.0f);
+    int py = cy + (int)(fy * 11.0f);
+    oled.fillCircle(px, py, 8, SSD1306_BLACK);
+    oled.fillCircle(px + 3, py - 3, 2, SSD1306_WHITE);
+  }
+  if (!live) ctr("waiting for the Mac", 56, 1);
+  oled.display();
+}
+
+//  Something slow to rest on. Three of them, and it moves to the next
+//  one every half minute so no single pattern sits on the panel.
+static void drawRelax() {
+  unsigned long t = millis();
+  oled.clearDisplay();
+  if (relaxKind == 0) {
+    // a circle that breathes: four seconds out, four back, which is
+    // roughly the pace you would want to be breathing at
+    float ph = (t % 8000UL) / 8000.0f;
+    float k = ph < 0.5f ? ph * 2.0f : (1.0f - ph) * 2.0f;
+    int r = 6 + (int)(k * 20.0f);
+    oled.drawCircle(SCRW / 2, 32, r, SSD1306_WHITE);
+    oled.drawCircle(SCRW / 2, 32, r / 2, SSD1306_WHITE);
+    oled.fillCircle(SCRW / 2, 32, 2, SSD1306_WHITE);
+    ctr(ph < 0.5f ? "in" : "out", 56, 1);
+  } else if (relaxKind == 1) {
+    // specks drifting past, each at its own pace
+    for (int i = 0; i < 28; i++) {
+      int sp = 1 + (i % 4);
+      int x = (int)((i * 37 + t / (60 / sp)) % SCRW);
+      int y = (i * 23) % SCRH;
+      if (sp > 2) oled.fillCircle(x, y, 1, SSD1306_WHITE);
+      else        oled.drawPixel(x, y, SSD1306_WHITE);
+    }
+  } else {
+    // two slow waves crossing, which never quite repeat
+    for (int x = 0; x < SCRW; x++) {
+      float a = sinf(x * 0.09f + t * 0.0011f) * 13.0f;
+      float b = sinf(x * 0.05f - t * 0.0007f) * 9.0f;
+      oled.drawPixel(x, 32 + (int)a, SSD1306_WHITE);
+      oled.drawPixel(x, 32 + (int)b, SSD1306_WHITE);
+    }
+  }
+  oled.display();
+}
+
+//  A screenful the Mac drew. One knock clears it early.
+static void drawCanvas() {
+  if (!canvasBuf) return;
+  oled.clearDisplay();
+  memcpy(oled.getBuffer(), canvasBuf, SCRW * SCRH / 8);
+  oled.display();
+}
+
 static void drawSettings() {
   oled.clearDisplay();
   if (depth == 0) {
@@ -1267,6 +1516,7 @@ static void drawSettings() {
   }
   if (depth == 2 && itemIdx == C_ABOUT) { drawAbout(); return; }
   if (depth == 2 && itemIdx == C_ACCEL) { drawAccel(); return; }
+  if (depth == 2 && itemIdx == C_PAIR)  { drawPair();  return; }
   bar(depth == 2 ? "CHANGE" : "SETTINGS");
 
   char v[18];
@@ -1286,6 +1536,7 @@ static void drawSettings() {
       case C_FACE:   snprintf(v, sizeof(v), "%s", FACE_NAME[cfgFace]); break;
       case C_PRAYER: snprintf(v, sizeof(v), "%s", prayerOk ? "saved" : "none"); break;
       case C_ACCEL:  snprintf(v, sizeof(v), "x2"); break;
+      case C_PAIR:   snprintf(v, sizeof(v), "%s", cfgLock ? "paired" : "x2"); break;
       case C_CONTROL:snprintf(v, sizeof(v), "%s", cfgTilt ? "tilt" : "taps"); break;
       case C_ABOUT:  snprintf(v, sizeof(v), "x2"); break;
       case C_SLEEP:  if (!sleepSecs())         snprintf(v, sizeof(v), "never");
@@ -3210,6 +3461,122 @@ static void servicePrayerAlert() {
   }
 }
 // ================================================================
+//  WHO IS ALLOWED TO ASK
+// ================================================================
+//  Until a Mac is paired the API is open, exactly as it has always
+//  been. Pair one and everything has to carry its token, which closes
+//  a door that was standing open: anyone on the same network could
+//  post to this device before.
+//
+//  The code is shown on the panel and nowhere else. Someone on your
+//  network can ask for one, but they cannot read it without standing
+//  in front of the thing, and that is the whole point of it.
+
+static bool authed() {
+  if (!cfgLock || !cfgTok.length()) return true;
+  String t = web.arg("t");
+  if (!t.length()) t = web.header("X-Rafiq-Token");
+  return t.length() && t == cfgTok;
+}
+// Every call that carries the token is also a heartbeat.
+static void sawMac() {
+  if (!cfgLock) return;
+  macSeen = millis();
+  if (!macLinked) {
+    macLinked = true;
+    linkCardJoin = true;
+    linkCardUntil = millis() + 1600;
+    wake("mac");
+  }
+}
+static bool guard() {
+  if (!authed()) { web.send(401, "application/json", "{\"ok\":false,\"err\":\"pair first\"}"); return false; }
+  sawMac();
+  return true;
+}
+static void okJson() { web.send(200, "application/json", "{\"ok\":true}"); }
+
+static void newPairCode() {
+  // A client that keeps asking must not keep changing the digits under
+  // your fingers. While one is still good, that is the one you get.
+  if (pairCode >= 0 && millis() < pairUntil) {
+    screen = S_SETTINGS; depth = 2; itemIdx = C_PAIR;
+    wake("pairing");
+    return;
+  }
+  pairCode = (int)random(0, 1000000);
+  pairUntil = millis() + PAIR_WINDOW_MS;
+  screen = S_SETTINGS; depth = 2; itemIdx = C_PAIR;
+  wake("pairing");
+}
+// Thirty-two hex characters out of the hardware generator, which is a
+// real one on this chip and not the Arduino pseudo random.
+static String newToken() {
+  String t;
+  for (int i = 0; i < 4; i++) { char b[9]; snprintf(b, sizeof(b), "%08x", (unsigned)esp_random()); t += b; }
+  return t;
+}
+
+// ---------------------------------------------------------------
+//  base64, for the screenful of pixels. Small enough to spell out
+//  and it saves pulling mbedtls in for one call.
+static int b64val(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+static int b64decode(const String& in, uint8_t* out, int cap) {
+  int bits = 0, acc = 0, n = 0;
+  for (int i = 0; i < (int)in.length(); i++) {
+    int v = b64val(in[i]);
+    if (v < 0) continue;                       // whitespace, padding, anything else
+    acc = (acc << 6) | v; bits += 6;
+    if (bits >= 8) { bits -= 8; if (n < cap) out[n++] = (uint8_t)((acc >> bits) & 0xFF); }
+  }
+  return n;
+}
+
+// ---------------------------------------------------------------
+//  Focus, driven from the Mac. One task, one length, and the panel
+//  spends most of it dark.
+static void focusBegin(int mins) {
+  if (mins <= 0) { stopSession(); fzPhase = FZ_SHOW; return; }
+  taskCount = 1;
+  tasks[0].name = "Focus";
+  tasks[0].mins = mins;
+  workedMin = 0; breakDue = false;
+  screen = S_FOCUS; depth = 0;
+  startTask(0);
+  fzPhase = FZ_SHOW; fzCycle = 0;
+  fzNext = millis() + FZ_SHOW_MS;
+  wake("focus");
+}
+
+// The pointer arrives over UDP, ten or so a second, as two numbers in
+// thousandths. Nothing is acknowledged and nothing is retried.
+static void serviceCursor() {
+  if (!cfgFollow) return;
+  int n = cursorUdp.parsePacket();
+  while (n > 0) {
+    char b[32];
+    int got = cursorUdp.read(b, sizeof(b) - 1);
+    if (got > 0) {
+      b[got] = 0;
+      int x = 0, y = 0;
+      if (sscanf(b, "%d %d", &x, &y) == 2) {
+        curX = constrain(x / 1000.0f, -1.0f, 1.0f);
+        curY = constrain(y / 1000.0f, -1.0f, 1.0f);
+        curUntil = millis() + CURSOR_HOLD_MS;
+      }
+    }
+    n = cursorUdp.parsePacket();
+  }
+}
+
+// ================================================================
 //  KNOCKS
 //    One rule, everywhere on the device:
 //
@@ -3261,6 +3628,11 @@ static void startHotspot() {
 
 static void knockOne() {
   cTap++;
+  // Anything the Mac put on the screen goes away on one knock. It is
+  // the Mac's idea of what you want to see, and this is the desk.
+  if (relaxOn)     { relaxOn = false;    return; }
+  if (canvasUntil) { canvasUntil = 0;    return; }
+  if (toastUntil)  { toastUntil = 0; toastText = ""; toastKind = ""; return; }
   if (depth == 0) {
     screen = (screen + 1) % S_COUNT;
     itemIdx = 0; subIdx = 0;
@@ -3364,6 +3736,13 @@ static void knockPrev() {
 
 static void knockTwo() {
   cDouble++;
+  // Told to stand up and not able to just yet. Ten minutes and it asks
+  // again, which is the difference between a reminder and a nag.
+  if (toastUntil && toastKind == "break") {
+    toastUntil = 0; toastKind = ""; toastText = "";
+    flash("SNOOZED", 1200);
+    return;
+  }
   if (depth == 0) {
     switch (screen) {
       case S_FAITH:    depth = 1; itemIdx = 0; subIdx = 0; break;
@@ -3417,6 +3796,7 @@ static void knockTwo() {
       case C_HOTSPOT: startHotspot(); break;
       case C_PRAYER:  prayerWanted = true; nextPrayerTry = 0; break;
       case C_ACCEL:   depth = 2; break;
+      case C_PAIR:    depth = 2; newPairCode(); break;
       default:        depth = 2; break;
     }
   }
@@ -3883,7 +4263,26 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
 const $=i=>document.getElementById(i);
 window.esc=function(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 window.rows=function(el,o){$(el).innerHTML=Object.entries(o).map(([k,v])=>'<tr><td>'+k+'</td><td>'+esc(v)+'</td></tr>').join('')}
-window.post=async function(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(d||{})})}
+window.tok=function(){return localStorage.getItem('rtok')||''}
+window.hdr=function(){const h={'Content-Type':'application/x-www-form-urlencoded'};const t=tok();if(t)h['X-Rafiq-Token']=t;return h}
+window.post=async function(u,d){const r=await fetch(u,{method:'POST',headers:hdr(),body:new URLSearchParams(d||{})});if(r.status==401||r.status==403)askPair();return r}
+window.locked=false;
+window.askPair=async function(){
+  if(locked)return;                       // one prompt, one code
+  locked=true;
+  await fetch('/api/paircode',{method:'POST'});
+  const c=prompt('This one is paired to a Mac. Six digits are on its screen now:');
+  if(c){
+    const r=await fetch('/api/pair',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({c:c.trim()})});
+    if(r.ok){const j=await r.json();
+      if(j.token){localStorage.setItem('rtok',j.token);locked=false;load();return}}
+  }
+  // Left locked on purpose: polling on would mint a fresh code every
+  // second and the digits on the panel would never sit still.
+  const t=$('t');
+  if(t){t.textContent='Locked to a Mac. Click here to pair.';t.style.cursor='pointer';
+        t.onclick=function(){locked=false;askPair()}}
+}
 window.act=async function(u){$('t').textContent='working';await post(u,{});$('t').textContent='done';load()}
 window.go=async function(n){await post('/api/screen',{n:n});$('t').textContent='opened'}
 window.tab=function(w){
@@ -3946,7 +4345,10 @@ window.pushTime=async function(){const d=new Date();
   await post('/api/time',{e:Math.floor(d.getTime()/1000),o:-d.getTimezoneOffset()})}
 let filled=false, adjFilled=false;
 window.load=async function(){
-  const s=await(await fetch('/api/state',{cache:'no-store'})).json();
+  if(locked)return;
+  const rr=await fetch('/api/state',{cache:'no-store',headers:hdr()});
+  if(rr.status==401||rr.status==403){askPair();return}
+  const s=await rr.json();
   if(!s.timeOk) await pushTime();
   $('clk').textContent=s.time;
   $('sub').textContent=(s.asleep?'asleep':'awake')+' · '+s.screen+' · fw '+s.fw;
@@ -4080,14 +4482,137 @@ static void apiState() {
                                      : String("off")) + "\",";
   o += "\"chip\":\"" + String(ESP.getChipModel()) + " @" + String(ESP.getCpuFreqMHz()) + "MHz\",";
   o += "\"ip\":\"" + String(online() ? WiFi.localIP().toString() : String("not on a network")) + "\",";
+  o += "\"paired\":" + String(cfgLock ? "true" : "false") + ",";
+  o += "\"linked\":" + String(macLinked ? "true" : "false") + ",";
+  o += "\"follow\":" + String(cfgFollow ? "true" : "false") + ",";
+  o += "\"relax\":" + String(relaxOn ? "true" : "false") + ",";
+  o += "\"webui\":" + String(webUiOn ? "true" : "false") + ",";
+  o += "\"focusLeft\":" + String(sessionRunning()
+          ? (long)((taskEnd - millis()) / 1000UL) : 0L) + ",";
   o += "\"ssid\":\"" + cfgSsid + "\",\"tz\":\"" + cfgTz + "\"}";
   web.send(200, "application/json", o);
 }
 
 static void setupWeb() {
-  web.on("/", HTTP_GET, []() { web.send_P(200, "text/html; charset=utf-8", PAGE); });
-  web.on("/api/state", HTTP_GET, apiState);
+  web.on("/", HTTP_GET, []() {
+    if (!webUiOn) {
+      web.send(200, "text/html; charset=utf-8",
+               "<meta name=viewport content='width=device-width'>"
+               "<body style='background:#111;color:#eee;font:16px system-ui;padding:2em'>"
+               "<h2>Driven from your Mac</h2><p>This page comes back on its own "
+               "a quarter of an hour after the Mac stops talking, so there is "
+               "always a way in.</p></body>");
+      return;
+    }
+    web.send_P(200, "text/html; charset=utf-8", PAGE);
+  });
+  web.on("/api/state", HTTP_GET, []() { if (!authed()) { web.send(401, "application/json", "{\"ok\":false}"); return; } sawMac(); apiState(); });
+
+  // ---- pairing ----
+  // Asking for a code is the one thing that needs no token, because
+  // otherwise a device whose token you have lost could never be paired
+  // again. Seeing the code still means standing in front of it.
+  web.on("/api/paircode", HTTP_POST, []() { newPairCode(); okJson(); });
+  web.on("/api/pair", HTTP_POST, []() {
+    if (pairCode < 0 || millis() > pairUntil) {
+      web.send(403, "application/json", "{\"ok\":false,\"err\":\"no code showing\"}");
+      return;
+    }
+    if (web.arg("c").toInt() != pairCode) {
+      pairCode = -1;                                   // one wrong guess spends it
+      web.send(403, "application/json", "{\"ok\":false,\"err\":\"wrong code\"}");
+      return;
+    }
+    // One device, one secret. A second client that can read the code off
+    // the panel is standing in front of the thing, which is the whole
+    // proof we ever wanted, so it gets the same token rather than a new
+    // one that would lock the first client out. Forgetting clears it, and
+    // the next pairing then mints a fresh one, which is how a token that
+    // has got out is revoked.
+    if (!cfgTok.length()) cfgTok = newToken();
+    cfgLock = true;
+    prefs.putString("tok", cfgTok);
+    prefs.putBool("lock", true);
+    pairCode = -1;
+    screen = S_HOME; depth = 0;
+    macSeen = millis(); macLinked = true;
+    linkCardJoin = true; linkCardUntil = millis() + 1600;
+    web.send(200, "application/json", "{\"ok\":true,\"token\":\"" + cfgTok + "\"}");
+  });
+  web.on("/api/unpair", HTTP_POST, []() {
+    if (!guard()) return;
+    cfgTok = ""; cfgLock = false;
+    prefs.remove("tok"); prefs.putBool("lock", false);
+    macLinked = false; webUiOn = true;
+    okJson();
+  });
+
+  // ---- what the Mac drives ----
+  web.on("/api/focus", HTTP_POST, []() {
+    if (!guard()) return;
+    focusBegin(constrain((int)web.arg("m").toInt(), 0, 240));
+    okJson();
+  });
+  web.on("/api/toast", HTTP_POST, []() {
+    if (!guard()) return;
+    String m = web.arg("m"); m.trim();
+    toastKind = web.arg("k");
+    toastText = m.substring(0, 84);
+    int secs = web.arg("s").toInt(); if (secs <= 0) secs = 4;
+    toastUntil = millis() + (unsigned long)constrain(secs, 1, 60) * 1000UL;
+    wake("mac");
+    okJson();
+  });
+  web.on("/api/relax", HTTP_POST, []() {
+    if (!guard()) return;
+    relaxOn = web.arg("a").toInt() != 0;
+    if (relaxOn) { relaxKind = 0; relaxNext = millis() + 30000UL; wake("relax"); }
+    okJson();
+  });
+  web.on("/api/follow", HTTP_POST, []() {
+    if (!guard()) return;
+    cfgFollow = web.arg("a").toInt() != 0;
+    prefs.putBool("follow", cfgFollow);
+    if (cfgFollow) { cursorUdp.begin(CURSOR_PORT); wake("follow"); }
+    else           { cursorUdp.stop(); curUntil = 0; }
+    okJson();
+  });
+  // Nothing wakes it from this but the power. Say so, and mean it.
+  web.on("/api/deepsleep", HTTP_POST, []() {
+    if (!guard()) return;
+    okJson();
+    delay(200);
+    oled.clearDisplay();
+    robotHead(SCRW / 2, 26, false);
+    ctr("Good night", 50, 1);
+    oled.display();
+    delay(2200);
+    screenPower(false);
+    esp_deep_sleep_start();
+  });
+  // One screenful of pixels, base64 of 1024 bytes, top row first.
+  web.on("/api/canvas", HTTP_POST, []() {
+    if (!guard()) return;
+    if (!canvasBuf) canvasBuf = (uint8_t*)malloc(SCRW * SCRH / 8);
+    if (!canvasBuf) { web.send(507, "application/json", "{\"ok\":false,\"err\":\"no room\"}"); return; }
+    int n = b64decode(web.arg("b"), canvasBuf, SCRW * SCRH / 8);
+    if (n < SCRW * SCRH / 8) {
+      web.send(400, "application/json", "{\"ok\":false,\"err\":\"want 1024 bytes\"}");
+      return;
+    }
+    int secs = web.arg("s").toInt(); if (secs <= 0) secs = 8;
+    canvasUntil = millis() + (unsigned long)constrain(secs, 1, 300) * 1000UL;
+    wake("canvas");
+    okJson();
+  });
+  web.on("/api/webui", HTTP_POST, []() {
+    if (!guard()) return;
+    webUiOn = web.arg("a").toInt() != 0;
+    webOffAt = webUiOn ? 0 : millis();
+    okJson();
+  });
   web.on("/api/msg", HTTP_POST, []() {
+    if (!guard()) return;
     String m = web.arg("m"); m.trim();
     if (m.length()) {
       message = m.substring(0, 84);
@@ -4098,17 +4623,20 @@ static void setupWeb() {
     web.send(200, "application/json", "{\"ok\":true}");
   });
   web.on("/api/screen", HTTP_POST, []() {
+    if (!guard()) return;
     screen = constrain((int)web.arg("n").toInt(), 0, S_COUNT - 1);
     depth = 0; itemIdx = 0; subIdx = 0; wake("panel");
     web.send(200, "application/json", "{\"ok\":true}");
   });
-  web.on("/api/weather", HTTP_POST, []() { nextWx = 0; web.send(200, "application/json", "{\"ok\":true}"); });
+  web.on("/api/weather", HTTP_POST, []() { if (!guard()) return; nextWx = 0; web.send(200, "application/json", "{\"ok\":true}"); });
   web.on("/api/turn", HTTP_POST, []() {
+    if (!guard()) return;
     cfgAutoTurn = web.arg("a").toInt() != 0;
     prefs.putBool("turn", cfgAutoTurn);
     web.send(200, "application/json", "{\"ok\":true}");
   });
   web.on("/api/adj", HTTP_POST, []() {
+    if (!guard()) return;
     for (int i = 0; i < 5; i++) {
       String k = "a" + String(i);
       if (web.hasArg(k)) prayerAdj[i] = constrain((int)web.arg(k).toInt(), -90, 90);
@@ -4118,6 +4646,7 @@ static void setupWeb() {
     web.send(200, "application/json", "{\"ok\":true}");
   });
   web.on("/api/control", HTTP_POST, []() {
+    if (!guard()) return;
     bool want = web.arg("t").toInt() != 0;
     if (want != cfgTilt) {
       cfgTilt = want;
@@ -4134,6 +4663,7 @@ static void setupWeb() {
   // only ever fetches a URL it read from its own releases, never one
   // handed to it.
   web.on("/api/releases", HTTP_POST, []() {
+    if (!guard()) return;
     String o = "{\"tags\":[";
     if (otaFetchList())
       for (int i = 0; i < relCount; i++) { o += "\"" + relTag[i] + "\""; if (i < relCount - 1) o += ","; }
@@ -4141,6 +4671,7 @@ static void setupWeb() {
     web.send(200, "application/json", o);
   });
   web.on("/api/install", HTTP_POST, []() {
+    if (!guard()) return;
     int i = web.arg("i").toInt();
     if (i < 0 || i >= relCount) { web.send(400, "application/json", "{\"ok\":false}"); return; }
     upTag = relTag[i]; upUrl = relUrl[i];
@@ -4150,11 +4681,13 @@ static void setupWeb() {
   });
 
   web.on("/api/hotspot", HTTP_POST, []() {
+    if (!guard()) return;
     startHotspot();
     web.send(200, "application/json", "{\"ok\":true}");
   });
 
   web.on("/api/plan", HTTP_POST, []() {
+    if (!guard()) return;
     if (web.hasArg("Clear")) {
       taskCount = 0; stopSession(); saveTasks();
     } else if (web.hasArg("del")) {
@@ -4179,6 +4712,7 @@ static void setupWeb() {
   });
 
   web.on("/api/session", HTTP_POST, []() {
+    if (!guard()) return;
     int go = web.arg("go").toInt();
     if (go == 1)      { startSession(); wake("session"); }
     else if (go == 2) { if (sessionRunning()) { flashUntil = 0; startTask(taskIdx + 1); } }
@@ -4188,6 +4722,7 @@ static void setupWeb() {
 
   // open one on the face, or take it off the shelf
   web.on("/api/read", HTTP_POST, []() {
+    if (!guard()) return;
     if (web.hasArg("open")) {
       int i = web.arg("open").toInt();
       if (i >= 0 && i < readCount) {
@@ -4211,6 +4746,7 @@ static void setupWeb() {
 
   // the key on its own, so saving it does not force a reboot
   web.on("/api/key", HTTP_POST, []() {
+    if (!guard()) return;
     String k = web.arg("key"); k.trim();
     if (k.length()) {
       cfgKey = k;
@@ -4221,10 +4757,11 @@ static void setupWeb() {
     }
     web.send(200, "application/json", "{\"ok\":true}");
   });
-  web.on("/api/story", HTTP_POST, []() { nextStory = 0; web.send(200, "application/json", "{\"ok\":true}"); });
+  web.on("/api/story", HTTP_POST, []() { if (!guard()) return; nextStory = 0; web.send(200, "application/json", "{\"ok\":true}"); });
 
   // paste your own: it goes on the shelf exactly like a written one
   web.on("/api/paste", HTTP_POST, []() {
+    if (!guard()) return;
     String t = web.arg("text");
     t.trim();
     if (t.length()) {
@@ -4237,6 +4774,7 @@ static void setupWeb() {
              String("{\"ok\":true,\"count\":") + String(readCount) + "}");
   });
   web.on("/api/time", HTTP_POST, []() {
+    if (!guard()) return;
     long e = web.arg("e").toInt();
     int  z = web.arg("o").toInt();
     if (e > 1735689600L) {
@@ -4251,6 +4789,7 @@ static void setupWeb() {
     web.send(200, "application/json", "{\"ok\":true}");
   });
   web.on("/api/cfg", HTTP_POST, []() {
+    if (!guard()) return;
     String s = web.arg("ssid"); s.trim();
     if (s.length()) prefs.putString("ssid", s);
     if (web.arg("pass").length()) prefs.putString("pass", web.arg("pass"));
@@ -4260,13 +4799,19 @@ static void setupWeb() {
     delay(300); ESP.restart();
   });
   web.on("/api/update", HTTP_POST, []() {
+    if (!guard()) return;
     web.send(200, "application/json", "{\"ok\":true}");
     delay(200); runUpdate();
   });
   web.on("/api/reboot", HTTP_POST, []() {
+    if (!guard()) return;
     web.send(200, "application/json", "{\"ok\":true}");
     delay(300); ESP.restart();
   });
+  {
+    const char* keep[] = { "X-Rafiq-Token" };
+    web.collectHeaders(keep, 1);
+  }
   web.onNotFound([]() { web.send(404, "text/plain", "not found"); });
   web.begin();
 }
@@ -4462,6 +5007,12 @@ void setup() {
   cfgAutoTurn = prefs.getBool("turn", false);
   cfgFace     = constrain(prefs.getInt("face", F_CLASSIC), 0, FACE_N - 1);
   cfgTilt     = prefs.getBool("ctrl", false);
+  // A paired Mac survives a reflash, because the token lives in NVS and
+  // OTA never touches that. Losing it would mean walking over to the
+  // device after every update, which nobody would put up with.
+  cfgTok      = prefs.getString("tok", "");
+  cfgLock     = prefs.getBool("lock", false) && cfgTok.length();
+  cfgFollow   = prefs.getBool("follow", false);
   cfgTz       = prefs.getString("tz", DEF_TZ);
   cfgSsid     = prefs.getString("ssid", "");
   cfgPass     = prefs.getString("pass", "");
@@ -4575,6 +5126,8 @@ void setup() {
   // Between them that is the better part of half a minute of blocking
   // network calls, during which nothing redraws and no knock is acted
   // on. The card stayed up and the device looked wedged. Stagger them.
+  if (cfgFollow && online()) cursorUdp.begin(CURSOR_PORT);
+
   nextWx        = millis() + 3000;
   nextPrayerTry = millis() + 8000;
   nextStory     = millis() + 25000;
@@ -4592,6 +5145,23 @@ void loop() {
   if (now - lastPoll >= 45) { lastPoll = now; input(); }
   serviceSession();
   servicePrayerAlert();
+  serviceCursor();
+
+  // The Mac stops talking for all sorts of ordinary reasons: a lid
+  // closed, a network changed, a laptop carried to another room. None
+  // of them are a fault, so this is quiet about it and everything
+  // carries on without it.
+  if (macLinked && (now - macSeen) > MAC_GONE_MS) {
+    macLinked = false;
+    linkCardJoin = false;
+    linkCardUntil = now + 1400;
+    relaxOn = false; curUntil = 0; canvasUntil = 0;
+  }
+  // The page is never gone for good. A quarter of an hour after the Mac
+  // goes quiet it is back, which is what keeps a broken app from being
+  // a device you cannot reach.
+  if (!webUiOn && (now - (macSeen > webOffAt ? macSeen : webOffAt)) > WEBUI_RETURN_MS)
+    webUiOn = true;
 
   // Fetching blocks for seconds at a time, so it waits for a lull rather
   // than freezing the screen under someone's hand.
@@ -4631,7 +5201,37 @@ void loop() {
 
   if (popupUntil && now > popupUntil) { popupUntil = 0; screen = S_HOME; depth = 0; }
 
-  if (sessionRunning() || millis() < flashUntil) { lastActive = now; screen = S_FOCUS; depth = 0; }
+  // Focus used to hold the panel lit for the whole run, which is the
+  // one reliable way to burn a countdown into an OLED. It now shows
+  // for twelve seconds, goes dark for ten, and every third time comes
+  // back with a word instead of the clock. The device is never asleep
+  // through any of it: the timer keeps running and one knock brings it
+  // straight back.
+  if (sessionRunning() || millis() < flashUntil) {
+    lastActive = now;
+    screen = S_FOCUS; depth = 0;
+    if (millis() < flashUntil) {
+      fzPhase = FZ_SHOW; screenPower(true);      // the end is worth looking at
+    } else if ((long)(now - fzNext) >= 0) {
+      if (fzPhase == FZ_DARK) {
+        fzCycle++;
+        if (fzCycle % 3 == 0) {
+          fzPhase = FZ_QUOTE;
+          fzLine = FZ_LINES[random(FZ_N)];
+          fzNext = now + FZ_QUOTE_MS;
+        } else {
+          fzPhase = FZ_SHOW;
+          fzNext = now + FZ_SHOW_MS;
+        }
+        screenPower(true);
+      } else {
+        fzPhase = FZ_DARK;
+        fzNext = now + FZ_DARK_MS;
+        screenPower(false);
+      }
+    }
+    if (fzPhase == FZ_DARK) { delay(6); return; }
+  }
 
   // depth only means something on the three screens that have one
   if (screen != S_FAITH && screen != S_READS && screen != S_GAMES &&
@@ -4677,6 +5277,41 @@ void loop() {
     if (now - lastDraw >= 60) { lastDraw = now; drawPrayerAlert(); }
     delay(2);
     return;
+  }
+
+  // What the Mac asked for. The call to prayer is checked above this
+  // and returns first, so nothing sent from a laptop can ever sit on
+  // top of the adhan.
+  if (now < linkCardUntil) {
+    lastActive = now;
+    if (now - lastDraw >= 60) { lastDraw = now; drawLinkCard(); }
+    delay(2); return;
+  }
+  if (toastUntil && now < toastUntil) {
+    lastActive = now;
+    if (now - lastDraw >= 90) { lastDraw = now; drawToast(); }
+    delay(2); return;
+  }
+  if (toastUntil && now >= toastUntil) { toastUntil = 0; toastText = ""; toastKind = ""; }
+  if (canvasUntil && now < canvasUntil) {
+    lastActive = now;
+    if (now - lastDraw >= 120) { lastDraw = now; drawCanvas(); }
+    delay(2); return;
+  }
+  if (canvasUntil && now >= canvasUntil) canvasUntil = 0;
+  if (relaxOn) {
+    lastActive = now;
+    if ((long)(now - relaxNext) >= 0) { relaxKind = (relaxKind + 1) % 3; relaxNext = now + 30000UL; }
+    if (now - lastDraw >= 40) { lastDraw = now; drawRelax(); }
+    delay(2); return;
+  }
+  // Following the pointer holds the screen only while the pointer is
+  // actually moving. Stop touching the mouse and it lets go, and the
+  // usual sleep takes over as if nothing had happened.
+  if (cfgFollow && now < curUntil) {
+    lastActive = now;
+    if (now - lastDraw >= 45) { lastDraw = now; drawFollow(); }
+    delay(2); return;
   }
 
   // a game runs its own clock, and holds the screen while it does
