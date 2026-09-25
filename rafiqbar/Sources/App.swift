@@ -179,17 +179,21 @@ struct Panel: View {
             Tile(icon: "text.quote", name: "Phrases", detail: "saved lines") {
                 showPhrases = true
             }
-            Tile(icon: "timer", name: "Focus",
-                 detail: dev.focusLeft > 0 ? "\(dev.focusLeft / 60 + 1) min left" : "",
-                 on: dev.focusLeft > 0) {
-                if dev.focusLeft > 0 { Task { await dev.stopFocus() } } else { showFocus = true }
+            Tile(icon: dev.focusRunning ? "stop.circle" : "timer", name: "Focus",
+                 detail: dev.focusRunning ? "\(dev.focusLeft / 60 + 1) min left  ·  stop" : "",
+                 on: dev.focusRunning) {
+                if dev.focusRunning { Task { await dev.stopFocus() } } else { showFocus = true }
             }
-            Tile(icon: "eyes", name: "Follow", detail: "the pointer", on: dev.following) {
+            Tile(icon: "eyes", name: "Follow",
+                 detail: dev.blocked(.follow) ?? "the pointer",
+                 on: dev.following, enabled: dev.blocked(.follow) == nil) {
                 Task { await dev.setFollow(!dev.following); svc.syncCursor() }
             }
 
             // row two
-            Tile(icon: "wind", name: "Relax", detail: "screensaver", on: dev.relaxing) {
+            Tile(icon: "wind", name: "Relax",
+                 detail: dev.blocked(.relax) ?? "screensaver",
+                 on: dev.relaxing, enabled: dev.blocked(.relax) == nil) {
                 Task { await dev.setRelax(!dev.relaxing) }
             }
             Tile(icon: "doc.on.clipboard", name: "Clipboard",
@@ -209,8 +213,9 @@ struct Panel: View {
                 showRemind = true
             }
             Tile(icon: "cup.and.saucer", name: "On a break",
-                 detail: dev.dndLeft > 0 ? "\(dev.dndLeft / 60 + 1) min left" : "locks the Mac",
-                 on: dev.dndLeft > 0) {
+                 detail: dev.dndLeft > 0 ? "\(dev.dndLeft / 60 + 1) min left"
+                                         : (dev.blocked(.breakNow) ?? "locks the Mac"),
+                 on: dev.dndLeft > 0, enabled: dev.blocked(.breakNow) == nil) {
                 if dev.dndLeft > 0 { Task { await dev.endBreak() } } else { showBreak = true }
             }
             Tile(icon: "video", name: "Camera & mic",
@@ -223,7 +228,9 @@ struct Panel: View {
             Tile(icon: "arrow.down.circle", name: "Update", detail: "the robot") {
                 Task { await dev.checkUpdate() }
             }
-            Tile(icon: "moon.zzz", name: "Deep sleep", detail: "power to wake") {
+            Tile(icon: "moon.zzz", name: "Deep sleep",
+                 detail: dev.blocked(.deepSleep) ?? "power to wake",
+                 enabled: dev.blocked(.deepSleep) == nil) {
                 Task { await dev.deepSleep() }
             }
             // Wired up and tested, but deliberately inert for now.

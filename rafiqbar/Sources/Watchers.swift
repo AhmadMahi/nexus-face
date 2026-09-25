@@ -53,7 +53,7 @@ final class AVWatch: ObservableObject {
         self.onChange = onChange
         stop()
         tick()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        timer = Timer.every(2) { [weak self] in
             Task { @MainActor in self?.tick() }
         }
     }

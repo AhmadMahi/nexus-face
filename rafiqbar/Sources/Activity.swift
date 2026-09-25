@@ -26,7 +26,7 @@ final class Activity: ObservableObject {
         self.onDue = onDue
         stop()
         last = Date()
-        timer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+        timer = Timer.every(20) { [weak self] in
             Task { @MainActor in self?.tick() }
         }
     }

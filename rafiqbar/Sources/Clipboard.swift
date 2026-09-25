@@ -21,7 +21,7 @@ final class Clipboard {
     func start(_ onCopy: @escaping (String) -> Void) {
         stop()
         lastChange = NSPasteboard.general.changeCount
-        timer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { _ in
+        timer = Timer.every(0.6) {
             Task { @MainActor in
                 let pb = NSPasteboard.general
                 guard pb.changeCount != self.lastChange else { return }

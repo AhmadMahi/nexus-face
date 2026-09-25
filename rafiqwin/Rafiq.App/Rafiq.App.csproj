@@ -9,7 +9,7 @@
     <AssemblyName>Rafiq</AssemblyName>
     <RootNamespace>Rafiq.App</RootNamespace>
     <ApplicationIcon>rafiq.ico</ApplicationIcon>
-    <Version>1.2.0</Version>
+    <Version>1.2.1</Version>
     <Product>Rafiq</Product>
     <Company>iotcart.in</Company>
     <ApplicationManifest>app.manifest</ApplicationManifest>

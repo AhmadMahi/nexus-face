@@ -218,7 +218,8 @@ struct RemindSheet: View {
     @State private var text = ""
     @State private var mins = 15
     @State private var mode = 0                 // 0 in a while, 1 at a time
-    @State private var when = Date().addingTimeInterval(3600)
+    @State private var hour = Calendar.current.component(.hour, from: Date().addingTimeInterval(3600))
+    @State private var minute = 0
     @FocusState private var typing: Bool
 
     private let quick = [5, 10, 15, 30, 45, 60, 90, 120]
@@ -261,9 +262,27 @@ struct RemindSheet: View {
                     }
                 }
             } else {
-                DatePicker("", selection: $when, displayedComponents: [.hourAndMinute])
-                    .labelsHidden()
-                    .datePickerStyle(.field)
+                // A DatePicker field cannot be typed into inside a menu bar
+                // window: it never takes keyboard focus, so the time could
+                // be seen but never set. Two plain menus always work, and
+                // are quicker than typing a time anyway.
+                HStack(spacing: 6) {
+                    Picker("", selection: $hour) {
+                        ForEach(0..<24, id: \.self) { h in
+                            Text(String(format: "%02d", h)).tag(h)
+                        }
+                    }
+                    .labelsHidden().frame(width: 70)
+                    Text(":").foregroundStyle(.secondary)
+                    Picker("", selection: $minute) {
+                        ForEach(Array(stride(from: 0, to: 60, by: 5)), id: \.self) { m in
+                            Text(String(format: "%02d", m)).tag(m)
+                        }
+                    }
+                    .labelsHidden().frame(width: 70)
+                    Spacer()
+                    Text(atNote).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
             }
 
             Button(action: add) {
@@ -306,14 +325,25 @@ struct RemindSheet: View {
         if mode == 0 {
             Reminders.shared.add(t, inMinutes: mins)
         } else {
-            // A time already gone today means tomorrow, which is what
-            // anyone setting an alarm for 7am at midnight expects.
-            var target = when
-            if target <= Date() { target = target.addingTimeInterval(86400) }
-            Reminders.shared.add(t, at: target)
+            Reminders.shared.add(t, at: nextOccurrence)
         }
         text = ""
         dev.flash("Reminder set")
+    }
+
+    /// The next time today's clock shows this. A time already gone means
+    /// tomorrow, which is what anyone setting 7am at midnight expects.
+    private var nextOccurrence: Date {
+        let cal = Calendar.current
+        var c = cal.dateComponents([.year, .month, .day], from: Date())
+        c.hour = hour; c.minute = minute; c.second = 0
+        var target = cal.date(from: c) ?? Date().addingTimeInterval(3600)
+        if target <= Date() { target = target.addingTimeInterval(86400) }
+        return target
+    }
+
+    private var atNote: String {
+        Calendar.current.isDateInToday(nextOccurrence) ? "today" : "tomorrow"
     }
 
     static func stamp(_ d: Date) -> String {

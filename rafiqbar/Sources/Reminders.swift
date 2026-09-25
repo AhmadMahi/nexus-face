@@ -33,7 +33,7 @@ final class Reminders: ObservableObject {
         timer?.invalidate()
         // Ten seconds is close enough for something measured in minutes,
         // and it costs nothing to check.
-        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+        timer = Timer.every(10) { [weak self] in
             Task { @MainActor in self?.tick() }
         }
         tick()

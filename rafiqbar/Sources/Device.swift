@@ -54,6 +54,36 @@ final class Device: ObservableObject {
     @Published var pairing = false
     @Published var pairError = ""
 
+    // ---------------------------------------------------------------
+    //  What can run beside what
+    // ---------------------------------------------------------------
+    //  A few of these cannot sensibly be on at once. The rules live here
+    //  rather than inside the buttons, so the tiles and the robot can
+    //  never end up disagreeing about what is allowed.
+
+    var focusRunning: Bool { focusLeft > 0 }
+    var breakRunning: Bool { dndLeft > 0 }
+
+    /// Nil when the tile is free to use, otherwise the reason it is not.
+    /// A greyed out tile with no explanation is just a broken tile.
+    func blocked(_ what: Tool) -> String? {
+        switch what {
+        case .breakNow:
+            // A break locks the screen, which is the opposite of focusing.
+            return focusRunning ? "during focus" : nil
+        case .deepSleep:
+            // Sleeping would take the countdown with it.
+            return focusRunning ? "after focus" : (breakRunning ? "on a break" : nil)
+        case .relax:
+            // The robot can only hold one of these on its panel.
+            return following ? "following" : nil
+        case .follow:
+            return relaxing ? "relaxing" : nil
+        }
+    }
+
+    enum Tool { case breakNow, deepSleep, relax, follow }
+
     var token: String {
         get { Keychain.get("token") }
         set { Keychain.set(newValue, for: "token") }
@@ -335,7 +365,7 @@ final class Cursor {
         let c = NWConnection(host: NWEndpoint.Host(host), port: p, using: .udp)
         c.start(queue: .global(qos: .utility))
         conn = c
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        timer = Timer.every(0.1) { [weak self] in
             Task { @MainActor in self?.tick() }
         }
     }

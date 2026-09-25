@@ -33,13 +33,13 @@ final class Services: ObservableObject {
         idle?.invalidate()
         // Locking when you have walked away is worth checking often enough
         // to be useful and rarely enough to cost nothing.
-        idle = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+        idle = Timer.every(20) { [weak self] in
             Task { @MainActor in self?.checkIdle() }
         }
         poll?.invalidate()
         // Ten seconds keeps the menu bar honest without being chatty. The
         // device answers this in well under a millisecond.
-        poll = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+        poll = Timer.every(10) { [weak self] in
             Task { @MainActor in await self?.dev.refresh() }
         }
         syncClipboard()
@@ -98,7 +98,7 @@ final class Services: ObservableObject {
         breaks?.invalidate(); breaks = nil
         guard dev.breakOn else { activity.stop(); return }
         activity.start { _ in }
-        breaks = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        breaks = Timer.every(60) { [weak self] in
             Task { @MainActor in
                 guard let self, self.dev.breakOn else { return }
                 guard self.activity.due(after: self.dev.breakMins) else { return }
