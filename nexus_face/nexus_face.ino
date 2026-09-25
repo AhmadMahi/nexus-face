@@ -48,7 +48,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.3.0"
+#define FW_VERSION "2.4.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -114,10 +114,10 @@ unsigned long zikrNext = 0;      // when the next count lands
 #define ZIKR_LONG_MS 9000        // the last one is long, give it room
 
 // ---------------- settings ----------------
-enum { C_BRIGHT = 0, C_FACE, C_CONTROL, C_SLEEP, C_TURN, C_POPUP, C_EYES,
+enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
        C_PRAYER, C_HOTSPOT, C_ACCEL, C_PAIR, C_UPDATE, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
-  { "Brightness", "Watch face", "Control", "Sleep after", "Page turn", "Popup time",
+  { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
     "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Pair a Mac",
     "Check update", "Reboot", "About" };
 
@@ -172,23 +172,24 @@ const int STYLE_N = sizeof(STYLES) / sizeof(STYLES[0]);
 
 int cfgBright = 160, cfgSleepIdx = 1, cfgPopupIdx = 2, cfgEyes = 0;
 bool cfgAutoTurn = false;                  // pages turn themselves
-// Taps always work. Tilt is something you turn on as well, never instead,
-// so a misread lean can never leave you with no way back.
-bool cfgTilt = false;
 
-// Leaning it about: down for the next thing, up for the one before, left
-// to go in, right to come out, and up held for three seconds for home.
+// Knocking is the only way to drive this. Leaning it about was offered as
+// a second way for four versions and never worked properly: a lean does
+// not change how hard gravity pulls, so the check that kept the thing
+// awake could not see one, and it dozed off mid gesture. Four attempts at
+// it were each a real fix for a real bug and none of them cured the
+// symptom. The sensor still reads leans for the games and for the watch
+// faces that react to being tilted; nothing navigates by them.
 enum { NC_OFF = 0, NC_HOLD, NC_UP, NC_DOWN, NC_LEFT, NC_RIGHT, NC_INFO };
+// How far counts as a lean. Only the games use this now, to learn which
+// way round the thing is sitting before one starts.
+#define NAV_TILT_ON 0.30f
 int  navCal = NC_OFF;
 bool navCalTeach = false;
 unsigned long navCalStamp = 0;
 bool navLatch = false;
 unsigned long upSince = 0;
 bool upConsumed = false;
-uint32_t nTiltNext = 0, nTiltPrev = 0, nTiltIn = 0, nTiltOut = 0, nTiltHome = 0;
-#define NAV_TILT_ON  0.30f
-#define NAV_TILT_OFF 0.14f
-#define NAV_HOME_MS  3000UL
 String cfgSsid, cfgPass, cfgTz, cfgKey;
 int sleepSecs() { return SLEEP_OPTS[cfgSleepIdx]; }
 int popupSecs() { return POPUP_OPTS[cfgPopupIdx]; }
@@ -376,7 +377,6 @@ bool asleep = false, screenOn = true, timeOk = false, rescueAP = false, fsOk = f
 unsigned long lastActive = 0, lastDraw = 0, lastPoll = 0, reactUntil = 0, lastShake = 0;
 unsigned long nextTimeTry = 0, swStart = 0, inputMuteUntil = 0;
 unsigned long lastLowG = 0, lastFallAt = 0;
-float lastRawX = 0, lastRawY = 0, lastRawZ = 0;
 float refAx = 0, refAy = 0, refAz = 1;
 unsigned long steadySince = 0;
 uint32_t cTap = 0, cDouble = 0, cTriple = 0, cQuad = 0, cFall = 0, cShake = 0, cBoot = 0;
@@ -452,12 +452,13 @@ static void startSensors() {
     wReg(mpu, M_GYRO_CFG, 0x00); wReg(mpu, M_ACC_CFG, 0x00);
   }
 }
-// With leaning switched on the device lives in a hand, and a hand unloads
-// it constantly while turning it over. The fall animation is not worth
-// the false alarms there, so it is simply not armed in that mode.
+// Taps and the drop alarm, both always on. This used to disarm the drop
+// alarm while leaning was switched on, because a hand turning the thing
+// over unloads it constantly and tripped it. With leaning gone it sits on
+// a desk, where a genuine unloading means it is falling.
 static void applyFallInt() {
   if (!adxl) return;
-  wReg(adxl, A_INT_ENABLE, cfgTilt ? (uint8_t)INT_TAP1 : (uint8_t)(INT_TAP1 | INT_FF));
+  wReg(adxl, A_INT_ENABLE, (uint8_t)(INT_TAP1 | INT_FF));
   rReg(adxl, A_INT_SOURCE);                  // drop anything already pending
 }
 
@@ -1643,7 +1644,6 @@ static void drawSettings() {
       case C_PRAYER: snprintf(v, sizeof(v), "%s", prayerOk ? "saved" : "none"); break;
       case C_ACCEL:  snprintf(v, sizeof(v), "x2"); break;
       case C_PAIR:   snprintf(v, sizeof(v), "%s", cfgLock ? "paired" : "x2"); break;
-      case C_CONTROL:snprintf(v, sizeof(v), "%s", cfgTilt ? "tilt" : "taps"); break;
       case C_ABOUT:  snprintf(v, sizeof(v), "x2"); break;
       case C_SLEEP:  if (!sleepSecs())         snprintf(v, sizeof(v), "never");
                      else if (sleepSecs() < 60) snprintf(v, sizeof(v), "%ds", sleepSecs());
@@ -3505,11 +3505,10 @@ static void goSleep() {
   for (int i = 0; i < 26; i++) { eyesFrame(); delay(16); }
   screenPower(false);
   nSlept++;
-  // The clock used to drop to 80MHz here. That saves almost nothing on a
+  // The clock used to drop to 80MHz here. It saves almost nothing on a
   // desk and changes the bus timing at exactly the moment the sensors
-  // have to stay readable, because noticing a lean means reading them
-  // continuously while asleep. Not worth the risk.
-  if (!cfgTilt) setCpuFrequencyMhz(80);
+  // have to stay readable, because noticing that it has been moved means
+  // reading them continuously while asleep. Not worth the risk.
 }
 static void wake(const char* why) {
   lastActive = millis();
@@ -3781,11 +3780,6 @@ static void knockOne() {
                        applyBright(); prefs.putInt("bri", cfgBright); break; }
       case C_FACE:   cfgFace = (cfgFace + 1) % FACE_N;
                      prefs.putInt("face", cfgFace); break;
-      case C_CONTROL: cfgTilt = !cfgTilt;
-                     prefs.putBool("ctrl", cfgTilt);
-                     applyFallInt();
-                     if (cfgTilt) navCalBegin(true);        // show how, there and then
-                     break;
       case C_SLEEP:  cfgSleepIdx = (cfgSleepIdx + 1) % SLEEP_N;
                      prefs.putInt("slpi", cfgSleepIdx); break;
       case C_TURN:   cfgAutoTurn = !cfgAutoTurn;
@@ -3980,85 +3974,6 @@ static void updateKnock(uint8_t n) {
   }
 }
 
-static void navHome() { upState = U_OFF; screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; nTiltHome++; }
-
-// While the update conversation is up it takes the leans too, so there is
-// never a screen that only answers to one of the two.
-static void navAct(uint8_t n) {
-  if (upState != U_OFF) { updateKnock(n); return; }
-  if (n == 1) knockOne();
-  else if (n == 2) knockTwo();
-  else knockThree();
-}
-static void navPrevAct() {
-  switch (upState) {
-    case U_OFF:  knockPrev(); return;
-    case U_LIST: if (relCount) relSel = (relSel + relCount - 1) % relCount; return;
-    case U_MENU: upPick = (upPick + 1) % 2; return;
-    case U_ASK:  upYes = !upYes; return;
-    default: return;
-  }
-}
-
-// Down for the next thing, up for the one before, left to go in, right to
-// come out, and up held for three seconds for home. Up does double duty,
-// so it only counts as "the one before" once you let it go: holding it
-// past three seconds means you wanted home instead.
-static void tiltNav() {
-  if (!cfgTilt || !tiltTaught()) return;
-  if (navCal != NC_OFF) return;
-  if (alertPhase != AL_NONE) return;
-  if (screen == S_GAMES && depth == 2) return;      // in there, tilt is playing
-
-  float tx, ty;
-  tiltRead(tx, ty);
-  unsigned long now = millis();
-
-  // Gravity has the same magnitude whichever way up the thing is, so
-  // leaning it never shows up in the movement check that keeps it awake:
-  // it would doze off under your hand mid gesture. Watch the lean itself
-  // change instead. One left standing at an angle still settles down.
-  // Judge stillness from the sensor itself, not from the lean. The lean
-  // is measured against rest, and the correction below moves rest, so a
-  // lean based test would read its own correction as movement, stop
-  // itself, and crawl. Raw cannot fight itself.
-  float rawD = fabsf(ax - lastRawX) + fabsf(ay - lastRawY) + fabsf(az - lastRawZ);
-  lastRawX = ax; lastRawY = ay; lastRawZ = az;
-
-  // Gravity has the same magnitude whichever way up it is, so leaning
-  // never showed up in the movement check that keeps it awake.
-  if (rawD > 0.03f) lastActive = now;
-
-  // Rest is measured in your hand, because that is where it asks you to
-  // hold it. Put the thing down afterwards and every lean reads as
-  // already held over: the latch never clears, no gesture fires again,
-  // and nothing refreshes the idle timer, so it dozes and does the same
-  // after every shake. Once it has sat still a while, let rest settle to
-  // wherever it is actually sitting.
-  if (rawD > 0.02f || !steadySince) steadySince = now;
-  else if (!upSince && now - steadySince > 5000) {
-    float v[3] = { ax, ay, az };
-    for (int i = 0; i < 3; i++) restV[i] += (v[i] - restV[i]) * 0.08f;
-  }
-
-  if (ty > NAV_TILT_ON) {
-    if (!upSince) { upSince = now; upConsumed = false; }
-    else if (!upConsumed && now - upSince >= NAV_HOME_MS) {
-      navHome(); upConsumed = true; lastActive = now;
-    }
-  } else if (upSince && fabsf(ty) < NAV_TILT_OFF) {
-    if (!upConsumed) { navPrevAct(); nTiltPrev++; lastActive = now; }
-    upSince = 0; upConsumed = false;
-  }
-
-  if (!navLatch) {
-    if (ty < -NAV_TILT_ON)      { navAct(1); nTiltNext++; navLatch = true; lastActive = now; }
-    else if (tx < -NAV_TILT_ON) { navAct(2); nTiltIn++;   navLatch = true; lastActive = now; }
-    else if (tx >  NAV_TILT_ON) { navAct(3); nTiltOut++;  navLatch = true; lastActive = now; }
-  }
-  if (fabsf(tx) < NAV_TILT_OFF && fabsf(ty) < NAV_TILT_OFF) navLatch = false;
-}
-
 static void onFall() {
   cFall++;
   int keep = screen;
@@ -4114,7 +4029,7 @@ static void input() {
     // The latch trips on any brief unloading, and a hand turning the
     // device over produces those constantly. Believe it only if the low
     // reading is one we saw ourselves, and never twice in a few seconds.
-    if (!cfgTilt && (s & INT_FF) && lastLowG && now - lastLowG < 400 &&
+    if ((s & INT_FF) && lastLowG && now - lastLowG < 400 &&
         (!lastFallAt || now - lastFallAt > 4000)) {
       lastFallAt = now;
       wake("fall"); onFall(); return;
@@ -4166,7 +4081,6 @@ static void input() {
 
   if (asleep) return;
 
-  tiltNav();
 
   // Reading needs a long fuse. Two minutes on a page is normal, and
   // dozing off mid sentence would be maddening.
@@ -4301,8 +4215,6 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
   <h2>Control</h2><div class="card">
     <table><tr><td>Driven by</td><td id="ctrlNow">taps</td></tr></table>
     <div class="row" style="margin-top:8px">
-      <button class="g" onclick="setCtrl(0)">Taps only</button>
-      <button class="g" onclick="setCtrl(1)">Taps and tilt</button>
     </div>
     <div style="font-size:12px;color:var(--mut);margin-top:8px;text-align:left">
       Switching tilt on here keeps the leans it already learned, and turns
@@ -4423,9 +4335,6 @@ window.pasteStory=async function(){
   $('t').textContent='stored, '+(j.count||0)+' on the shelf';
   load();
 }
-window.setCtrl=async function(t){
-  if(t===1&&!confirm('Switch to taps and tilt?'))return;
-  await post('/api/control',{t:t}); $('t').textContent='control set'; load()}
 window.listRel=async function(){
   $('t').textContent='asking github';
   const r=await post('/api/releases',{});
@@ -4510,9 +4419,6 @@ static void apiState() {
   o += "\"k1\":" + String(cTap) + ",\"k2\":" + String(cDouble) + ",\"k3\":" + String(cTriple) +
        ",\"k4\":" + String(cQuad) + ",\"fall\":" + String(cFall) + ",\"boots\":" + String(cBoot) + ",";
   o += "\"autoTurn\":" + String(cfgAutoTurn ? "true" : "false") + ",";
-  o += "\"control\":\"" + String(cfgTilt ? "taps and tilt" : "taps") + "\",";
-  o += "\"tilts\":\"" + String(nTiltNext) + " next, " + String(nTiltPrev) + " back, " +
-       String(nTiltIn) + " in, " + String(nTiltOut) + " out, " + String(nTiltHome) + " home\",";
   o += "\"city\":\"" + wCity + "\",";
   o += "\"temp\":\"" + String(wxOk ? String(wTemp, 1) + " C" : String("--")) + "\",";
   o += "\"hum\":\"" + String(wxOk ? String(wHum, 0) + " %" : String("--")) + "\",";
@@ -4777,23 +4683,6 @@ static void setupWeb() {
     for (int i = 0; i < 5; i++) alertDone[i] = 0;   // the times moved, so let today ring again
     web.send(200, "application/json", "{\"ok\":true}");
   });
-  web.on("/api/control", HTTP_POST, []() {
-    if (!guard()) return;
-    bool want = web.arg("t").toInt() != 0;
-    if (want != cfgTilt) {
-      cfgTilt = want;
-      prefs.putBool("ctrl", cfgTilt);
-      applyFallInt();
-      // Never taught the leans? Ask on the device. Otherwise just find
-      // where it is resting now, so the first lean is measured from there.
-      if (cfgTilt) navCalBegin(!tiltTaught());
-    }
-    web.send(200, "application/json", "{\"ok\":true}");
-  });
-
-  // The list first, then install by its position in that list. The device
-  // only ever fetches a URL it read from its own releases, never one
-  // handed to it.
   web.on("/api/releases", HTTP_POST, []() {
     if (!guard()) return;
     String o = "{\"tags\":[";
@@ -5138,7 +5027,10 @@ void setup() {
   cfgEyes     = constrain(prefs.getInt("eye", 0), 0, STYLE_N - 1);
   cfgAutoTurn = prefs.getBool("turn", false);
   cfgFace     = constrain(prefs.getInt("face", F_CLASSIC), 0, FACE_N - 1);
-  cfgTilt     = prefs.getBool("ctrl", false);
+  // Leaning it about is gone as a way to drive this. Clear the old flag
+  // so a device that had it switched on does not carry the setting
+  // around in flash forever.
+  if (prefs.isKey("ctrl")) prefs.remove("ctrl");
   // A paired Mac survives a reflash, because the token lives in NVS and
   // OTA never touches that. Losing it would mean walking over to the
   // device after every update, which nobody would put up with.
@@ -5220,23 +5112,9 @@ void setup() {
   eyes.setIdleMode(ON, 5, 4);
   eyes.setMood(STYLES[cfgEyes].mood);
 
-  // Leaning only means anything against how it is sitting now, and that
-  // changes every time it is picked up and put down. So it takes a moment
-  // to settle before handing control over.
-  if (cfgTilt) {
-    navCalBegin(false);
-    while (navCal != NC_OFF) { navCalService(); drawNavCal(); web.handleClient(); delay(40); }
-  }
-
   // Two columns, numbers on a common left edge so the words line up.
   oled.clearDisplay();
-  if (cfgTilt) {
-    titleBarC("KNOCK OR LEAN");
-    at(8,  16, "1 next");   at(66, 16, "dn next");
-    at(8,  28, "2 open");   at(66, 28, "lt open");
-    oled.drawFastHLine(8, 40, 112, SSD1306_WHITE);
-    ctr("up 3s for home", 48, 1);
-  } else {
+  {
     titleBarC("HOW TO KNOCK");
     at(8,  16, "1  next");
     at(8,  28, "2  open");
