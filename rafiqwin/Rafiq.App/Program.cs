@@ -4,9 +4,30 @@ namespace Rafiq.App;
 
 static class Program
 {
+    /// <summary>
+    /// A tray app has nowhere to show a crash, so anything that escapes is
+    /// written down instead of disappearing. This is also what lets the
+    /// build machine say why it fell over.
+    /// </summary>
+    static void LogCrash(object? e)
+    {
+        try
+        {
+            Directory.CreateDirectory(Store.Dir);
+            File.AppendAllText(Path.Combine(Store.Dir, "crash.log"),
+                $"{DateTime.Now:u}  {e}{Environment.NewLine}{Environment.NewLine}");
+        }
+        catch { }
+        try { Console.Error.WriteLine(e); } catch { }
+    }
+
     [STAThread]
     static void Main()
     {
+        AppDomain.CurrentDomain.UnhandledException += (_, a) => LogCrash(a.ExceptionObject);
+        Application.ThreadException += (_, a) => LogCrash(a.Exception);
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+
         // One Rafiq at a time, or two tray icons fight over the same robot.
         using var only = new Mutex(true, "Local\\RafiqMenuBarApp", out bool first);
         if (!first) return;
@@ -15,14 +36,21 @@ static class Program
         Application.SetCompatibleTextRenderingDefault(false);
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
 
-        var cfg = Store.Load();
-        var dev = new Device(cfg);
-        var rem = new Reminders();
-        using var svc = new Services(dev, cfg, rem);
-
-        using var tray = new TrayHost(dev, cfg, rem, svc);
-        svc.Start();
-        Application.Run();
+        try
+        {
+            var cfg = Store.Load();
+            var dev = new Device(cfg);
+            var rem = new Reminders();
+            using var svc = new Services(dev, cfg, rem);
+            using var tray = new TrayHost(dev, cfg, rem, svc);
+            svc.Start();
+            Application.Run();
+        }
+        catch (Exception e)
+        {
+            LogCrash(e);
+            throw;
+        }
     }
 }
 

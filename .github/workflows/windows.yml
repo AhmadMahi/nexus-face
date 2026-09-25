@@ -59,9 +59,15 @@ jobs:
           # stays up, and is still running a few seconds later.
           $exe = "out/win-x64/Rafiq.exe"
           if (-not (Test-Path $exe)) { throw "Rafiq.exe was not produced" }
-          $p = Start-Process $exe -PassThru
+          $p = Start-Process $exe -PassThru -RedirectStandardError err.txt -RedirectStandardOutput out.txt
           Start-Sleep -Seconds 8
-          if ($p.HasExited) { throw "Rafiq exited straight away with code $($p.ExitCode)" }
+          if ($p.HasExited) {
+            Write-Host "--- stderr ---"; if (Test-Path err.txt) { Get-Content err.txt }
+            Write-Host "--- stdout ---"; if (Test-Path out.txt) { Get-Content out.txt }
+            $log = Join-Path $env:APPDATA "Rafiq\crash.log"
+            Write-Host "--- crash log ---"; if (Test-Path $log) { Get-Content $log }
+            throw "Rafiq exited straight away with code $($p.ExitCode)"
+          }
           Write-Host "Rafiq started and is still running after 8s"
           Stop-Process -Id $p.Id -Force
           # and the command line helper answers
