@@ -59,7 +59,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.8.0"
+#define FW_VERSION "2.9.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -1385,22 +1385,28 @@ static void drawSystem() {
 }
 
 // ---- the work session ----
+// A word, held for a moment, over whatever happens to be on screen.
+//
+// This used to live inside the focus screen, and the loop forced the
+// screen to focus for as long as one was up. So saying SET in the tap
+// settings, or DONE on a list, threw you onto the focus screen and left
+// you there. A word about what just happened should never move you.
+static void drawFlash() {
+  oled.clearDisplay();
+  oled.fillRect(0, 0, SCRW, SCRH, SSD1306_WHITE);
+  oled.setTextColor(SSD1306_BLACK);
+  int n = strlen(flashWord);
+  int size = n * 12 <= SCRW - 8 ? 2 : 1;
+  ctr(flashWord, size == 2 ? 20 : 26, size);
+  if (breakDue) ctr("Walk for a minute", 42, 1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.display();
+}
+
 static void drawFocus() {
   if (swOn)      { drawStopwatch(); return; }
   if (depth == 1) { drawFocusList(); return; }
   oled.clearDisplay();
-
-  if (millis() < flashUntil) {
-    oled.fillRect(0, 0, SCRW, SCRH, SSD1306_WHITE);
-    oled.setTextColor(SSD1306_BLACK);
-    int n = strlen(flashWord);
-    int size = n * 12 <= SCRW - 8 ? 2 : 1;
-    ctr(flashWord, size == 2 ? 20 : 26, size);
-    if (breakDue) ctr("Walk for a minute", 42, 1);
-    oled.setTextColor(SSD1306_WHITE);
-    oled.display();
-    return;
-  }
 
   if (!sessionRunning()) {
     bar("FOCUS");
@@ -4470,6 +4476,15 @@ static void settleBurst() {
     Serial.printf("knock x%u -> update state %d\n", n, upState);
     return;
   }
+  // While a strength is being tried out, knocking IS the test. At the
+  // light end one real tap easily lands as three or four, and each of
+  // those was being obeyed as a command, which is what walked you off
+  // the screen the moment you touched it. Only a clean double means
+  // anything in there; everything else has already been counted.
+  if (tapTesting && tapChosen && n != 2) {
+    Serial.printf("knock x%u counted, not obeyed (trying a strength)\n", n);
+    return;
+  }
   if      (n == 1) knockOne();
   else if (n == 2) knockTwo();
   else if (n == 3) knockThree();
@@ -4981,6 +4996,9 @@ static void apiState() {
   }
   o += "],";
   o += "\"netMax\":" + String(NET_MAX) + ",";
+  o += "\"bri\":" + String(cfgBright) + ",\"face\":" + String(cfgFace) +
+       ",\"slpi\":" + String(cfgSleepIdx) + ",\"popi\":" + String(cfgPopupIdx) +
+       ",\"eye\":" + String(cfgEyes) + ",\"turn\":" + String(cfgAutoTurn ? "true" : "false") + ",";
   o += "\"deepOff\":" + String(deepOff ? "true" : "false") + ",";
   o += "\"tapName\":\"" + String(TAP_NAME[cfgTap]) + "\",";
   o += "\"relax\":" + String(relaxOn ? "true" : "false") + ",";
@@ -5185,6 +5203,22 @@ static void setupWeb() {
       saveNets();
       netReload = true;
     }
+    okJson();
+  });
+  // One way in for the plain numbered settings, rather than an endpoint
+  // each. Every one is clamped to its own range here, so a value typed
+  // wrong somewhere else cannot put the device into a state it has no
+  // screen for.
+  web.on("/api/cfgv", HTTP_POST, []() {
+    if (!guard()) return;
+    String k = web.arg("k");
+    int v = web.arg("v").toInt();
+    if      (k == "bri")  { cfgBright   = constrain(v, 0, 255);           prefs.putInt("bri", cfgBright);   applyBright(); }
+    else if (k == "face") { cfgFace     = constrain(v, 0, FACE_N - 1);    prefs.putInt("face", cfgFace); }
+    else if (k == "slpi") { cfgSleepIdx = constrain(v, 0, SLEEP_N - 1);   prefs.putInt("slpi", cfgSleepIdx); }
+    else if (k == "popi") { cfgPopupIdx = constrain(v, 0, POPUP_N - 1);   prefs.putInt("popi", cfgPopupIdx); }
+    else if (k == "eye")  { cfgEyes     = constrain(v, 0, STYLE_N - 1);   prefs.putInt("eye", cfgEyes); applyEyes(cfgEyes); }
+    else { web.send(400, "application/json", "{\"ok\":false,\"err\":\"no such setting\"}"); return; }
     okJson();
   });
   web.on("/api/deep", HTTP_POST, []() {
@@ -5890,16 +5924,14 @@ void loop() {
   // back with a word instead of the clock. The device is never asleep
   // through any of it: the timer keeps running and one knock brings it
   // straight back.
-  if (sessionRunning() || millis() < flashUntil) {
+  if (sessionRunning()) {
     lastActive = now;
     screen = S_FOCUS;
     // Browsing the list while something is running is allowed; only the
     // countdown itself owns depth zero.
     if (depth > 1) depth = 0;
-    if (depth == 1) {
+    if (depth == 1 || millis() < flashUntil) {
       fzPhase = FZ_SHOW; screenPower(true);      // you are reading it
-    } else if (millis() < flashUntil) {
-      fzPhase = FZ_SHOW; screenPower(true);      // the end is worth looking at
     } else if ((long)(now - fzNext) >= 0) {
       if (fzPhase == FZ_DARK) {
         fzCycle++;
@@ -5968,6 +6000,14 @@ void loop() {
     gamePending = -1;
     gameStart(itemIdx);
     depth = 2;
+  }
+
+  // A word about what just happened, over whatever is on screen. It
+  // does not move you anywhere, which is the whole point of it.
+  if (millis() < flashUntil) {
+    lastActive = now;
+    if (now - lastDraw >= 60) { lastDraw = now; drawFlash(); }
+    delay(2); return;
   }
 
   if (alertPhase != AL_NONE) {                 // the call takes the screen
