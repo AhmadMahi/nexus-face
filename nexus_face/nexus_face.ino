@@ -59,7 +59,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.10.0"
+#define FW_VERSION "2.11.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -131,12 +131,12 @@ unsigned long zikrNext = 0;      // when the next count lands
 
 // ---------------- settings ----------------
 enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
-       C_PRAYER, C_HOTSPOT, C_ACCEL, C_TAP, C_PAIR, C_UPDATE, C_EARLIER,
+       C_PRAYER, C_HOTSPOT, C_ACCEL, C_TAP, C_PAIR, C_UPDATE,
        C_AUTOUP, C_RESET, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
     "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Tap strength",
-    "Pair a Mac", "Check update", "Earlier versions", "Auto update",
+    "Pair a Mac", "Check update", "Auto update",
     "Reset settings", "Reboot", "About" };
 
 // Zero is the dimmest the panel goes, not off: the SSD1306 still shows
@@ -157,6 +157,11 @@ int  cfgTap  = TAP_MED;
 int  tapPick = TAP_MED;              // what is highlighted while choosing
 bool tapTesting = false;
 bool tapChosen = false;              // past the list, actually knocking at one
+// Trying a strength is a window with an end, not a screen you have to
+// knock your way out of. Knocking IS the test in there, so no knock can
+// be a command as well; the window closing is the only way back.
+#define TAP_TRY_MS 10000UL
+uint32_t tapTestEnds = 0;
 // A little rolling trace of how hard the last few shoves were, so you
 // can see the one that did not count as well as the ones that did.
 #define TAP_TRACE 24
@@ -483,15 +488,23 @@ uint8_t  burst = 0;
 unsigned long burstStart = 0;
 String   otaStatus = "", otaStatus2 = "";
 
-// Updating is a little conversation now rather than one button: which
+// Updating is a little conversation rather than one button: which
 // release, then yes or no, and only then does anything get written.
-// Checking used to be a menu you picked from before anything happened,
-// and then the check itself froze the panel for up to half a minute
-// while it talked to GitHub, which looked exactly like dropping off to
-// sleep. Now picking it starts the check, the check runs on the network
-// task, and U_LOOK is what you watch while it does.
-enum { U_OFF = 0, U_LOOK, U_ASK, U_LIST, U_NONE, U_FAIL };
+// U_MENU is the two icons you pick from, newest or earlier, and it is
+// the room every other state comes back to.
+//
+// The freeze was never the menu. Picking an icon ran the GitHub call
+// on the display loop, where it held everything still for anything up
+// to half a minute, which is what looked like dropping off to sleep.
+// Picking an icon now only raises a flag; the network task does the
+// talking and U_LOOK is what you watch while it does.
+//
+// upSeq is how a check gets called off. Knocking out of U_LOOK bumps
+// it, and a reply carrying a stale number is dropped on the floor
+// rather than dragging you back into a conversation you just left.
+enum { U_OFF = 0, U_MENU, U_LOOK, U_ASK, U_LIST, U_NONE, U_FAIL };
 int    upState = U_OFF;
+volatile uint8_t upSeq = 0;
 int    upPick = 0;                  // 0 the latest one, 1 the older ones
 bool   upYes = true;
 String upTag = "", upUrl = "", upMsg = "";
@@ -1879,7 +1892,7 @@ static void drawTapTry() {
 //  barely register is still one you can leave.
 static void drawTapTest() {
   oled.clearDisplay();
-  titleBar("KNOCK AT IT", TAP_NAME[tapPick]);
+  titleBar("TRYING", TAP_NAME[tapPick]);
 
   char c[10];
   snprintf(c, sizeof(c), "%lu", (unsigned long)tapSeen);
@@ -1901,7 +1914,14 @@ static void drawTapTest() {
   }
   at(TX, 13, "jolt");
 
-  ctr("2 knocks to go back", 56, 1);
+  // No way out is offered because there is none to offer: every knock
+  // in here is being measured, so none of them can also be a command.
+  // What it shows instead is how much of the window is left.
+  uint32_t left = (int32_t)(tapTestEnds - millis());
+  if ((int32_t)left < 0) left = 0;
+  char t[20];
+  snprintf(t, sizeof(t), "%lus left", (unsigned long)((left + 999) / 1000));
+  ctr(t, 56, 1);
   oled.display();
 }
 
@@ -1970,7 +1990,6 @@ static void drawSettings() {
       case C_PAIR:   snprintf(v, sizeof(v), "%s", cfgLock ? "paired" : "x2"); break;
       case C_TAP:    snprintf(v, sizeof(v), "%s", TAP_NAME[cfgTap]); break;
       case C_AUTOUP: snprintf(v, sizeof(v), "%s", cfgAutoUp ? "on" : "off"); break;
-      case C_EARLIER:snprintf(v, sizeof(v), "%s", online() ? "x2" : "offline"); break;
       case C_ABOUT:  snprintf(v, sizeof(v), "x2"); break;
       case C_SLEEP:  if (!sleepSecs())         snprintf(v, sizeof(v), "never");
                      else if (sleepSecs() < 60) snprintf(v, sizeof(v), "%ds", sleepSecs());
@@ -2047,6 +2066,20 @@ static void drawUpdateUI() {
   oled.clearDisplay();
   char r[12];
   switch (upState) {
+    case U_MENU: {
+      snprintf(r, sizeof(r), "%d/2", upPick + 1);
+      titleBar("UPDATE", r);
+      const int TX[2] = { 14, 74 };
+      for (int i = 0; i < 2; i++) {
+        if (i == upPick) oled.drawRoundRect(TX[i] - 2, 13, 42, 28, 4, SSD1306_WHITE);
+        if (i == 0) dlIcon(TX[i] + 19, 27);
+        else        histIcon(TX[i] + 19, 27);
+      }
+      ctr(upPick == 0 ? "Newest release" : "Earlier releases", 45, 1);
+      ctr("1 next   2 open", 55, 1);
+      break;
+    }
+
     case U_LOOK: {
       // Something to watch while it asks GitHub, instead of a panel that
       // has apparently dropped off to sleep.
@@ -4376,14 +4409,17 @@ static void knockTwo() {
       return;
     }
     if (subIdx == 0) {                       // trying one out
-      if (!tapChosen) {                      // from the list, go and hit it
+      // Only ever a way in. There is no knock that leaves this screen,
+      // because a light tap bounces into two or three of them and one
+      // of those was being read as the way out, which is what walked
+      // you off the screen the instant you touched it. The window
+      // closing is the way back, and nothing else is.
+      if (!tapChosen) {
         tapChosen = true; tapTesting = true;
         tapSeen = 0; tapLastSeen = millis();
+        tapTestEnds = millis() + TAP_TRY_MS;
         for (int i = 0; i < TAP_TRACE; i++) tapTrace[i] = 0;
         applyTapLevel(tapPick);
-      } else {                               // and this is the way back
-        tapChosen = false; tapTesting = false;
-        applyTap();
       }
       return;
     }
@@ -4400,11 +4436,7 @@ static void knockTwo() {
     switch (itemIdx) {
       case C_REBOOT:  delay(150); ESP.restart(); break;
       case C_UPDATE:
-        if (online()) { upState = U_LOOK; upMsg = ""; wantOtaLatest = true; }
-        else { upState = U_FAIL; upMsg = "No network"; }
-        break;
-      case C_EARLIER:
-        if (online()) { upState = U_LOOK; upMsg = ""; wantOtaList = true; }
+        if (online()) { upState = U_MENU; upPick = 0; upMsg = ""; }
         else { upState = U_FAIL; upMsg = "No network"; }
         break;
       case C_AUTOUP:
@@ -4435,8 +4467,10 @@ static void knockThree() {
   if (screen == S_SETTINGS && itemIdx == C_RESET && depth == 2) { depth = 1; return; }
   if (screen == S_SETTINGS && itemIdx == C_TAP && depth >= 2) {
     if (depth == 3) {
-      // whatever was being tried is dropped; only Set ever commits
-      tapTesting = false; tapChosen = false;
+      // Never reached while a window is open: settleBurst eats every
+      // knock in there. This is the way out of the list behind it.
+      if (tapTesting) return;
+      tapChosen = false;
       applyTap();
       depth = 2;
     } else depth = 1;
@@ -4477,19 +4511,40 @@ static void knockFour() {
 // keeps drawing while it waits instead of sitting there looking asleep.
 static void updateKnock(uint8_t n) {
   switch (upState) {
+    case U_MENU:
+      if (n == 1) { upPick = (upPick + 1) % 2; return; }
+      if (n == 2) {
+        // All this does is ask. The network task picks the flag up and
+        // sets the answer; the panel stays awake and answering the whole
+        // time it takes, which is the whole point of the change.
+        upMsg = "";
+        if (upPick == 0) wantOtaLatest = true;
+        else             wantOtaList = true;
+        upState = U_LOOK;
+        return;
+      }
+      upState = U_OFF;
+      return;
+
     case U_LOOK:
-      // nothing to do but wait. Three knocks gives up on it.
-      if (n >= 3) { wantOtaLatest = false; wantOtaList = false; upState = U_OFF; }
+      // Nothing to do but wait. Three knocks calls it off, and bumping
+      // the sequence means a reply already on its way is ignored rather
+      // than yanking you back in a few seconds later.
+      if (n >= 3) {
+        wantOtaLatest = false; wantOtaList = false;
+        upSeq++;
+        upState = U_MENU;
+      }
       return;
 
     case U_ASK:
       if (n == 1) { upYes = !upYes; return; }
       if (n == 2) {
         if (upYes) { upState = U_OFF; otaInstall(); upState = U_FAIL; }  // returns only if it failed
-        else upState = U_OFF;
+        else upState = U_MENU;
         return;
       }
-      upState = U_OFF;
+      upState = U_MENU;
       return;
 
     case U_LIST:
@@ -4499,11 +4554,11 @@ static void updateKnock(uint8_t n) {
         upYes = true; upState = U_ASK;
         return;
       }
-      upState = U_OFF;
+      upState = U_MENU;
       return;
 
-    default:                                   // it said its piece; let it go
-      upState = U_OFF;
+    default:                                   // it said its piece
+      upState = U_MENU;
       return;
   }
 }
@@ -4535,12 +4590,13 @@ static void settleBurst() {
     Serial.printf("knock x%u -> update state %d\n", n, upState);
     return;
   }
-  // While a strength is being tried out, knocking IS the test. At the
-  // light end one real tap easily lands as three or four, and each of
-  // those was being obeyed as a command, which is what walked you off
-  // the screen the moment you touched it. Only a clean double means
-  // anything in there; everything else has already been counted.
-  if (tapTesting && tapChosen && n != 2) {
+  // While a strength is being tried out, knocking IS the test, so no
+  // knock is a command as well. Letting the clean double through was
+  // the whole bug: at the light end one real tap lands as a double as
+  // often as not, and the double was the way out, so touching the
+  // screen left it. Everything is counted, nothing is obeyed, and the
+  // window closing is what ends it.
+  if (tapTesting && tapChosen) {
     Serial.printf("knock x%u counted, not obeyed (trying a strength)\n", n);
     return;
   }
@@ -5735,14 +5791,20 @@ static void netLoop(void*) {
       // never reads a tag that is only half written.
       if (wantOtaLatest) {
         wantOtaLatest = false;
-        if (!otaFetchLatest()) upState = U_FAIL;
-        else if (upTag == String("v" FW_VERSION) || upTag == String(FW_VERSION))
-          upState = U_NONE;
-        else { upYes = true; upState = U_ASK; }
+        uint8_t seq = upSeq;                   // who asked, and are they still there
+        bool ok = otaFetchLatest();
+        if (seq == upSeq) {
+          if (!ok) upState = U_FAIL;
+          else if (upTag == String("v" FW_VERSION) || upTag == String(FW_VERSION))
+            upState = U_NONE;
+          else { upYes = true; upState = U_ASK; }
+        }
       }
       if (wantOtaList) {
         wantOtaList = false;
-        upState = otaFetchList() ? U_LIST : U_FAIL;
+        uint8_t seq = upSeq;
+        bool ok = otaFetchList();
+        if (seq == upSeq) upState = ok ? U_LIST : U_FAIL;
       }
     }
     vTaskDelay(pdMS_TO_TICKS(40));
@@ -6016,17 +6078,23 @@ void loop() {
 
   if (popupUntil && now > popupUntil) { popupUntil = 0; screen = S_HOME; depth = 0; }
 
-  // Trying a strength out that turns out to be too heavy for your desk
-  // would otherwise leave you unable to knock your way back out of the
-  // very screen testing it. Half a minute without a knock landing and it
-  // lets itself out, putting back whatever was set before.
+  // Trying a strength is ten seconds with an end on it. No knock in
+  // there is a command, which is the only way a screen that measures
+  // knocks can be trusted not to walk out from under you. When the
+  // window closes it puts back whatever was set, drops you on the list
+  // you came from and says what it saw. Nothing is committed by trying;
+  // only Set ever commits.
   if (tapTesting) {
     lastActive = now;
-    if (now - tapLastSeen > 30000UL) {
+    if ((int32_t)(now - tapTestEnds) >= 0) {
       tapTesting = false;
+      tapChosen  = false;
       applyTap();
-      depth = 2;
-      flash("PUT BACK", 1200);
+      depth = 3;
+      char m[16];
+      if (tapSeen) snprintf(m, sizeof(m), "SAW %lu", (unsigned long)tapSeen);
+      else         snprintf(m, sizeof(m), "SAW NONE");
+      flash(m, 1400);
     }
   }
 
