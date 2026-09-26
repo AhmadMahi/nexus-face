@@ -59,7 +59,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.13.0"
+#define FW_VERSION "2.14.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -175,10 +175,17 @@ unsigned long tapLastSeen = 0;
 //  Six laid out by hand, two that lean with the device, and two with
 //  something that pours. Only the clock screen is affected.
 enum { F_CLASSIC = 0, F_STACK, F_DATEUP, F_MINIMAL, F_SIDE, F_BANNER,
-       F_DRIFT, F_PARALLAX, F_WATER, F_SAND, FACE_N };
+       F_DRIFT, F_PARALLAX, F_WATER, F_SAND,
+       // Ten more, borrowed from watches that cost rather more. Three
+       // are hands, one is both, five are the numbers a desk robot
+       // actually knows about itself, and one is for showing off.
+       F_DIAL, F_BAUHAUS, F_REGULATOR, F_RINGS, F_INFOGRAPH,
+       F_STATUS, F_VITALS, F_BARS, F_TERMINAL, F_BINARY, FACE_N };
 const char* FACE_NAME[FACE_N] =
   { "classic", "stacked", "date up", "minimal", "side", "banner",
-    "drift", "parallax", "water", "sand" };
+    "drift", "parallax", "water", "sand",
+    "dial", "bauhaus", "regulator", "rings", "infograph",
+    "status", "vitals", "bars", "terminal", "binary" };
 int cfgFace = F_CLASSIC;
 
 // Changing the face from the clock itself rather than walking into
@@ -899,11 +906,24 @@ static void swStr(char* o, size_t n) {
 
 // ================================================================
 //  WATCH FACES
-//    Ten ways to show the same few things. No frames and no boxes:
+//    Twenty ways to show the same few things. No frames and no boxes:
 //    the panel is small enough that a border is only lost pixels.
+//
+//    The second half borrows from wristwatches: three with hands, four
+//    that carry information the robot already knows and was only ever
+//    showing buried in SYSTEM, and three that are just nice to look at.
+//    Anything it does not know yet shows dashes rather than a gap.
 // ================================================================
 struct Bits { char hm[8], hh[4], mm[4], ss[4], day[12], dlong[20], dshort[14],
-                   dmon[10], dyear[6]; bool ok; };
+                   dmon[10], dyear[6]; bool ok;
+              // The hands need an angle, not a string, and Rings needs
+              // to know how far through the day it is.
+              //
+              // Not S for seconds: RoboEyes has "#define S 5" for the
+              // south gaze direction, so a member called S expands to a
+              // number and takes the rest of the line down with it. The
+              // same goes for N, E, W and the four corners.
+              int H, M, sec, mday, yday; };
 
 static Bits fb;                         // what the faces draw from
 static void loadBits() {
@@ -913,6 +933,7 @@ static void loadBits() {
   if (!fb.ok) {
     strcpy(fb.hm, "--:--"); strcpy(fb.hh, "--"); strcpy(fb.mm, "--"); strcpy(fb.ss, "--");
     strcpy(fb.day, "waiting"); strcpy(fb.dlong, "for the clock"); strcpy(fb.dshort, "--");
+    fb.H = fb.M = fb.sec = 0; fb.mday = 1; fb.yday = 0;
     return;
   }
   snprintf(fb.hm, sizeof(fb.hm), "%02d:%02d", t.tm_hour, t.tm_min);
@@ -922,6 +943,8 @@ static void loadBits() {
   strftime(fb.day,    sizeof(fb.day),    "%A", &t);
   strftime(fb.dlong,  sizeof(fb.dlong),  "%d %B %Y", &t);
   strftime(fb.dshort, sizeof(fb.dshort), "%d %b %Y", &t);
+  fb.H = t.tm_hour; fb.M = t.tm_min; fb.sec = t.tm_sec;
+  fb.mday = t.tm_mday; fb.yday = t.tm_yday;
 }
 
 // A level that follows slowly, so however the thing happens to be
@@ -1055,6 +1078,327 @@ static void offlineIcon(int x, int y) {
   for (int i = 0; i < 8; i++) oled.drawPixel(x - 1 + i, y + i, SSD1306_WHITE);
 }
 
+
+// ================================================================
+//  TEN MORE FACES
+// ================================================================
+//  Hands, rings and readouts. Everything here is drawn from fb, which
+//  is only ever filled when the clock is known, and from numbers the
+//  robot already keeps about itself: how loud the network is, how many
+//  times it has started up, how long it has been awake.
+//
+//  The panel redraws about nine times a second, so a second hand ticks
+//  once per second and lands cleanly. There is no sweep and there was
+//  never going to be one.
+// ================================================================
+
+// How strong the signal is, nought to four. Anything still connected
+// gets at least one bar: nought means no network at all, which is a
+// different thing from a weak one and should not look the same.
+static int sigBars() {
+  if (!online()) return 0;
+  int r = (int)WiFi.RSSI();
+  if (r >= -55) return 4;
+  if (r >= -65) return 3;
+  if (r >= -75) return 2;
+  return 1;
+}
+static void drawSig(int x, int y, int bars) {
+  for (int i = 0; i < 4; i++) {
+    int h = 3 + i * 2, bx = x + i * 4, by = y + 9 - h;
+    if (i < bars) oled.fillRect(bx, by, 3, h, SSD1306_WHITE);
+    else          oled.drawRect(bx, by, 3, h, SSD1306_WHITE);
+  }
+}
+
+// A number that cannot grow wider than four characters. The knock
+// count passes ten thousand on a busy desk and a boot count climbs
+// forever; either one printed in full runs off the right of a face
+// that has sixty pixels for it.
+static void numStr(char* out, size_t n, uint32_t v) {
+  if (v < 1000)        snprintf(out, n, "%lu", (unsigned long)v);
+  else if (v < 100000) snprintf(out, n, "%luk", (unsigned long)(v / 1000));
+  else                 snprintf(out, n, "%luM", (unsigned long)(v / 1000000));
+}
+
+// Awake for how long, in the largest unit that still says something.
+static void upStr(char* out, size_t n) {
+  uint32_t s = millis() / 1000UL;
+  if (s < 3600)  snprintf(out, n, "%lum", (unsigned long)(s / 60));
+  else if (s < 86400) snprintf(out, n, "%luh%02lum",
+                               (unsigned long)(s / 3600), (unsigned long)((s % 3600) / 60));
+  else snprintf(out, n, "%lud%luh", (unsigned long)(s / 86400),
+                (unsigned long)((s % 86400) / 3600));
+}
+
+// The next prayer, or empty if the times have not arrived. Wraps to
+// tomorrow's first one after the last has passed, so it is never blank
+// for the rest of the evening.
+static bool nextPrayer(char* name, size_t nn, char* when, size_t wn) {
+  int nowMin = fb.H * 60 + fb.M, best = -1, bi = -1;
+  for (int i = 0; i < 5; i++) {
+    int mins = prayerAt(i);
+    if (mins < 0) continue;
+    if (mins >= nowMin && (best < 0 || mins < best)) { best = mins; bi = i; }
+  }
+  if (bi < 0) for (int i = 0; i < 5; i++) {     // all gone; tomorrow's first
+    int mins = prayerAt(i);
+    if (mins >= 0) { best = mins; bi = i; break; }
+  }
+  if (bi < 0) return false;
+  snprintf(name, nn, "%s", PRAYERS[bi]);
+  snprintf(when, wn, "%02d:%02d", best / 60, best % 60);
+  return true;
+}
+
+// A hand, from the middle out. Angles run clockwise from twelve, which
+// is not how sin and cos run, hence the quarter turn.
+static void hand(int cx, int cy, float turns, int len, bool thick) {
+  float a = turns * 6.28318f - 1.5708f;
+  int x = cx + (int)(cosf(a) * len), y = cy + (int)(sinf(a) * len);
+  oled.drawLine(cx, cy, x, y, SSD1306_WHITE);
+  if (thick) {                      // a second line beside it, so it reads as heavier
+    oled.drawLine(cx, cy + 1, x, y + 1, SSD1306_WHITE);
+    oled.drawLine(cx + 1, cy, x + 1, y, SSD1306_WHITE);
+  }
+}
+// Part of a circle, from twelve, clockwise. Stepped finely enough that
+// it does not come out as a dotted line.
+static void arc(int cx, int cy, int r, float part) {
+  int steps = (int)(part * 220);
+  for (int i = 0; i <= steps; i++) {
+    float a = (i / 220.0f) * 6.28318f - 1.5708f;
+    oled.drawPixel(cx + (int)(cosf(a) * r), cy + (int)(sinf(a) * r), SSD1306_WHITE);
+  }
+}
+
+// ---- 1. dial: a whole watch, ticks and three hands ----
+static void faceDial() {
+  const int CX = 64, CY = 32, R = 30;
+  oled.drawCircle(CX, CY, R, SSD1306_WHITE);
+  for (int i = 0; i < 12; i++) {
+    float a = i * 0.5236f - 1.5708f;
+    int len = (i % 3 == 0) ? 6 : 3;
+    oled.drawLine(CX + (int)(cosf(a) * (R - 2)), CY + (int)(sinf(a) * (R - 2)),
+                  CX + (int)(cosf(a) * (R - 2 - len)), CY + (int)(sinf(a) * (R - 2 - len)),
+                  SSD1306_WHITE);
+  }
+  hand(CX, CY, ((fb.H % 12) + fb.M / 60.0f) / 12.0f, 14, true);
+  hand(CX, CY, (fb.M + fb.sec / 60.0f) / 60.0f, 21, true);
+  hand(CX, CY, fb.sec / 60.0f, 25, false);
+  oled.fillCircle(CX, CY, 2, SSD1306_WHITE);
+}
+
+// ---- 2. bauhaus: no case, four marks, two hands ----
+static void faceBauhaus() {
+  const int CX = 64, CY = 32;
+  for (int i = 0; i < 12; i++) {
+    float a = i * 0.5236f - 1.5708f;
+    if (i % 3 == 0) {
+      oled.drawLine(CX + (int)(cosf(a) * 30), CY + (int)(sinf(a) * 30),
+                    CX + (int)(cosf(a) * 23), CY + (int)(sinf(a) * 23), SSD1306_WHITE);
+      oled.drawLine(CX + (int)(cosf(a) * 30) + 1, CY + (int)(sinf(a) * 30),
+                    CX + (int)(cosf(a) * 23) + 1, CY + (int)(sinf(a) * 23), SSD1306_WHITE);
+    } else {
+      oled.drawPixel(CX + (int)(cosf(a) * 29), CY + (int)(sinf(a) * 29), SSD1306_WHITE);
+    }
+  }
+  hand(CX, CY, ((fb.H % 12) + fb.M / 60.0f) / 12.0f, 15, true);
+  hand(CX, CY, fb.M / 60.0f, 24, false);
+  oled.fillCircle(CX, CY, 2, SSD1306_WHITE);
+}
+
+// ---- 3. regulator: hours and minutes apart from the seconds ----
+static void faceRegulator() {
+  const int CX = 40, CY = 33, R = 27;
+  oled.drawCircle(CX, CY, R, SSD1306_WHITE);
+  for (int i = 0; i < 12; i += 3) {
+    float a = i * 0.5236f - 1.5708f;
+    oled.drawLine(CX + (int)(cosf(a) * (R - 2)), CY + (int)(sinf(a) * (R - 2)),
+                  CX + (int)(cosf(a) * (R - 7)), CY + (int)(sinf(a) * (R - 7)), SSD1306_WHITE);
+  }
+  hand(CX, CY, ((fb.H % 12) + fb.M / 60.0f) / 12.0f, 13, true);
+  hand(CX, CY, fb.M / 60.0f, 20, false);
+  oled.fillCircle(CX, CY, 2, SSD1306_WHITE);
+
+  const int SX = 99, SY = 22, SR = 15;         // the seconds, on their own
+  oled.drawCircle(SX, SY, SR, SSD1306_WHITE);
+  for (int i = 0; i < 4; i++) {
+    float a = i * 1.5708f - 1.5708f;
+    oled.drawPixel(SX + (int)(cosf(a) * (SR - 3)), SY + (int)(sinf(a) * (SR - 3)), SSD1306_WHITE);
+  }
+  hand(SX, SY, fb.sec / 60.0f, 11, false);
+  oled.fillCircle(SX, SY, 1, SSD1306_WHITE);
+
+  char d[8];
+  snprintf(d, sizeof(d), "%02d", fb.mday);
+  oled.drawRect(88, 46, 23, 13, SSD1306_WHITE);
+  at(95, 49, d);
+}
+
+// ---- 4. rings: an hour, a minute and a second, closing ----
+static void faceRings() {
+  const int CX = 64, CY = 33;
+  // Faint tracks first so an almost empty ring still reads as a ring,
+  // then the filled part over the top. Every fourth pixel: enough to
+  // see where the ring goes, not enough to be mistaken for progress.
+  for (int r = 20; r <= 30; r += 5)
+    for (int i = 0; i < 220; i += 4) {
+      float a = (i / 220.0f) * 6.28318f - 1.5708f;
+      oled.drawPixel(CX + (int)(cosf(a) * r), CY + (int)(sinf(a) * r), SSD1306_WHITE);
+    }
+  arc(CX, CY, 30, ((fb.H % 12) + fb.M / 60.0f) / 12.0f);
+  arc(CX, CY, 25, (fb.M + fb.sec / 60.0f) / 60.0f);
+  arc(CX, CY, 20, fb.sec / 60.0f);
+  at(CX - 15, CY - 9, fb.hm);
+  at(CX - 6, CY + 2, fb.ss);
+}
+
+// ---- 5. infograph: the time small, and one fact in each corner ----
+static void faceInfograph() {
+  drawSig(3, 2, sigBars());
+
+  char t[10];
+  if (wxOk) snprintf(t, sizeof(t), "%dC", (int)lroundf(wTemp));
+  else      snprintf(t, sizeof(t), "--");
+  at(SCRW - 2 - (int)strlen(t) * 6, 3, t);
+
+  oled.setTextSize(2);
+  oled.setCursor(64 - 5 * 6, 24);
+  oled.print(fb.hm);
+  oled.setTextSize(1);
+  at(64 + 5 * 6 + 2, 31, fb.ss);
+
+  char dd[12];
+  snprintf(dd, sizeof(dd), "%02d %.3s", fb.mday, fb.dshort + 3);
+  at(3, 54, dd);
+
+  char pn[10], pw[8];
+  if (nextPrayer(pn, sizeof(pn), pw, sizeof(pw))) {
+    char p[20];
+    snprintf(p, sizeof(p), "%.4s %s", pn, pw);
+    at(SCRW - 2 - (int)strlen(p) * 6, 54, p);
+  }
+  oled.drawFastHLine(0, 14, SCRW, SSD1306_WHITE);
+  oled.drawFastHLine(0, 50, SCRW, SSD1306_WHITE);
+}
+
+// ---- 6. status: the time, and how the thing is doing under it ----
+static void faceStatus() {
+  oled.setTextSize(3);
+  oled.setCursor(64 - (5 * 18) / 2 - 7, 6);
+  oled.print(fb.hm);
+  oled.setTextSize(1);
+  at(64 + (5 * 18) / 2 - 5, 22, fb.ss);
+
+  oled.drawFastHLine(0, 36, SCRW, SSD1306_WHITE);
+  drawSig(3, 41, sigBars());
+
+  char r[12];
+  if (online()) snprintf(r, sizeof(r), "%ddBm", (int)WiFi.RSSI());
+  else          snprintf(r, sizeof(r), "no wifi");
+  at(23, 42, r);
+
+  // Two pieces pinned to their own ends rather than one centred line:
+  // a long uptime and a long boot count together came to more than the
+  // screen is wide.
+  char u[12]; upStr(u, sizeof(u));
+  char l[16], r2[16], b[8];
+  numStr(b, sizeof(b), cBoot);
+  snprintf(l,  sizeof(l),  "up %s", u);
+  snprintf(r2, sizeof(r2), "boots %s", b);
+  at(3, 53, l);
+  at(SCRW - 2 - (int)strlen(r2) * 6, 53, r2);
+}
+
+// ---- 7. vitals: everything it knows about itself ----
+static void faceVitals() {
+  at(3, 2, fb.hm);
+  at(SCRW - 2 - (int)strlen(fb.dshort) * 6, 2, fb.dshort);
+  oled.drawFastHLine(0, 12, SCRW, SSD1306_WHITE);
+
+  // The right hand column starts at 68 and the screen ends at 128, so
+  // it has ten characters and not one more. Every number here is one
+  // that keeps growing, so every one of them is shortened.
+  char u[12]; upStr(u, sizeof(u));
+  char nb[8], ns[8], nt[8];
+  numStr(nb, sizeof(nb), cBoot);
+  numStr(ns, sizeof(ns), nSlept);
+  numStr(nt, sizeof(nt), cTap);
+  char l[6][14];
+  snprintf(l[0], 14, "boots %s", nb);
+  snprintf(l[1], 14, "up %s",    u);
+  snprintf(l[2], 14, "slept %s", ns);
+  snprintf(l[3], 14, "taps %s",  nt);
+  snprintf(l[4], 14, "heap %uk", (unsigned)(ESP.getFreeHeap() / 1024));
+  if (online()) snprintf(l[5], 14, "rssi %d", (int)WiFi.RSSI());
+  else          snprintf(l[5], 14, "offline");
+  for (int i = 0; i < 6; i++) at(i % 2 ? 68 : 4, 17 + (i / 2) * 15, l[i]);
+}
+
+// ---- 8. bars: read it like a level meter ----
+static void faceBars() {
+  const char* L[4] = { "H", "M", "S", "@" };
+  float f[4] = { fb.H / 24.0f, fb.M / 60.0f, fb.sec / 60.0f, sigBars() / 4.0f };
+  char  v[4][6];
+  snprintf(v[0], 6, "%02d", fb.H);
+  snprintf(v[1], 6, "%02d", fb.M);
+  snprintf(v[2], 6, "%02d", fb.sec);
+  snprintf(v[3], 6, "%d", sigBars());
+  for (int i = 0; i < 4; i++) {
+    int y = 4 + i * 15;
+    at(1, y + 1, L[i]);
+    oled.drawRect(10, y, 100, 10, SSD1306_WHITE);
+    int w = (int)(f[i] * 96);
+    if (w > 0) oled.fillRect(12, y + 2, w, 6, SSD1306_WHITE);
+    at(113, y + 1, v[i]);
+  }
+}
+
+// ---- 9. terminal: for when you want it to look like a machine ----
+static void faceTerminal() {
+  char l[6][24];
+  snprintf(l[0], 24, "time  %s:%s", fb.hm, fb.ss);
+  snprintf(l[1], 24, "date  %s", fb.dshort);
+  if (online()) {
+    String s = WiFi.SSID();
+    snprintf(l[2], 24, "net   %.13s", s.c_str());
+    snprintf(l[3], 24, "rssi  %d dBm", (int)WiFi.RSSI());
+  } else {
+    snprintf(l[2], 24, "net   none");
+    snprintf(l[3], 24, "rssi  --");
+  }
+  char nb[8]; numStr(nb, sizeof(nb), cBoot);
+  snprintf(l[4], 24, "boots %s", nb);
+  char u[12]; upStr(u, sizeof(u));
+  snprintf(l[5], 24, "up    %s", u);
+  for (int i = 0; i < 6; i++) {
+    at(2, 2 + i * 10, ">");
+    at(10, 2 + i * 10, l[i]);
+  }
+}
+
+// ---- 10. binary: hours, minutes and seconds, in dots ----
+//  One column per digit, most significant at the top, and only the dots
+//  that can ever light are drawn: there is no eight in the tens of an
+//  hour, so there is no lamp for one.
+static void faceBinary() {
+  const int digit[6] = { fb.H / 10, fb.H % 10, fb.M / 10, fb.M % 10,
+                         fb.sec / 10, fb.sec % 10 };
+  const int bits[6]  = { 2, 4, 3, 4, 3, 4 };     // how many can ever light
+  const int cx[6]    = { 16, 32, 56, 72, 96, 112 };
+  at(20, 3, "H"); at(60, 3, "M"); at(100, 3, "S");
+  for (int c = 0; c < 6; c++) {
+    for (int b = 0; b < bits[c]; b++) {
+      int weight = 1 << (bits[c] - 1 - b);
+      int y = 20 + b * 12 - (4 - bits[c]) * 0;
+      y = 20 + (4 - bits[c] + b) * 12;           // bottom aligned, so rows line up
+      if (digit[c] & weight) oled.fillCircle(cx[c], y, 4, SSD1306_WHITE);
+      else                   oled.drawCircle(cx[c], y, 4, SSD1306_WHITE);
+    }
+  }
+}
+
 static void drawHome() {
   oled.clearDisplay();
   loadBits();
@@ -1081,7 +1425,17 @@ static void drawHome() {
     case F_DRIFT:    faceDrift();       break;
     case F_PARALLAX:    faceParallax();    break;
     case F_WATER:    faceFill(true);  break;
-    case F_SAND:    faceFill(false); break;
+    case F_SAND:     faceFill(false); break;
+    case F_DIAL:      faceDial();       break;
+    case F_BAUHAUS:   faceBauhaus();    break;
+    case F_REGULATOR: faceRegulator();  break;
+    case F_RINGS:     faceRings();      break;
+    case F_INFOGRAPH: faceInfograph();  break;
+    case F_STATUS:    faceStatus();     break;
+    case F_VITALS:    faceVitals();     break;
+    case F_BARS:      faceBars();       break;
+    case F_TERMINAL:  faceTerminal();   break;
+    case F_BINARY:    faceBinary();     break;
     default:         faceClassic();     break;
   }
   oled.display();
@@ -4864,6 +5218,15 @@ static void knockThree() {
       applyTap();
       depth = 2;
     } else depth = 1;
+    return;
+  }
+  // Twenty faces is a long way round on double knocks alone, so three
+  // knocks steps back one. Only on the clock, and only at the top
+  // level, where three knocks already meant "go home" and going home
+  // from home does nothing at all.
+  if (screen == S_HOME && depth == 0 && timeOk) {
+    cfgFace = (cfgFace + FACE_N - 1) % FACE_N;
+    prefs.putInt("face", cfgFace);
     return;
   }
   if (inReader()) { depth = 0; itemIdx = 0; subIdx = 0; return; }
