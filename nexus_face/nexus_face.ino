@@ -59,7 +59,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.11.0"
+#define FW_VERSION "2.12.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -180,6 +180,16 @@ const char* FACE_NAME[FACE_N] =
   { "classic", "stacked", "date up", "minimal", "side", "banner",
     "drift", "parallax", "water", "sand" };
 int cfgFace = F_CLASSIC;
+
+// Trying faces on from the clock itself, rather than walking into
+// settings for it. A double knock on the clock opens it, single knocks
+// walk the faces with the real clock drawn in each one, and a double
+// knock keeps the one you are looking at. Three knocks, or walking
+// away for eight seconds, puts back the one you had.
+bool     faceTrying = false;
+int      faceWas = F_CLASSIC;
+uint32_t faceIdle = 0;
+#define FACE_TRY_MS 8000UL
 
 // The faces read the sensor for themselves, so they work whether or not
 // leaning is switched on as a way of driving the thing. The reference
@@ -1072,6 +1082,19 @@ static void drawHome() {
     case F_WATER:    faceFill(true);  break;
     case F_SAND:    faceFill(false); break;
     default:         faceClassic();     break;
+  }
+  // Drawn over whichever face is showing, because the point is to see
+  // the real thing and not a picture of it. A black band first, so a
+  // busy face cannot swallow the words.
+  if (faceTrying) {
+    // Two lines rather than one. The name and the three things you can
+    // do come to 24 characters on the widest face, and the screen holds
+    // 21, so putting them side by side would have run the hint through
+    // the word "parallax".
+    oled.fillRect(0, 41, SCRW, SCRH - 41, SSD1306_BLACK);
+    oled.drawFastHLine(0, 41, SCRW, SSD1306_WHITE);
+    ctr(FACE_NAME[cfgFace], 45, 1);
+    ctr("1 next 2 keep 3 undo", 55, 1);
   }
   oled.display();
 }
@@ -2153,15 +2176,17 @@ static void drawUpdateUI() {
 //  position is re-measured every time a game starts, because that is
 //  the part that drifts when you pick it up and put it down.
 // ================================================================
-enum { G_SNAKE = 0, G_BRICK, G_CAR, G_CATCH, G_PONG, G_ROLL, G_COUNT };
-const char* G_NAME[G_COUNT] = { "Snake", "Brick", "Car", "Catch", "Pong", "Roll" };
+enum { G_SNAKE = 0, G_BRICK, G_CAR, G_CATCH, G_PONG, G_ROLL,
+       G_ECHO, G_MAZE, G_COUNT };
+const char* G_NAME[G_COUNT] =
+  { "Snake", "Brick", "Car", "Catch", "Pong", "Roll", "Echo", "Maze" };
 #define G_PER_PAGE 2
 #define G_PAGES ((G_COUNT + G_PER_PAGE - 1) / G_PER_PAGE)
 
 enum { GS_CAL_STILL = 0, GS_CAL_RIGHT, GS_CAL_AWAY, GS_READY, GS_PLAY, GS_PAUSE, GS_OVER };
 int  gState = GS_READY;
 int  gamePending = -1;
-int  gScore = 0, gBest[G_COUNT] = { 0, 0, 0, 0, 0, 0 };
+int  gScore = 0, gBest[G_COUNT] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 unsigned long gNext = 0, gStamp = 0;
 
 
@@ -2691,6 +2716,148 @@ static void rlDraw() {
   for (int i = 0; i < rlLives; i++) oled.fillRect(122 - i * 4, 12, 2, 2, SSD1306_WHITE);
 }
 
+// ---------------- Echo ----------------
+//  For someone small. Nothing to dodge, nothing that speeds up and no
+//  tilting: the robot knocks a little pattern and you knock it back,
+//  and every round it adds one more. Beats are one, two or three knocks
+//  and never four, because four is the top of what the chip counts and
+//  the one most likely to come out as three on a small hand.
+#define EC_MAX 16
+uint8_t ecPat[EC_MAX];
+int  ecLen = 1, ecAt = 0, ecPip = 0;
+bool ecShow = true;                  // true while the robot is doing the knocking
+unsigned long ecNext = 0;
+
+static void ecReset() {
+  ecLen = 1;
+  for (int i = 0; i < EC_MAX; i++) ecPat[i] = 1 + random(3);
+  ecAt = 0; ecPip = 0; ecShow = true;
+  ecNext = millis() + 700;
+  gScore = 0;
+}
+static void ecStep() {
+  if (!ecShow) return;                            // your turn; nothing ticks
+  unsigned long now = millis();
+  if ((long)(now - ecNext) < 0) return;
+  if (ecPip < ecPat[ecAt]) { ecPip++; ecNext = now + 330; return; }
+  ecAt++; ecPip = 0;                              // a gap, so beats do not run together
+  if (ecAt >= ecLen) { ecShow = false; ecAt = 0; return; }
+  ecNext = now + 520;
+}
+static void ecKnock(uint8_t n) {
+  if (ecShow) return;                             // still showing you; wait
+  if (n != ecPat[ecAt]) { gState = GS_OVER; return; }
+  ecAt++;
+  if (ecAt < ecLen) return;
+  gScore = ecLen;                                 // a whole pattern back
+  if (ecLen < EC_MAX) ecLen++;
+  ecAt = 0; ecPip = 0; ecShow = true;
+  ecNext = millis() + 800;
+}
+static void ecDraw() {
+  ctr(ecShow ? "listen" : "your turn", 15, 1);
+  if (ecShow) {
+    int n = ecPat[ecAt];
+    int x0 = SCRW / 2 - (n * 18) / 2 + 9;
+    for (int i = 0; i < n; i++) {
+      if (i < ecPip) oled.fillCircle(x0 + i * 18, 33, 7, SSD1306_WHITE);
+      else           oled.drawCircle(x0 + i * 18, 33, 7, SSD1306_WHITE);
+    }
+  } else {
+    ctr("knock it back", 30, 1);
+  }
+  // one block per beat, filled for the ones already knocked back
+  int w = ecLen > 12 ? 5 : 7;
+  int x0 = SCRW / 2 - (ecLen * w) / 2;
+  for (int i = 0; i < ecLen; i++) {
+    if (!ecShow && i < ecAt) oled.fillRect(x0 + i * w, 48, w - 2, 6, SSD1306_WHITE);
+    else                     oled.drawRect(x0 + i * w, 48, w - 2, 6, SSD1306_WHITE);
+  }
+}
+
+// ---------------- Maze ----------------
+//  The other one for someone small. No timer, nothing chasing anybody
+//  and no way to lose: you lean the dot to the star and it draws a new
+//  one. A wall simply does not let you through.
+#define MZ_COLS 15
+#define MZ_ROWS 6
+#define MZ_CELL 8
+#define MZ_X0   4
+#define MZ_Y0   14
+#define MZ_N    (MZ_COLS * MZ_ROWS)
+uint8_t mzW[MZ_N];                // bit 0 north, 1 east, 2 south, 3 west; set means wall
+int mzX = 0, mzY = 0, mzLevel = 1;
+unsigned long mzMove = 0;
+
+static void mzCarve() {
+  for (int i = 0; i < MZ_N; i++) mzW[i] = 0x0F;
+  bool seen[MZ_N];
+  for (int i = 0; i < MZ_N; i++) seen[i] = false;
+  uint8_t stk[MZ_N];
+  int sp = 0;
+  seen[0] = true; stk[sp++] = 0;
+  while (sp) {
+    int cur = stk[sp - 1];
+    int cx = cur % MZ_COLS, cy = cur / MZ_COLS;
+    int cand[4], dir[4], nc = 0;
+    if (cy > 0           && !seen[cur - MZ_COLS]) { cand[nc] = cur - MZ_COLS; dir[nc++] = 0; }
+    if (cx < MZ_COLS - 1 && !seen[cur + 1])       { cand[nc] = cur + 1;       dir[nc++] = 1; }
+    if (cy < MZ_ROWS - 1 && !seen[cur + MZ_COLS]) { cand[nc] = cur + MZ_COLS; dir[nc++] = 2; }
+    if (cx > 0           && !seen[cur - 1])       { cand[nc] = cur - 1;       dir[nc++] = 3; }
+    if (!nc) { sp--; continue; }
+    int k = random(nc), nx = cand[k], d = dir[k];
+    mzW[cur] &= ~(1 << d);
+    mzW[nx]  &= ~(1 << ((d + 2) & 3));
+    seen[nx] = true;
+    stk[sp++] = nx;
+  }
+}
+static void mzReset() {
+  mzLevel = 1; gScore = 0;
+  mzCarve(); mzX = 0; mzY = 0; mzMove = 0;
+}
+static void mzStep() {
+  unsigned long now = millis();
+  if ((long)(now - mzMove) < 0) return;
+  float tx, ty;
+  tiltRead(tx, ty);
+  const float T = 0.22f;
+  int d = -1;
+  if (fabsf(tx) > fabsf(ty)) { if (tx > T) d = 1; else if (tx < -T) d = 3; }
+  else                       { if (ty > T) d = 0; else if (ty < -T) d = 2; }
+  if (d < 0) return;
+  int cur = mzY * MZ_COLS + mzX;
+  if (mzW[cur] & (1 << d)) { mzMove = now + 150; return; }   // a wall, and that is that
+  if      (d == 0) mzY--;
+  else if (d == 1) mzX++;
+  else if (d == 2) mzY++;
+  else             mzX--;
+  mzMove = now + 170;
+  if (mzX == MZ_COLS - 1 && mzY == MZ_ROWS - 1) {
+    gScore = mzLevel;
+    mzLevel++;
+    mzCarve(); mzX = 0; mzY = 0;
+    mzMove = now + 450;
+  }
+}
+static void mzDraw() {
+  for (int y = 0; y < MZ_ROWS; y++)
+    for (int x = 0; x < MZ_COLS; x++) {
+      int c = y * MZ_COLS + x;
+      int px = MZ_X0 + x * MZ_CELL, py = MZ_Y0 + y * MZ_CELL;
+      if (mzW[c] & 1) oled.drawFastHLine(px, py, MZ_CELL + 1, SSD1306_WHITE);
+      if (mzW[c] & 2) oled.drawFastVLine(px + MZ_CELL, py, MZ_CELL + 1, SSD1306_WHITE);
+      if (mzW[c] & 4) oled.drawFastHLine(px, py + MZ_CELL, MZ_CELL + 1, SSD1306_WHITE);
+      if (mzW[c] & 8) oled.drawFastVLine(px, py, MZ_CELL + 1, SSD1306_WHITE);
+    }
+  int sx = MZ_X0 + (MZ_COLS - 1) * MZ_CELL + MZ_CELL / 2;
+  int sy = MZ_Y0 + (MZ_ROWS - 1) * MZ_CELL + MZ_CELL / 2;
+  oled.drawFastHLine(sx - 3, sy, 7, SSD1306_WHITE);
+  oled.drawFastVLine(sx, sy - 3, 7, SSD1306_WHITE);
+  oled.fillCircle(MZ_X0 + mzX * MZ_CELL + MZ_CELL / 2,
+                  MZ_Y0 + mzY * MZ_CELL + MZ_CELL / 2, 2, SSD1306_WHITE);
+}
+
 // ================================================================
 //  SHARED
 // ================================================================
@@ -2701,6 +2868,8 @@ static const char* bestKey(int g) {
     case G_CAR:   return "bCar";
     case G_CATCH: return "bCatch";
     case G_PONG:  return "bPong";
+    case G_ECHO:  return "bEcho";
+    case G_MAZE:  return "bMaze";
     default:      return "bRoll";
   }
 }
@@ -2711,6 +2880,8 @@ static void gameReset(int g) {
     case G_CAR:   carReset(); break;
     case G_CATCH: ctReset(); break;
     case G_PONG:  pgReset(); break;
+    case G_ECHO:  ecReset(); break;
+    case G_MAZE:  mzReset(); break;
     default:      rlReset(); break;
   }
 }
@@ -2726,6 +2897,8 @@ static const char* gameHint(int g) {
     case G_CAR:   return "Tilt to change lane";
     case G_CATCH: return "Tilt to catch";
     case G_PONG:  return "Tilt to return it";
+    case G_ECHO:  return "Knock it back";
+    case G_MAZE:  return "Tilt to the star";
     default:      return "Tilt to roll it";
   }
 }
@@ -2802,10 +2975,15 @@ static void serviceGame() {
     case G_CAR:   gNext = now + 28;     carStep();  break;
     case G_CATCH: gNext = now + 28;     ctStep();   break;
     case G_PONG:  gNext = now + 26;     pgStep();   break;
+    case G_ECHO:  gNext = now + 40;     ecStep();   break;
+    case G_MAZE:  gNext = now + 30;     mzStep();   break;
     default:      gNext = now + 26;     rlStep();   break;
   }
 
-  if (gState == GS_OVER && gScore > gBest[which]) {
+  // Maze never ends, so waiting for game over would mean its best was
+  // never written down. A level takes long enough that saving one per
+  // level costs nothing.
+  if ((gState == GS_OVER || which == G_MAZE) && gScore > gBest[which]) {
     gBest[which] = gScore;
     prefs.putInt(bestKey(which), gScore);
   }
@@ -2858,6 +3036,23 @@ static void rollIcon(int x, int y) {
   oled.drawRect(x + 17, y + 17, 8, 8, SSD1306_WHITE);
   oled.fillRect(x + 19, y + 19, 4, 4, SSD1306_WHITE);
 }
+static void echoIcon(int x, int y) {
+  for (int i = 0; i < 3; i++) {
+    int cx = x + 6 + i * 9;
+    if (i == 1) oled.fillCircle(cx, y + 8, 4, SSD1306_WHITE);
+    else        oled.drawCircle(cx, y + 8, 4, SSD1306_WHITE);
+  }
+  for (int i = 0; i < 3; i++) oled.fillRect(x + 4 + i * 9, y + 18, 6, 5, SSD1306_WHITE);
+}
+static void mazeIcon(int x, int y) {
+  oled.drawRect(x + 2, y + 3, 27, 21, SSD1306_WHITE);
+  oled.drawFastVLine(x + 11, y + 3, 13, SSD1306_WHITE);
+  oled.drawFastVLine(x + 20, y + 11, 13, SSD1306_WHITE);
+  oled.drawFastHLine(x + 11, y + 11, 6, SSD1306_WHITE);
+  oled.fillCircle(x + 6, y + 8, 2, SSD1306_WHITE);
+  oled.drawFastHLine(x + 22, y + 7, 5, SSD1306_WHITE);
+  oled.drawFastVLine(x + 24, y + 5, 5, SSD1306_WHITE);
+}
 static void gameIcon(int g, int x, int y) {
   switch (g) {
     case G_SNAKE: snakeIcon(x, y); break;
@@ -2865,6 +3060,8 @@ static void gameIcon(int g, int x, int y) {
     case G_CAR:   carIcon(x, y);   break;
     case G_CATCH: catchIcon(x, y); break;
     case G_PONG:  pongIcon(x, y);  break;
+    case G_ECHO:  echoIcon(x, y);  break;
+    case G_MAZE:  mazeIcon(x, y);  break;
     default:      rollIcon(x, y);  break;
   }
 }
@@ -2943,6 +3140,8 @@ static void drawGamePlay() {
     case G_CAR:   snprintf(t, sizeof(t), "CAR");                break;
     case G_CATCH: snprintf(t, sizeof(t), "CATCH");              break;
     case G_PONG:  snprintf(t, sizeof(t), "PONG");               break;
+    case G_ECHO:  snprintf(t, sizeof(t), "ECHO");               break;
+    case G_MAZE:  snprintf(t, sizeof(t), "MAZE L%d", mzLevel); break;
     default:      snprintf(t, sizeof(t), "SNAKE");              break;
   }
   if (which == G_PONG) snprintf(r, sizeof(r), "%d-%d", pgMe, pgThem);
@@ -2966,6 +3165,8 @@ static void drawGamePlay() {
     case G_CAR:   carDraw(); break;
     case G_CATCH: ctDraw();  break;
     case G_PONG:  pgDraw();  break;
+    case G_ECHO:  ecDraw();  break;
+    case G_MAZE:  mzDraw();  break;
     default:      rlDraw();  break;
   }
   if (which == G_BRICK && brStuck && gState == GS_PLAY) ctr("Knock to launch", 44, 1);
@@ -4263,6 +4464,13 @@ static void knockOne() {
   if (canvasUntil) { canvasUntil = 0;    return; }
   if (toastUntil)  { toastUntil = 0; toastText = ""; toastKind = ""; return; }
   if (depth == 0) {
+    // Trying faces on holds the clock screen: single knocks walk the
+    // faces, not the screens, until you have kept one or put it back.
+    if (faceTrying) {
+      cfgFace = (cfgFace + 1) % FACE_N;
+      faceIdle = millis();
+      return;
+    }
     screen = (screen + 1) % S_COUNT;
     itemIdx = 0; subIdx = 0;
     return;
@@ -4345,7 +4553,20 @@ static void knockTwo() {
       case S_READS:    if (readCount) { depth = 1; itemIdx = 0; } else refillShelf(); break;
       case S_GAMES:    depth = 1; itemIdx = 0; navCalBegin(false); break;
       case S_SETTINGS: depth = 1; itemIdx = 0; break;
-      case S_HOME:     if (!timeOk) swStart = millis(); break;   // restart the stopwatch
+      case S_HOME:
+        // With no clock this screen is a stopwatch, and restarting it is
+        // the only useful thing a double knock can mean there.
+        if (!timeOk) { swStart = millis(); break; }
+        if (faceTrying) {                      // keep the one you are looking at
+          faceTrying = false;
+          prefs.putInt("face", cfgFace);
+          flash("KEPT", 900);
+        } else {
+          faceTrying = true;
+          faceWas = cfgFace;
+          faceIdle = millis();
+        }
+        break;
       case S_WEATHER:  nextWx = 0; break;
       case S_PRAYER:   nextPrayerTry = 0; break;
       default: break;
@@ -4458,6 +4679,15 @@ static void knockTwo() {
 }
 
 static void knockThree() {
+  // Out of trying faces first, and without keeping anything. Three
+  // knocks is the way back out of everywhere else, so it means the same
+  // here: whatever you were looking at is dropped.
+  if (faceTrying) {
+    faceTrying = false;
+    cfgFace = faceWas;
+    flash("PUT BACK", 900);
+    return;
+  }
   cTriple++;
   if (screen == S_FOCUS && (swOn || depth == 1)) {
     if (swOn) { swOn = false; depth = 0; return; }
@@ -4487,6 +4717,7 @@ static void knockThree() {
 
 static void knockFour() {
   cQuad++;
+  if (faceTrying) { faceTrying = false; cfgFace = faceWas; return; }
   // Ticking one off at the device, so the robot can change the list and
   // not only show it. Rafiq sees it on its next look.
   if (screen == S_FOCUS && depth == 1 && itemIdx < taskCount) {
@@ -4598,6 +4829,16 @@ static void settleBurst() {
   // window closing is what ends it.
   if (tapTesting && tapChosen) {
     Serial.printf("knock x%u counted, not obeyed (trying a strength)\n", n);
+    return;
+  }
+  // Echo is played by knocking, so in there a burst is the move and not
+  // a command. Taken here for the same reason as the line above: once a
+  // burst has been turned into next, open or back, the count is gone.
+  if (screen == S_GAMES && depth == 2 && itemIdx == G_ECHO &&
+      gState == GS_PLAY && !ecShow) {
+    ecKnock(n);
+    lastActive = millis();
+    Serial.printf("knock x%u -> echo\n", n);
     return;
   }
   if      (n == 1) knockOne();
@@ -6074,6 +6315,20 @@ void loop() {
   if (autoUpArmed && (upState == U_NONE || upState == U_FAIL)) {
     autoUpArmed = false;
     upState = U_OFF;                 // nothing found; say nothing
+  }
+
+  // Walked away mid try. Putting the old one back is the safe way to be
+  // wrong: leaving a face nobody chose is how you end up with a clock
+  // you do not recognise and no idea what changed it.
+  if (faceTrying && (now - faceIdle > FACE_TRY_MS)) {
+    faceTrying = false;
+    cfgFace = faceWas;
+  }
+  // Nothing else may hold the clock screen while faces are being tried
+  // on, or the strip would be drawn over something that is not a face.
+  if (faceTrying && (screen != S_HOME || depth != 0 || !timeOk)) {
+    faceTrying = false;
+    cfgFace = faceWas;
   }
 
   if (popupUntil && now > popupUntil) { popupUntil = 0; screen = S_HOME; depth = 0; }
