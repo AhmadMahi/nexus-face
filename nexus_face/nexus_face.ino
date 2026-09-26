@@ -48,7 +48,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.5.0"
+#define FW_VERSION "2.6.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -115,17 +115,31 @@ unsigned long zikrNext = 0;      // when the next count lands
 
 // ---------------- settings ----------------
 enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
-       C_PRAYER, C_HOTSPOT, C_ACCEL, C_PAIR, C_UPDATE, C_REBOOT, C_ABOUT, C_COUNT };
+       C_PRAYER, C_HOTSPOT, C_ACCEL, C_TAP, C_PAIR, C_UPDATE, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
-    "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Pair a Mac",
-    "Check update", "Reboot", "About" };
+    "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Tap strength",
+    "Pair a Mac", "Check update", "Reboot", "About" };
 
 // Zero is the dimmest the panel goes, not off: the SSD1306 still shows
 // faintly at contrast zero. After that, quarters.
 const int BRIGHT_OPTS[] = { 0, 64, 128, 191, 255 };
 const char* BRIGHT_NAME[] = { "dim", "25%", "50%", "75%", "100%" };
 const int BRIGHT_N = sizeof(BRIGHT_OPTS) / sizeof(BRIGHT_OPTS[0]);
+
+// ---------------- how hard a knock has to be ----------------
+//  THRESH_TAP on the ADXL345 counts in 62.5mg steps, so these are the
+//  force a knock has to reach before the chip calls it one. Lower means
+//  a lighter touch is enough. Medium is what every version so far has
+//  used, so it stays the default and nothing changes unless you say so.
+enum { TAP_ULTRA = 0, TAP_LIGHT, TAP_MED, TAP_HARD, TAP_N };
+const char*   TAP_NAME[TAP_N]   = { "ultra light", "light", "medium", "hard" };
+const uint8_t TAP_THRESH[TAP_N] = { 0x14, 0x1C, 0x28, 0x3C };   // 1.25g .. 3.75g
+int  cfgTap  = TAP_MED;
+int  tapPick = TAP_MED;              // what is highlighted while choosing
+bool tapTesting = false;
+uint32_t tapSeen = 0;                // knocks counted while testing
+unsigned long tapLastSeen = 0;
 
 // ---------------- watch faces ----------------
 //  Six laid out by hand, two that lean with the device, and two with
@@ -274,9 +288,23 @@ unsigned long nextRefill = 0;
 unsigned long nextStory = 0;
 #define READING_SLEEP_SEC 180          // a long fuse while you are reading
 
+// ---------------- the clock that is not set yet ----------------
+//  Home used to turn into a stopwatch whenever the time was unknown,
+//  which is how the stopwatch ended up running whether or not anyone
+//  had asked for one. Home stays home now, and says something rather
+//  than showing a clock with nothing in it.
+const char* IDLE_LINES[] = {
+  "Knock to begin",   "Everything still works",  "Reads, faith, games",
+  "No network needed", "Knock twice for more",   "Still here" };
+const int IDLE_N = sizeof(IDLE_LINES) / sizeof(IDLE_LINES[0]);
+
+// ---------------- the stopwatch ----------------
+//  Something you pick now, rather than something home became.
+bool swOn = false;
+
 // ---------------- work session ----------------
-#define TASK_MAX 8
-struct Task { String name; int mins; };
+#define TASK_MAX 12
+struct Task { String name; int mins; bool done; };
 Task tasks[TASK_MAX];
 int  taskCount = 0;
 int  taskIdx   = -1;
@@ -470,6 +498,14 @@ static void startSensors() {
 // alarm while leaning was switched on, because a hand turning the thing
 // over unloads it constantly and tripped it. With leaning gone it sits on
 // a desk, where a genuine unloading means it is falling.
+// Writing the threshold is all it takes; the chip does the rest.
+static void applyTapLevel(int lvl) {
+  if (!adxl) return;
+  wReg(adxl, A_THRESH_TAP, TAP_THRESH[constrain(lvl, 0, TAP_N - 1)]);
+  rReg(adxl, A_INT_SOURCE);            // drop anything the change stirred up
+}
+static void applyTap() { applyTapLevel(cfgTap); }
+
 static void applyFallInt() {
   if (!adxl) return;
   wReg(adxl, A_INT_ENABLE, (uint8_t)(INT_TAP1 | INT_FF));
@@ -896,20 +932,29 @@ static void faceFill(bool wavy) {
   invertUnder(topAt);
 }
 
+// A little mast with its signal struck through: enough to read as
+// "no network" without a word for it.
+static void offlineIcon(int x, int y) {
+  oled.drawFastVLine(x + 3, y + 1, 6, SSD1306_WHITE);
+  oled.drawFastHLine(x + 1, y + 7, 5, SSD1306_WHITE);
+  oled.drawPixel(x + 1, y + 2, SSD1306_WHITE);
+  oled.drawPixel(x + 5, y + 2, SSD1306_WHITE);
+  for (int i = 0; i < 8; i++) oled.drawPixel(x - 1 + i, y + i, SSD1306_WHITE);
+}
+
 static void drawHome() {
   oled.clearDisplay();
   loadBits();
 
-  if (!fb.ok) {                          // no clock yet, so it counts instead
-    char e[14];
-    swStr(e, sizeof(e));
-    ctr("STOPWATCH", 6, 1);
-    int sz = strlen(e) > 5 ? 2 : 3;
-    oled.setTextSize(sz);
-    oled.setCursor((SCRW - (int)strlen(e) * 6 * sz) / 2, sz == 3 ? 20 : 24);
-    oled.print(e);
-    oled.drawFastHLine(22, 46, SCRW - 44, SSD1306_WHITE);
-    ctr("Two knocks to reset", 52, 1);
+  // No clock yet. This used to become a stopwatch, which is why one was
+  // always running whether or not anyone wanted it. Home stays home, and
+  // says something rather than showing an empty clock.
+  if (!fb.ok) {
+    offlineIcon(6, 3);
+    at(18, 4, "OFFLINE MODE");
+    robotHead(SCRW / 2, 37, true);        // 23px of aerial clears the title
+    // a different line every eight seconds, so it is never a dead panel
+    ctr(IDLE_LINES[(millis() / 8000UL) % IDLE_N], 55, 1);
     oled.display();
     return;
   }
@@ -1266,6 +1311,8 @@ static void drawSystem() {
 
 // ---- the work session ----
 static void drawFocus() {
+  if (swOn)      { drawStopwatch(); return; }
+  if (depth == 1) { drawFocusList(); return; }
   oled.clearDisplay();
 
   if (millis() < flashUntil) {
@@ -1284,13 +1331,15 @@ static void drawFocus() {
     bar("FOCUS");
     if (taskCount) {
       char l[26];
-      snprintf(l, sizeof(l), "%d ready to run", taskCount);
+      int left = 0;
+      for (int i = 0; i < taskCount; i++) if (!tasks[i].done) left++;
+      snprintf(l, sizeof(l), "%d still to do", left);
       ctr(l, 24, 1);
-      ctr("Start it on the page", 42, 1);
+      ctr("Two knocks to see", 42, 1);
     } else {
-      ctr("Nothing planned", 24, 1);
-      ctr("A clear desk is a", 40, 1);
-      ctr("good place to begin", 50, 1);
+      ctr("Nothing planned", 22, 1);
+      ctr("Two knocks for the", 38, 1);
+      ctr("stopwatch", 48, 1);
     }
     oled.display();
     return;
@@ -1346,6 +1395,68 @@ static void drawFocus() {
   fill = constrain(fill, 0, RW);
   oled.drawFastHLine(RX, 57, RW, SSD1306_WHITE);
   if (fill > 0) oled.fillRect(RX, 55, fill, 4, SSD1306_WHITE);
+  oled.display();
+}
+
+// ================================================================
+//  WHAT THERE IS TO DO
+// ================================================================
+//  The list lives here rather than on its own screen, because this is
+//  where you come to start something. The stopwatch sits at the end of
+//  it: it used to be what home turned into when the clock was unknown,
+//  which meant one was always running whether or not you wanted it.
+static int focusRows() { return taskCount + 1; }        // the tasks, then the stopwatch
+
+static void drawFocusList() {
+  oled.clearDisplay();
+  char r[12];
+  snprintf(r, sizeof(r), "%d/%d", itemIdx + 1, focusRows());
+  titleBar("TO DO", r);
+
+  int first = itemIdx > 3 ? itemIdx - 3 : 0;
+  if (first > focusRows() - 4) first = focusRows() - 4;
+  if (first < 0) first = 0;
+
+  for (int k = 0; k < 4 && first + k < focusRows(); k++) {
+    int i = first + k, y = 14 + k * 12;
+    bool on = (i == itemIdx);
+    if (on) { oled.fillRect(0, y - 2, SCRW, 12, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
+    else      oled.setTextColor(SSD1306_WHITE);
+
+    if (i == taskCount) {                       // the stopwatch, always last
+      at(4, y, "Stopwatch");
+      at(SCRW - 4 - 2 * 6, y, "go");
+    } else {
+      // a tick in front of anything already finished
+      if (tasks[i].done) {
+        int c = on ? SSD1306_BLACK : SSD1306_WHITE;
+        oled.drawLine(4, y + 4, 6, y + 6, c);
+        oled.drawLine(6, y + 6, 10, y + 1, c);
+      }
+      String nm = tasks[i].name;
+      if (nm.length() > 14) nm = nm.substring(0, 14);
+      at(13, y, nm.c_str());
+      char m[8];
+      snprintf(m, sizeof(m), "%dm", tasks[i].mins);
+      at(SCRW - 4 - (int)strlen(m) * 6, y, m);
+    }
+  }
+  oled.setTextColor(SSD1306_WHITE);
+  oled.display();
+}
+
+//  Counts up rather than down, and only when you have asked it to.
+static void drawStopwatch() {
+  oled.clearDisplay();
+  char e[14];
+  swStr(e, sizeof(e));
+  bar("STOPWATCH");
+  int sz = strlen(e) > 5 ? 2 : 3;
+  oled.setTextSize(sz);
+  oled.setCursor((SCRW - (int)strlen(e) * 6 * sz) / 2, sz == 3 ? 22 : 26);
+  oled.print(e);
+  oled.setTextSize(1);
+  ctr("2 restart   3 leave", 54, 1);
   oled.display();
 }
 
@@ -1626,6 +1737,67 @@ static void drawCanvas() {
   oled.display();
 }
 
+// ================================================================
+//  HOW HARD A KNOCK HAS TO BE
+// ================================================================
+//  Two things you can do here: try the strengths out, or pick one.
+//  Trying one out is the point, because how hard your desk needs to be
+//  hit depends on your desk, not on a number.
+static void drawTapMenu() {
+  oled.clearDisplay();
+  bar("TAP STRENGTH");
+  for (int i = 0; i < 2; i++) {
+    int cx = i ? 92 : 36;
+    bool on = (subIdx == i);
+    if (on) oled.drawRoundRect(cx - 27, 16, 54, 34, 5, SSD1306_WHITE);
+    if (i == 0) knockIcon(cx, 28);               // try one out
+    else        gearIcon(cx, 28, 9);             // pick one
+    at(cx - (i ? 9 : 9), 40, i ? "set" : "try");
+  }
+  char v[22];
+  snprintf(v, sizeof(v), "now: %s", TAP_NAME[cfgTap]);
+  ctr(v, 54, 1);
+  oled.display();
+}
+
+//  Knock at it and watch. The count is what the chip reported, and the
+//  number beside it is how hard the last shove actually was, so a
+//  strength that never registers is obvious rather than mysterious.
+static void drawTapTest() {
+  oled.clearDisplay();
+  titleBar("TRY IT", TAP_NAME[tapPick]);
+
+  char c[18];
+  snprintf(c, sizeof(c), "%lu", (unsigned long)tapSeen);
+  oled.setTextSize(3);
+  oled.setCursor((SCRW - (int)strlen(c) * 18) / 2, 16);
+  oled.print(c);
+  oled.setTextSize(1);
+  ctr(tapSeen ? "knocks heard" : "knock at it", 42, 1);
+
+  // the last jolt, so you can see what did and did not count
+  char g[24];
+  snprintf(g, sizeof(g), "jolt %.2fg", fabsf(amag - 1.0f));
+  at(3, 54, g);
+  at(SCRW - 3 - 11 * 6, 54, "1 next  3 out");
+  oled.display();
+}
+
+static void drawTapSet() {
+  oled.clearDisplay();
+  bar("SET STRENGTH");
+  for (int i = 0; i < TAP_N; i++) {
+    int y = 14 + i * 11;
+    bool on = (i == tapPick);
+    if (on) { oled.fillRect(0, y - 2, SCRW, 11, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
+    else      oled.setTextColor(SSD1306_WHITE);
+    at(4, y, TAP_NAME[i]);
+    if (i == cfgTap) at(SCRW - 4 - 3 * 6, y, "now");
+  }
+  oled.setTextColor(SSD1306_WHITE);
+  oled.display();
+}
+
 static void drawSettings() {
   oled.clearDisplay();
   if (depth == 0) {
@@ -1638,6 +1810,11 @@ static void drawSettings() {
   if (depth == 2 && itemIdx == C_ABOUT) { drawAbout(); return; }
   if (depth == 2 && itemIdx == C_ACCEL) { drawAccel(); return; }
   if (depth == 2 && itemIdx == C_PAIR)  { drawPair();  return; }
+  if (itemIdx == C_TAP && depth >= 2) {
+    if (depth == 2) { drawTapMenu(); return; }
+    if (subIdx == 0) { drawTapTest(); return; }
+    drawTapSet(); return;
+  }
   bar(depth == 2 ? "CHANGE" : "SETTINGS");
 
   char v[18];
@@ -1658,6 +1835,7 @@ static void drawSettings() {
       case C_PRAYER: snprintf(v, sizeof(v), "%s", prayerOk ? "saved" : "none"); break;
       case C_ACCEL:  snprintf(v, sizeof(v), "x2"); break;
       case C_PAIR:   snprintf(v, sizeof(v), "%s", cfgLock ? "paired" : "x2"); break;
+      case C_TAP:    snprintf(v, sizeof(v), "%s", TAP_NAME[cfgTap]); break;
       case C_ABOUT:  snprintf(v, sizeof(v), "x2"); break;
       case C_SLEEP:  if (!sleepSecs())         snprintf(v, sizeof(v), "never");
                      else if (sleepSecs() < 60) snprintf(v, sizeof(v), "%ds", sleepSecs());
@@ -3232,7 +3410,7 @@ static void saveTasks() {
   for (int i = 0; i < taskCount; i++) {
     String n = tasks[i].name;
     n.replace("|", " "); n.replace(";", " ");
-    out += n + "|" + String(tasks[i].mins);
+    out += n + "|" + String(tasks[i].mins) + "|" + (tasks[i].done ? "1" : "0");
     if (i < taskCount - 1) out += ";";
   }
   prefs.putString("plan", out);
@@ -3247,7 +3425,12 @@ static void loadTasks() {
     int barp = part.indexOf('|');
     if (barp > 0) {
       tasks[taskCount].name = part.substring(0, barp);
-      tasks[taskCount].mins = constrain(part.substring(barp + 1).toInt(), 1, 240);
+      String rest = part.substring(barp + 1);
+      int bar2 = rest.indexOf('|');
+      // A plan saved before ticking off existed has no third field, and
+      // has to keep loading rather than vanishing.
+      tasks[taskCount].mins = constrain((bar2 > 0 ? rest.substring(0, bar2) : rest).toInt(), 1, 240);
+      tasks[taskCount].done = bar2 > 0 && rest.substring(bar2 + 1).toInt() != 0;
       taskCount++;
     }
     i = semi + 1;
@@ -3799,6 +3982,10 @@ static void knockOne() {
     itemIdx = 0; subIdx = 0;
     return;
   }
+  if (screen == S_FOCUS) {
+    if (swOn) return;                          // it is just counting; leave it be
+    if (depth == 1) { itemIdx = (itemIdx + 1) % focusRows(); return; }
+  }
   if (screen == S_READS) {
     if (depth == 1) { if (readCount) itemIdx = (itemIdx + 1) % readCount; return; }
     nextPage();
@@ -3817,6 +4004,14 @@ static void knockOne() {
       return;
     }
     nextPage();
+    return;
+  }
+  if (screen == S_SETTINGS && itemIdx == C_TAP && depth >= 2) {
+    if (depth == 2) { subIdx = (subIdx + 1) % 2; return; }
+    // Stepping through strengths applies each one as you go, so the very
+    // next knock is judged by the one you are looking at.
+    tapPick = (tapPick + 1) % TAP_N;
+    if (subIdx == 0) { applyTapLevel(tapPick); tapSeen = 0; }
     return;
   }
   if (screen == S_GAMES) {
@@ -3856,6 +4051,10 @@ static void knockTwo() {
   }
   if (depth == 0) {
     switch (screen) {
+      case S_FOCUS:
+        if (swOn) { swStart = millis(); break; }      // restart it
+        depth = 1; itemIdx = 0;
+        break;
       case S_FAITH:    depth = 1; itemIdx = 0; subIdx = 0; break;
       case S_READS:    if (readCount) { depth = 1; itemIdx = 0; } else refillShelf(); break;
       case S_GAMES:    depth = 1; itemIdx = 0; navCalBegin(false); break;
@@ -3898,6 +4097,34 @@ static void knockTwo() {
     if (gState == GS_PAUSE) { gState = GS_PLAY; gNext = millis(); return; }
     return;
   }
+  if (screen == S_FOCUS && depth == 1) {
+    if (itemIdx == taskCount) {                 // the stopwatch
+      swOn = true; swStart = millis(); depth = 0;
+      return;
+    }
+    if (itemIdx < taskCount) {                  // run just this one
+      startTask(itemIdx);
+      depth = 0;
+    }
+    return;
+  }
+  if (screen == S_SETTINGS && itemIdx == C_TAP && depth >= 2) {
+    if (depth == 2) {
+      depth = 3;
+      tapPick = cfgTap;
+      tapSeen = 0; tapLastSeen = millis();
+      if (subIdx == 0) { tapTesting = true; applyTapLevel(tapPick); }
+      return;
+    }
+    if (subIdx == 1) {                       // choosing, so this commits
+      cfgTap = tapPick;
+      prefs.putInt("tap", cfgTap);
+      applyTap();
+      flash("SET", 900);
+      depth = 2;
+    }
+    return;
+  }
   if (screen == S_SETTINGS && depth == 1) {
     switch (itemIdx) {
       case C_REBOOT:  delay(150); ESP.restart(); break;
@@ -3915,6 +4142,20 @@ static void knockTwo() {
 
 static void knockThree() {
   cTriple++;
+  if (screen == S_FOCUS && (swOn || depth == 1)) {
+    if (swOn) { swOn = false; depth = 0; return; }
+    depth = 0; itemIdx = 0;
+    return;
+  }
+  if (screen == S_SETTINGS && itemIdx == C_TAP && depth >= 2) {
+    if (depth == 3) {
+      // whatever was being tried is dropped; only Set ever commits
+      tapTesting = false;
+      applyTap();
+      depth = 2;
+    } else depth = 1;
+    return;
+  }
   if (inReader()) { depth = 0; itemIdx = 0; subIdx = 0; return; }
   if (depth > 0) {
     depth--;
@@ -3926,6 +4167,14 @@ static void knockThree() {
 
 static void knockFour() {
   cQuad++;
+  // Ticking one off at the device, so the robot can change the list and
+  // not only show it. Rafiq sees it on its next look.
+  if (screen == S_FOCUS && depth == 1 && itemIdx < taskCount) {
+    tasks[itemIdx].done = !tasks[itemIdx].done;
+    saveTasks();
+    flash(tasks[itemIdx].done ? "DONE" : "BACK ON", 900);
+    return;
+  }
   if (screen == S_GAMES && depth == 2) { gameStart(itemIdx); return; }
   if (screen == S_GAMES && depth == 1) {          // forget how it was taught to tilt
     mapAxX = mapAxY = -1;
@@ -4043,6 +4292,7 @@ static void input() {
       wake("fall"); onFall(); return;
     }
     if (s & INT_TAP1) {
+      if (tapTesting) { tapSeen++; tapLastSeen = now; }
       wake("knock");
       if (!burst) burstStart = now;
       if (burst < 4) burst++;
@@ -4440,7 +4690,8 @@ static void apiState() {
   for (int i = 0; i < taskCount; i++) {
     String nm = tasks[i].name; nm.replace("\\", " "); nm.replace("\"", "'");
     o += "{\"name\":\"" + nm + "\",\"mins\":" + String(tasks[i].mins) +
-         ",\"brk\":" + String(isBreak(tasks[i].name) ? "true" : "false") + "}";
+         ",\"brk\":" + String(isBreak(tasks[i].name) ? "true" : "false") +
+         ",\"done\":" + String(tasks[i].done ? "true" : "false") + "}";
     if (i < taskCount - 1) o += ",";
   }
   o += "],";
@@ -4497,6 +4748,9 @@ static void apiState() {
   o += "\"paired\":" + String(cfgLock ? "true" : "false") + ",";
   o += "\"linked\":" + String(macLinked ? "true" : "false") + ",";
   o += "\"follow\":" + String(cfgFollow ? "true" : "false") + ",";
+  o += "\"tap\":" + String(cfgTap) + ",";
+  o += "\"swOn\":" + String(swOn ? "true" : "false") + ",";
+  o += "\"tapName\":\"" + String(TAP_NAME[cfgTap]) + "\",";
   o += "\"relax\":" + String(relaxOn ? "true" : "false") + ",";
   o += "\"webui\":" + String(webUiOn ? "true" : "false") + ",";
   o += "\"dndLeft\":" + String(dndUntil && millis() < dndUntil
@@ -4640,6 +4894,15 @@ static void setupWeb() {
     busyCam = c; busyMic = m;
     okJson();
   });
+  // How hard a knock has to be. Set from the app or the page, so a
+  // strength too heavy to knock through is never a device you have lost.
+  web.on("/api/tap", HTTP_POST, []() {
+    if (!guard()) return;
+    cfgTap = constrain((int)web.arg("n").toInt(), 0, TAP_N - 1);
+    prefs.putInt("tap", cfgTap);
+    applyTap();
+    okJson();
+  });
   web.on("/api/webui", HTTP_POST, []() {
     if (!guard()) return;
     webUiOn = web.arg("a").toInt() != 0;
@@ -4716,12 +4979,19 @@ static void setupWeb() {
         if (taskIdx >= taskCount) stopSession();
         saveTasks();
       }
+    } else if (web.hasArg("done")) {
+      int d = web.arg("done").toInt();
+      if (d >= 0 && d < taskCount) {
+        tasks[d].done = web.arg("v").toInt() != 0;
+        saveTasks();
+      }
     } else {
       String n = web.arg("name"); n.trim();
       int m = constrain((int)web.arg("mins").toInt(), 1, 240);
       if (n.length() && taskCount < TASK_MAX) {
         tasks[taskCount].name = n.substring(0, 40);
         tasks[taskCount].mins = m;
+        tasks[taskCount].done = false;
         taskCount++;
         saveTasks();
       }
@@ -5066,6 +5336,7 @@ void setup() {
   cfgTok      = prefs.getString("tok", "");
   cfgLock     = prefs.getBool("lock", false) && cfgTok.length();
   cfgFollow   = prefs.getBool("follow", false);
+  cfgTap      = constrain(prefs.getInt("tap", TAP_MED), 0, TAP_N - 1);
   cfgTz       = prefs.getString("tz", DEF_TZ);
   cfgSsid     = prefs.getString("ssid", "");
   cfgPass     = prefs.getString("pass", "");
@@ -5111,6 +5382,7 @@ void setup() {
   animWake();
   startSensors();
   applyFallInt();
+  applyTap();
   animSenses(1500);
 
   WiFi.mode(WIFI_STA);
@@ -5257,6 +5529,20 @@ void loop() {
 
   if (popupUntil && now > popupUntil) { popupUntil = 0; screen = S_HOME; depth = 0; }
 
+  // Trying a strength out that turns out to be too heavy for your desk
+  // would otherwise leave you unable to knock your way back out of the
+  // very screen testing it. Half a minute without a knock landing and it
+  // lets itself out, putting back whatever was set before.
+  if (tapTesting) {
+    lastActive = now;
+    if (now - tapLastSeen > 30000UL) {
+      tapTesting = false;
+      applyTap();
+      depth = 2;
+      flash("PUT BACK", 1200);
+    }
+  }
+
   // Focus used to hold the panel lit for the whole run, which is the
   // one reliable way to burn a countdown into an OLED. It now shows
   // for twelve seconds, goes dark for ten, and every third time comes
@@ -5265,8 +5551,13 @@ void loop() {
   // straight back.
   if (sessionRunning() || millis() < flashUntil) {
     lastActive = now;
-    screen = S_FOCUS; depth = 0;
-    if (millis() < flashUntil) {
+    screen = S_FOCUS;
+    // Browsing the list while something is running is allowed; only the
+    // countdown itself owns depth zero.
+    if (depth > 1) depth = 0;
+    if (depth == 1) {
+      fzPhase = FZ_SHOW; screenPower(true);      // you are reading it
+    } else if (millis() < flashUntil) {
       fzPhase = FZ_SHOW; screenPower(true);      // the end is worth looking at
     } else if ((long)(now - fzNext) >= 0) {
       if (fzPhase == FZ_DARK) {
@@ -5290,8 +5581,9 @@ void loop() {
   }
 
   // depth only means something on the three screens that have one
+  if (swOn) { lastActive = now; screen = S_FOCUS; }
   if (screen != S_FAITH && screen != S_READS && screen != S_GAMES &&
-      screen != S_SETTINGS && depth) {
+      screen != S_FOCUS && screen != S_SETTINGS && depth) {
     depth = 0; itemIdx = 0; subIdx = 0;
   }
 
