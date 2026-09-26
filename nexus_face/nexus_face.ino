@@ -59,7 +59,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.7.0"
+#define FW_VERSION "2.8.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -228,6 +228,25 @@ bool navLatch = false;
 unsigned long upSince = 0;
 bool upConsumed = false;
 String cfgSsid, cfgPass, cfgTz, cfgKey;
+
+// ---------------- the networks it knows ----------------
+//  Home, a phone hotspot, wherever else. It works down the list until
+//  one answers and stays there, and starts down it again if that one
+//  goes away.
+//
+//  Fixed buffers rather than Strings, because the network task reads
+//  these while the panel and the app can be writing them. A String moves
+//  in memory when it is reassigned and the reader follows the stale
+//  pointer, which is the same trap wCity was in. 32 and 63 characters
+//  are the most a name and a passphrase can be anyway.
+#define NET_MAX 5
+char netSsid[NET_MAX][33];
+char netPass[NET_MAX][65];
+int  netCount  = 0;
+int  netUsing  = -1;                 // which one answered
+int  netTrying = 0;                  // where the walk has got to
+unsigned long netNextTry = 0;
+volatile bool netReload = false;     // the app changed the list
 int sleepSecs() { return SLEEP_OPTS[cfgSleepIdx]; }
 int popupSecs() { return POPUP_OPTS[cfgPopupIdx]; }
 #define AUTO_TURN_MS 9000
@@ -3835,6 +3854,52 @@ static void goSleep() {
 // processor that is switched off can set an alarm and still speak up.
 // The times are already in flash and the clock survives being switched
 // off, so none of this needs the network.
+// Slot zero keeps the old ssid and pass keys, so a device that has been
+// running for months comes back up on the network it already knows and
+// only then notices it can hold four more.
+static void loadNets() {
+  netCount = 0;
+  for (int i = 0; i < NET_MAX; i++) {
+    String sk = i ? ("ssid" + String(i)) : String("ssid");
+    String pk = i ? ("pass" + String(i)) : String("pass");
+    String sv = prefs.getString(sk.c_str(), "");
+    if (!sv.length()) continue;
+    strncpy(netSsid[netCount], sv.c_str(), 32);          netSsid[netCount][32] = 0;
+    String pv = prefs.getString(pk.c_str(), "");
+    strncpy(netPass[netCount], pv.c_str(), 64);          netPass[netCount][64] = 0;
+    netCount++;
+  }
+}
+
+static void saveNets() {
+  for (int i = 0; i < NET_MAX; i++) {
+    String sk = i ? ("ssid" + String(i)) : String("ssid");
+    String pk = i ? ("pass" + String(i)) : String("pass");
+    if (i < netCount) {
+      prefs.putString(sk.c_str(), String(netSsid[i]));
+      prefs.putString(pk.c_str(), String(netPass[i]));
+    } else {
+      prefs.remove(sk.c_str());
+      prefs.remove(pk.c_str());
+    }
+  }
+}
+
+// One attempt at one network. Called from the network task, so the wait
+// costs the screen nothing.
+static bool joinOne(int i, int ms) {
+  if (i < 0 || i >= netCount || !netSsid[i][0]) return false;
+  WiFi.begin(netSsid[i], netPass[i]);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < (unsigned long)ms)
+    vTaskDelay(pdMS_TO_TICKS(100));
+  if (WiFi.status() != WL_CONNECTED) return false;
+  netUsing = i;
+  cfgSsid = String(netSsid[i]);
+  Serial.printf("on %s\n", netSsid[i]);
+  return true;
+}
+
 static long secsToNextAlert() {
   struct tm t;
   if (!prayerOk || !timeOk || !getLocalTime(&t, 0)) return -1;
@@ -4908,6 +4973,14 @@ static void apiState() {
   o += "\"tap\":" + String(cfgTap) + ",";
   o += "\"swOn\":" + String(swOn ? "true" : "false") + ",";
   o += "\"intWired\":" + String(intWired ? "true" : "false") + ",";
+  o += "\"nets\":[";
+  for (int i = 0; i < netCount; i++) {
+    String nm = String(netSsid[i]); nm.replace("\\", " "); nm.replace("\"", "'");
+    o += "{\"ssid\":\"" + nm + "\",\"on\":" + String(i == netUsing ? "true" : "false") + "}";
+    if (i < netCount - 1) o += ",";
+  }
+  o += "],";
+  o += "\"netMax\":" + String(NET_MAX) + ",";
   o += "\"deepOff\":" + String(deepOff ? "true" : "false") + ",";
   o += "\"tapName\":\"" + String(TAP_NAME[cfgTap]) + "\",";
   o += "\"relax\":" + String(relaxOn ? "true" : "false") + ",";
@@ -5063,6 +5136,57 @@ static void setupWeb() {
     okJson();
   });
   // Switching off altogether, and the way to stop it doing so.
+  // Adding, removing and reordering the networks it knows.
+  //
+  // Passwords only ever travel in this direction. Nothing here or in the
+  // state report ever sends one back out, so a paired app can set one
+  // and still cannot read the others.
+  web.on("/api/net", HTTP_POST, []() {
+    if (!guard()) return;
+    if (web.hasArg("del")) {
+      int d = web.arg("del").toInt();
+      if (d >= 0 && d < netCount) {
+        for (int i = d; i < netCount - 1; i++) {
+          strncpy(netSsid[i], netSsid[i + 1], 33);
+          strncpy(netPass[i], netPass[i + 1], 65);
+        }
+        netCount--;
+        netSsid[netCount][0] = netPass[netCount][0] = 0;
+        saveNets();
+        netReload = true;
+      }
+    } else if (web.hasArg("up")) {           // move one nearer the front
+      int u = web.arg("up").toInt();
+      if (u > 0 && u < netCount) {
+        char ts[33], tp[65];
+        strncpy(ts, netSsid[u], 33); strncpy(tp, netPass[u], 65);
+        strncpy(netSsid[u], netSsid[u - 1], 33); strncpy(netPass[u], netPass[u - 1], 65);
+        strncpy(netSsid[u - 1], ts, 33); strncpy(netPass[u - 1], tp, 65);
+        saveNets();
+        netReload = true;
+      }
+    } else {
+      String ss = web.arg("ssid"); ss.trim();
+      if (!ss.length()) { web.send(400, "application/json", "{\"ok\":false}"); return; }
+      // a name already on the list is an edit, not another copy of it
+      int at = -1;
+      for (int i = 0; i < netCount; i++) if (ss == netSsid[i]) { at = i; break; }
+      if (at < 0) {
+        if (netCount >= NET_MAX) {
+          web.send(409, "application/json", "{\"ok\":false,\"err\":\"full\"}");
+          return;
+        }
+        at = netCount++;
+      }
+      strncpy(netSsid[at], ss.c_str(), 32); netSsid[at][32] = 0;
+      if (web.hasArg("pass")) {
+        strncpy(netPass[at], web.arg("pass").c_str(), 64); netPass[at][64] = 0;
+      }
+      saveNets();
+      netReload = true;
+    }
+    okJson();
+  });
   web.on("/api/deep", HTTP_POST, []() {
     if (!guard()) return;
     deepOff = web.arg("off").toInt() != 0;
@@ -5480,8 +5604,20 @@ static void offlineWelcome() {
 //  for the two of them to disagree about.
 static void netLoop(void*) {
   for (;;) {
+    if (netReload) {                    // the app changed the list
+      netReload = false;
+      loadNets();
+      netNextTry = 0;
+    }
     if (!online()) {
       wantTime = wantWx = wantPrayerNow = false;
+      netUsing = -1;
+      // Try the next one, then the next. Waiting here costs the screen
+      // nothing, which is the whole reason this task exists.
+      if (netCount && !rescueAP && (long)(millis() - netNextTry) >= 0) {
+        netTrying = (netTrying + 1) % netCount;
+        if (!joinOne(netTrying, 7000)) netNextTry = millis() + 4000;
+      }
     } else {
       if (wantTime)      { wantTime = false;      trySyncTime(1500); }
       if (wantWx)        { wantWx = false;        fetchWeather(); }
@@ -5577,14 +5713,19 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  if (cfgSsid.length()) {
-    WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+  loadNets();
+  // Work down the list. Whichever answers first is the one it stays on,
+  // so put the one you are usually near at the top.
+  for (int i = 0; i < netCount && !online(); i++) {
+    WiFi.begin(netSsid[i], netPass[i]);
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 14000) {
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 7000) {
       animWifiFrame();
       delay(40);
     }
+    if (online()) { netUsing = i; cfgSsid = String(netSsid[i]); }
   }
+  netTrying = netUsing < 0 ? 0 : netUsing;
 
   setupWeb();
 
