@@ -44,11 +44,22 @@
 
 #define SDA_PIN 8
 #define SCL_PIN 9
+
+// The accelerometer's INT1 line. Wire it to this pin and the robot can
+// sleep properly: the chip watches for movement by itself and pulls the
+// line high, which is the only thing that can wake a processor that has
+// been switched off. Leave it unwired and everything still works, it
+// simply never goes deeper than a dark screen. It is found at boot
+// rather than assumed, so one unit having the wire and another not is
+// not something you have to keep track of.
+//
+// GPIO4 because the C3 can only wake on 0 to 5, and 2 is a strapping pin.
+#define TAP_INT_PIN 4
 #define OLED_ADDR 0x3C
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.6.0"
+#define FW_VERSION "2.7.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -66,6 +77,11 @@ Preferences prefs;
 // ---------------- sensors ----------------
 #define A_DEVID 0x00
 #define A_THRESH_TAP 0x1D
+#define A_THRESH_ACT 0x24
+#define A_ACT_INACT_CTL 0x27
+#define A_INT_MAP 0x2F
+#define INT_ACT 0x10
+#define INT_DATARDY 0x80
 #define A_THRESH_FF 0x28
 #define A_TIME_FF 0x29
 #define A_DUR 0x21
@@ -138,6 +154,13 @@ const uint8_t TAP_THRESH[TAP_N] = { 0x14, 0x1C, 0x28, 0x3C };   // 1.25g .. 3.75
 int  cfgTap  = TAP_MED;
 int  tapPick = TAP_MED;              // what is highlighted while choosing
 bool tapTesting = false;
+bool tapChosen = false;              // past the list, actually knocking at one
+// A little rolling trace of how hard the last few shoves were, so you
+// can see the one that did not count as well as the ones that did.
+#define TAP_TRACE 24
+uint8_t tapTrace[TAP_TRACE];
+int  tapTraceAt = 0;
+unsigned long tapTraceNext = 0;
 uint32_t tapSeen = 0;                // knocks counted while testing
 unsigned long tapLastSeen = 0;
 
@@ -411,6 +434,15 @@ bool webUiOn = true;
 unsigned long webOffAt = 0;
 #define WEBUI_RETURN_MS 900000UL
 
+// ---------------- sleeping properly ----------------
+//  A dark screen is not sleep: the processor is still running flat out
+//  with the radio up. After a while with nobody about and no Mac
+//  listening, it can switch off altogether and wait to be picked up.
+bool intWired = false;               // is INT1 actually connected?
+bool deepOff = false;                // switched off in settings
+unsigned long sleptAt = 0;           // when the screen went dark
+#define DEEP_AFTER_MS (7UL * 60000UL)
+
 // ---------------- runtime ----------------
 bool asleep = false, screenOn = true, timeOk = false, rescueAP = false, fsOk = false;
 unsigned long lastActive = 0, lastDraw = 0, lastPoll = 0, reactUntil = 0, lastShake = 0;
@@ -499,6 +531,30 @@ static void startSensors() {
 // over unloads it constantly and tripped it. With leaning gone it sits on
 // a desk, where a genuine unloading means it is falling.
 // Writing the threshold is all it takes; the chip does the rest.
+// Is the interrupt line actually there?
+//
+// Asked rather than assumed, so a unit built without the wire behaves
+// sensibly instead of going to sleep and never waking up. Data ready
+// fires continuously at the output rate, so routing it to INT1 and
+// looking at the pin is a reliable question: connected, it sits high;
+// unconnected, the pull down holds it low.
+static bool probeIntPin() {
+  if (!adxl) return false;
+  pinMode(TAP_INT_PIN, INPUT_PULLDOWN);
+  uint8_t keepEn = rReg(adxl, A_INT_ENABLE);
+  uint8_t keepMap = rReg(adxl, A_INT_MAP);
+  wReg(adxl, A_INT_MAP, 0x00);            // everything out of INT1
+  wReg(adxl, A_INT_ENABLE, INT_DATARDY);
+  delay(30);
+  int high = 0;
+  for (int i = 0; i < 12; i++) { if (digitalRead(TAP_INT_PIN)) high++; delay(4); }
+  wReg(adxl, A_INT_ENABLE, keepEn);
+  wReg(adxl, A_INT_MAP, keepMap);
+  rReg(adxl, A_INT_SOURCE);
+  // a floating pin would not read high this consistently
+  return high >= 9;
+}
+
 static void applyTapLevel(int lvl) {
   if (!adxl) return;
   wReg(adxl, A_THRESH_TAP, TAP_THRESH[constrain(lvl, 0, TAP_N - 1)]);
@@ -1763,23 +1819,50 @@ static void drawTapMenu() {
 //  Knock at it and watch. The count is what the chip reported, and the
 //  number beside it is how hard the last shove actually was, so a
 //  strength that never registers is obvious rather than mysterious.
+//  Which one to try. Knock through them, two knocks to go and hit it.
+static void drawTapTry() {
+  oled.clearDisplay();
+  bar("TRY WHICH ONE");
+  for (int i = 0; i < TAP_N; i++) {
+    int y = 14 + i * 11;
+    bool on = (i == tapPick);
+    if (on) { oled.fillRect(0, y - 2, SCRW, 11, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
+    else      oled.setTextColor(SSD1306_WHITE);
+    at(4, y, TAP_NAME[i]);
+    if (i == cfgTap) at(SCRW - 4 - 3 * 6, y, "now");
+  }
+  oled.setTextColor(SSD1306_WHITE);
+  oled.display();
+}
+
+//  Knock at it and watch. Single knocks are the thing being tested and
+//  do nothing else; two knocks is the way back, so a strength you can
+//  barely register is still one you can leave.
 static void drawTapTest() {
   oled.clearDisplay();
-  titleBar("TRY IT", TAP_NAME[tapPick]);
+  titleBar("KNOCK AT IT", TAP_NAME[tapPick]);
 
-  char c[18];
+  char c[10];
   snprintf(c, sizeof(c), "%lu", (unsigned long)tapSeen);
   oled.setTextSize(3);
-  oled.setCursor((SCRW - (int)strlen(c) * 18) / 2, 16);
+  oled.setCursor(6, 22);
   oled.print(c);
   oled.setTextSize(1);
-  ctr(tapSeen ? "knocks heard" : "knock at it", 42, 1);
 
-  // the last jolt, so you can see what did and did not count
-  char g[24];
-  snprintf(g, sizeof(g), "jolt %.2fg", fabsf(amag - 1.0f));
-  at(3, 54, g);
-  at(SCRW - 3 - 11 * 6, 54, "1 next  3 out");
+  // The trace lives in its own column on the right, and is kept clear of
+  // both the label above it and the line along the bottom. Every bar is
+  // a moment, and its height is how hard that shove was, whether or not
+  // the chip counted it. The short ones are the point.
+  const int TX = 74, BASE = 50, TOP = 22;
+  oled.drawFastHLine(TX, BASE, TAP_TRACE * 2, SSD1306_WHITE);
+  for (int i = 0; i < TAP_TRACE; i++) {
+    int k = (tapTraceAt + i) % TAP_TRACE;
+    int h = tapTrace[k] * (BASE - TOP) / 255;
+    if (h > 0) oled.drawFastVLine(TX + i * 2, BASE - h, h, SSD1306_WHITE);
+  }
+  at(TX, 13, "jolt");
+
+  ctr("2 knocks to go back", 56, 1);
   oled.display();
 }
 
@@ -1812,8 +1895,9 @@ static void drawSettings() {
   if (depth == 2 && itemIdx == C_PAIR)  { drawPair();  return; }
   if (itemIdx == C_TAP && depth >= 2) {
     if (depth == 2) { drawTapMenu(); return; }
-    if (subIdx == 0) { drawTapTest(); return; }
-    drawTapSet(); return;
+    if (subIdx == 1) { drawTapSet(); return; }
+    if (tapChosen)  { drawTapTest(); return; }
+    drawTapTry(); return;
   }
   bar(depth == 2 ? "CHANGE" : "SETTINGS");
 
@@ -3740,12 +3824,62 @@ static void goSleep() {
   eyes.setMood(TIRED); eyes.close();
   for (int i = 0; i < 26; i++) { eyesFrame(); delay(16); }
   screenPower(false);
+  sleptAt = millis();
   nSlept++;
   // The clock used to drop to 80MHz here. It saves almost nothing on a
   // desk and changes the bus timing at exactly the moment the sensors
   // have to stay readable, because noticing that it has been moved means
   // reading them continuously while asleep. Not worth the risk.
 }
+// How long until the next prayer wants saying something about, so a
+// processor that is switched off can set an alarm and still speak up.
+// The times are already in flash and the clock survives being switched
+// off, so none of this needs the network.
+static long secsToNextAlert() {
+  struct tm t;
+  if (!prayerOk || !timeOk || !getLocalTime(&t, 0)) return -1;
+  int nowMin = t.tm_hour * 60 + t.tm_min;
+  long best = -1;
+  for (int i = 0; i < 5; i++) {
+    int at = prayerAt(i);
+    if (at < 0) continue;
+    // ten minutes before is the first thing it says
+    int want = (at - 10 + 1440) % 1440;
+    long d = (long)want - nowMin;
+    if (d <= 0) d += 1440;                       // tomorrow, then
+    if (best < 0 || d < best) best = d;
+  }
+  return best < 0 ? -1 : best * 60 - t.tm_sec;
+}
+
+// Switch off properly and wait to be lifted.
+//
+// The accelerometer keeps watch on its own while the processor is off:
+// it is told to pull INT1 high the moment it feels movement, and that
+// line is the only thing that can bring the processor back. A timer is
+// set alongside it for the next prayer, so being switched off never
+// means missing one.
+static void goDeep() {
+  if (!intWired || deepOff) return;
+  Serial.println("switching off until moved");
+
+  wReg(adxl, A_THRESH_ACT, 0x08);              // about 500mg, a lift not a nudge
+  wReg(adxl, A_ACT_INACT_CTL, 0xF0);           // ac coupled, all three axes
+  wReg(adxl, A_INT_MAP, 0x00);                 // everything out of INT1
+  wReg(adxl, A_INT_ENABLE, INT_ACT);           // nothing else matters now
+  rReg(adxl, A_INT_SOURCE);                    // clear whatever is pending
+
+  screenPower(false);
+  prefs.end();
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+
+  esp_deep_sleep_enable_gpio_wakeup(BIT(TAP_INT_PIN), ESP_GPIO_WAKEUP_GPIO_HIGH);
+  long secs = secsToNextAlert();
+  if (secs > 0) esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
+  esp_deep_sleep_start();
+}
+
 static void wake(const char* why) {
   lastActive = millis();
   wokeBy = why;
@@ -4008,10 +4142,11 @@ static void knockOne() {
   }
   if (screen == S_SETTINGS && itemIdx == C_TAP && depth >= 2) {
     if (depth == 2) { subIdx = (subIdx + 1) % 2; return; }
-    // Stepping through strengths applies each one as you go, so the very
-    // next knock is judged by the one you are looking at.
+    // Inside the test, a single knock IS the thing being tested. It is
+    // counted where the interrupt is read and must do nothing here, or
+    // trying one out would walk you through the menu at the same time.
+    if (subIdx == 0 && tapChosen) return;
     tapPick = (tapPick + 1) % TAP_N;
-    if (subIdx == 0) { applyTapLevel(tapPick); tapSeen = 0; }
     return;
   }
   if (screen == S_GAMES) {
@@ -4112,8 +4247,20 @@ static void knockTwo() {
     if (depth == 2) {
       depth = 3;
       tapPick = cfgTap;
+      tapChosen = false;
       tapSeen = 0; tapLastSeen = millis();
-      if (subIdx == 0) { tapTesting = true; applyTapLevel(tapPick); }
+      return;
+    }
+    if (subIdx == 0) {                       // trying one out
+      if (!tapChosen) {                      // from the list, go and hit it
+        tapChosen = true; tapTesting = true;
+        tapSeen = 0; tapLastSeen = millis();
+        for (int i = 0; i < TAP_TRACE; i++) tapTrace[i] = 0;
+        applyTapLevel(tapPick);
+      } else {                               // and this is the way back
+        tapChosen = false; tapTesting = false;
+        applyTap();
+      }
       return;
     }
     if (subIdx == 1) {                       // choosing, so this commits
@@ -4150,7 +4297,7 @@ static void knockThree() {
   if (screen == S_SETTINGS && itemIdx == C_TAP && depth >= 2) {
     if (depth == 3) {
       // whatever was being tried is dropped; only Set ever commits
-      tapTesting = false;
+      tapTesting = false; tapChosen = false;
       applyTap();
       depth = 2;
     } else depth = 1;
@@ -4280,6 +4427,16 @@ static void input() {
   }
 
   if (amag < 0.60f) lastLowG = now;
+
+  // While trying a strength out, keep a rolling picture of how hard the
+  // last few shoves were. Every jolt goes in, registered or not, which
+  // is the whole point: it shows the ones that fell short.
+  if (tapTesting && tapChosen && now >= tapTraceNext) {
+    tapTraceNext = now + 60;
+    float j = fabsf(amag - 1.0f) * 255.0f / 1.2f;    // 1.2g reaches the top
+    tapTrace[tapTraceAt] = (uint8_t)constrain((int)j, 0, 255);
+    tapTraceAt = (tapTraceAt + 1) % TAP_TRACE;
+  }
 
   if (adxl) {
     uint8_t s = rReg(adxl, A_INT_SOURCE);
@@ -4646,7 +4803,7 @@ window.load=async function(){
     adjFilled=true;
   }
   $('keyState').textContent=s.hasKey?('key saved · '+s.storyState):'no key yet';
-  rows('sys',{'Signal':s.rssi,'Address':s.ip,'Hotspot':s.ap,'Free ram':s.heap+' B','OTA room':s.ota,
+  rows('sys',{'Signal':s.rssi,'Address':s.ip,'Hotspot':s.ap,'Deep sleep':(s.intWired?(s.deepOff?'off in settings':'ready'):'INT1 not wired'),'Free ram':s.heap+' B','OTA room':s.ota,
               'Storage used':s.fsUsed,'Uptime':s.up+' s','Boots':s.boots,'Falls':s.fall,
               'Chip':s.chip,'Firmware':s.fw,'Clock source':s.clockSrc});
   if(!filled){$('ssid').value=s.ssid;$('tz').value=s.tz;filled=true}
@@ -4750,6 +4907,8 @@ static void apiState() {
   o += "\"follow\":" + String(cfgFollow ? "true" : "false") + ",";
   o += "\"tap\":" + String(cfgTap) + ",";
   o += "\"swOn\":" + String(swOn ? "true" : "false") + ",";
+  o += "\"intWired\":" + String(intWired ? "true" : "false") + ",";
+  o += "\"deepOff\":" + String(deepOff ? "true" : "false") + ",";
   o += "\"tapName\":\"" + String(TAP_NAME[cfgTap]) + "\",";
   o += "\"relax\":" + String(relaxOn ? "true" : "false") + ",";
   o += "\"webui\":" + String(webUiOn ? "true" : "false") + ",";
@@ -4901,6 +5060,25 @@ static void setupWeb() {
     cfgTap = constrain((int)web.arg("n").toInt(), 0, TAP_N - 1);
     prefs.putInt("tap", cfgTap);
     applyTap();
+    okJson();
+  });
+  // Switching off altogether, and the way to stop it doing so.
+  web.on("/api/deep", HTTP_POST, []() {
+    if (!guard()) return;
+    deepOff = web.arg("off").toInt() != 0;
+    prefs.putBool("nodeep", deepOff);
+    okJson();
+  });
+  // Rafiq saying goodbye. Without this the robot waits out the full
+  // link timeout before it believes you have gone, which is most of a
+  // minute of standing there wondering.
+  web.on("/api/bye", HTTP_POST, []() {
+    if (!guard()) return;
+    macLinked = false;
+    macSeen = 0;
+    linkCardJoin = false;
+    linkCardUntil = millis() + 1400;
+    sleptAt = millis();                  // the seven minutes start now
     okJson();
   });
   web.on("/api/webui", HTTP_POST, []() {
@@ -5314,6 +5492,12 @@ static void netLoop(void*) {
 }
 
 void setup() {
+  // Waking from being switched off is not a boot, whatever the processor
+  // thinks. Skipping the animations is the difference between picking it
+  // up and having it there, and picking it up and watching it introduce
+  // itself again.
+  esp_sleep_wakeup_cause_t woke_ = esp_sleep_get_wakeup_cause();
+  bool fromDeep = (woke_ == ESP_SLEEP_WAKEUP_GPIO || woke_ == ESP_SLEEP_WAKEUP_TIMER);
   Serial.begin(115200);
   delay(300);
 
@@ -5379,11 +5563,17 @@ void setup() {
   eyes.begin(SCRW, SCRH, 50);
   applyEyes(cfgEyes);
 
-  animWake();
+  if (!fromDeep) animWake();
   startSensors();
   applyFallInt();
   applyTap();
-  animSenses(1500);
+  // Ask the hardware whether the wire is there rather than assuming it.
+  intWired = probeIntPin();
+  applyFallInt();                     // the probe borrowed the interrupt setup
+  applyTap();
+  deepOff = prefs.getBool("nodeep", false);
+  Serial.printf("INT1 %s\n", intWired ? "wired, it can switch off" : "not wired, screen off only");
+  if (!fromDeep) animSenses(1500);
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -5407,9 +5597,11 @@ void setup() {
       if (trySyncTime(700)) break;
     }
     nextTimeTry = millis() + 15000;
-    restingFace(timeOk ? "Clock set" : "Clock still coming", 700);
-    nameCard();
-  } else {
+    if (!fromDeep) {
+      restingFace(timeOk ? "Clock set" : "Clock still coming", 700);
+      nameCard();
+    }
+  } else if (!fromDeep) {
     offlineWelcome();
   }
 
@@ -5418,8 +5610,10 @@ void setup() {
   eyes.setMood(STYLES[cfgEyes].mood);
 
   // Two columns, numbers on a common left edge so the words line up.
+  // Not shown when it was only switched off: you know how to knock by
+  // the second time you pick it up.
   oled.clearDisplay();
-  {
+  if (!fromDeep) {
     titleBarC("HOW TO KNOCK");
     at(8,  16, "1  next");
     at(8,  28, "2  open");
@@ -5429,11 +5623,17 @@ void setup() {
     knockIcon(19, 51);
     at(32, 48, "Knock to begin");
   }
-  oled.display();
-  holdCard(2000);                      // a knock ends it, and it never dawdles
+  if (!fromDeep) {
+    oled.display();
+    holdCard(2000);                    // a knock ends it, and it never dawdles
+  }
 
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
   lastActive = millis();
+  if (fromDeep) {
+    wokeBy = (woke_ == ESP_SLEEP_WAKEUP_TIMER) ? "prayer" : "picked up";
+    Serial.printf("back from being off (%s)\n", wokeBy.c_str());
+  }
   drawHome();                          // on screen before anything can block
 
   // These all started at zero, so the first pass through loop() fired
@@ -5585,6 +5785,15 @@ void loop() {
   if (screen != S_FAITH && screen != S_READS && screen != S_GAMES &&
       screen != S_FOCUS && screen != S_SETTINGS && depth) {
     depth = 0; itemIdx = 0; subIdx = 0;
+  }
+
+  // Seven minutes of a dark screen with nobody listening and it can
+  // switch off altogether. A Mac on the other end counts as somebody
+  // listening: disconnect in Rafiq and the clock starts, reconnect and
+  // it never goes past a dark screen.
+  if (asleep && intWired && !deepOff && !macLinked && sleptAt &&
+      (now - sleptAt) > DEEP_AFTER_MS && upState == U_OFF && !storyBusy) {
+    goDeep();
   }
 
   if (asleep) { delay(6); return; }
