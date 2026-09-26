@@ -59,7 +59,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.12.0"
+#define FW_VERSION "2.13.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -181,15 +181,16 @@ const char* FACE_NAME[FACE_N] =
     "drift", "parallax", "water", "sand" };
 int cfgFace = F_CLASSIC;
 
-// Trying faces on from the clock itself, rather than walking into
-// settings for it. A double knock on the clock opens it, single knocks
-// walk the faces with the real clock drawn in each one, and a double
-// knock keeps the one you are looking at. Three knocks, or walking
-// away for eight seconds, puts back the one you had.
-bool     faceTrying = false;
-int      faceWas = F_CLASSIC;
-uint32_t faceIdle = 0;
-#define FACE_TRY_MS 8000UL
+// Changing the face from the clock itself rather than walking into
+// settings for it. A double knock on the clock is the next face, kept
+// straight away, and that is the whole of it.
+//
+// It was a mode before this: a double knock went in, single knocks
+// walked the faces, another double kept one and looking away for eight
+// seconds put the old one back. That made a single knock mean two
+// different things depending on a state you could not see from across
+// the desk, and it threw away a face you had chosen if you got
+// distracted. Nothing to enter and nothing to confirm is better.
 
 // The faces read the sensor for themselves, so they work whether or not
 // leaning is switched on as a way of driving the thing. The reference
@@ -1082,19 +1083,6 @@ static void drawHome() {
     case F_WATER:    faceFill(true);  break;
     case F_SAND:    faceFill(false); break;
     default:         faceClassic();     break;
-  }
-  // Drawn over whichever face is showing, because the point is to see
-  // the real thing and not a picture of it. A black band first, so a
-  // busy face cannot swallow the words.
-  if (faceTrying) {
-    // Two lines rather than one. The name and the three things you can
-    // do come to 24 characters on the widest face, and the screen holds
-    // 21, so putting them side by side would have run the hint through
-    // the word "parallax".
-    oled.fillRect(0, 41, SCRW, SCRH - 41, SSD1306_BLACK);
-    oled.drawFastHLine(0, 41, SCRW, SSD1306_WHITE);
-    ctr(FACE_NAME[cfgFace], 45, 1);
-    ctr("1 next 2 keep 3 undo", 55, 1);
   }
   oled.display();
 }
@@ -2177,16 +2165,26 @@ static void drawUpdateUI() {
 //  the part that drifts when you pick it up and put it down.
 // ================================================================
 enum { G_SNAKE = 0, G_BRICK, G_CAR, G_CATCH, G_PONG, G_ROLL,
-       G_ECHO, G_MAZE, G_COUNT };
+       G_ECHO, G_MAZE, G_DIZZY, G_BALLOON, G_COUNT };
 const char* G_NAME[G_COUNT] =
-  { "Snake", "Brick", "Car", "Catch", "Pong", "Roll", "Echo", "Maze" };
+  { "Snake", "Brick", "Car", "Catch", "Pong", "Roll", "Echo", "Maze",
+    "Dizzy", "Balloon" };
+
+// The last three are for a small person, and none of them asks for the
+// tilt lesson first: being made to hold a thing still, lean it right and
+// lean it away before anything happens is a reasonable price for Snake
+// and no price a four year old will pay. Copy Me is knocked, and the
+// other two are a shake and a knock.
+static bool gameUsesTilt(int g) {
+  return !(g == G_ECHO || g == G_DIZZY || g == G_BALLOON);
+}
 #define G_PER_PAGE 2
 #define G_PAGES ((G_COUNT + G_PER_PAGE - 1) / G_PER_PAGE)
 
 enum { GS_CAL_STILL = 0, GS_CAL_RIGHT, GS_CAL_AWAY, GS_READY, GS_PLAY, GS_PAUSE, GS_OVER };
 int  gState = GS_READY;
 int  gamePending = -1;
-int  gScore = 0, gBest[G_COUNT] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+int  gScore = 0, gBest[G_COUNT] = {};
 unsigned long gNext = 0, gStamp = 0;
 
 
@@ -2861,6 +2859,150 @@ static void mzDraw() {
 // ================================================================
 //  SHARED
 // ================================================================
+// ---------------- Dizzy ----------------
+//  Shake it and it gets giddy. The eyes spin, stars come out, and when
+//  it cannot take any more it flops over and picks itself back up.
+//  There is nothing to lose and nothing to be good at.
+//
+//  No knock does anything in here, which is the same rule as trying a
+//  tap strength and for the same reason: a good shake throws off knocks
+//  by the handful, and any one of them being a command would end the
+//  game every time it got going. The round has an end instead.
+#define DZ_MS 20000UL
+float    dzSpin = 0, dzAng = 0;
+uint32_t dzFlop = 0, dzEnds = 0;
+
+static void dzReset() {
+  dzSpin = 0; dzAng = 0; dzFlop = 0; gScore = 0;
+  dzEnds = millis() + DZ_MS;
+}
+static void dzStep() {
+  uint32_t now = millis();
+  float jolt = fabsf(amag - 1.0f);
+  if (jolt > 0.22f) dzSpin += jolt * 9.0f;
+  dzSpin -= 0.55f;                                   // it always calms down
+  dzSpin = constrain(dzSpin, 0.0f, 100.0f);
+  dzAng += 0.02f + dzSpin * 0.012f;
+  if (dzAng > 6.2832f) dzAng -= 6.2832f;
+  if ((int)dzSpin > gScore) gScore = (int)dzSpin;
+
+  if (!dzFlop && dzSpin >= 99.0f) dzFlop = now;
+  if (dzFlop && now - dzFlop > 2400) { gState = GS_OVER; return; }
+  if (!dzFlop && (int32_t)(now - dzEnds) >= 0) gState = GS_OVER;
+}
+static void dzDraw() {
+  // The screen is 64 high and the title bar owns the top eleven, so
+  // everything below has to be placed rather than centred and hoped
+  // for. Words 11 to 19, stars 21 to 25, head 29 to 55, meter 57 to 62.
+  // Drawn at full size the first time round, the head ran through the
+  // meter and the stars ran through the words.
+  bool over = dzFlop != 0;
+  const int cy = 42, R = 13;
+  // A wobble that grows with the giddiness, so the head sways harder
+  // the more it has been shaken. Sideways only: dropping it down the
+  // screen when it flops is what put it through the meter.
+  int cx = 64 + (int)(sinf(dzAng * 2.4f) * (dzSpin / 16.0f));
+  cx = constrain(cx, 64 - 8, 64 + 8);
+
+  oled.drawCircle(cx, cy, R, SSD1306_WHITE);
+  if (over) {
+    // crosses for eyes, and a mouth that has given up
+    for (int s = -1; s <= 1; s += 2) {
+      int ex = cx + s * 6;
+      oled.drawLine(ex - 3, cy - 7, ex + 3, cy - 1, SSD1306_WHITE);
+      oled.drawLine(ex + 3, cy - 7, ex - 3, cy - 1, SSD1306_WHITE);
+    }
+    oled.drawCircle(cx, cy + 5, 4, SSD1306_WHITE);
+  } else {
+    for (int s = -1; s <= 1; s += 2) {
+      int ex = cx + s * 6, ey = cy - 4;
+      oled.drawCircle(ex, ey, 4, SSD1306_WHITE);
+      // the pupil goes round and round, faster the giddier it is
+      int px = ex + (int)(cosf(dzAng + (s > 0 ? 1.6f : 0)) * 2.0f);
+      int py = ey + (int)(sinf(dzAng + (s > 0 ? 1.6f : 0)) * 2.0f);
+      oled.fillCircle(px, py, 1, SSD1306_WHITE);
+    }
+    int m = 2 + (int)(dzSpin / 28);            // the mouth opens as it goes
+    oled.drawCircle(cx, cy + 6, m, SSD1306_WHITE);
+  }
+
+  // Stars come out once it is properly giddy, and go round above the
+  // head. On their own band at y 21 to 25, so they cannot cross either
+  // the words above them or the head below.
+  int stars = (int)(dzSpin / 26);
+  for (int i = 0; i < stars; i++) {
+    float a = dzAng * 1.7f + i * 2.1f;
+    int sx = 64 + (int)(cosf(a) * 26);
+    if (sx < 4 || sx > SCRW - 5) continue;     // round the back, out of sight
+    oled.drawFastHLine(sx - 2, 23, 5, SSD1306_WHITE);
+    oled.drawFastVLine(sx, 21, 5, SSD1306_WHITE);
+  }
+
+  if (over) ctr("whooooa", 12, 1);
+  else      ctr(dzSpin < 30 ? "shake me!" : dzSpin < 75 ? "more!" : "too much!", 12, 1);
+
+  // how giddy, along the bottom, on its own band below everything
+  oled.drawRect(14, 57, 100, 6, SSD1306_WHITE);
+  int w = (int)(dzSpin);
+  if (w > 0) oled.fillRect(15, 58, w, 4, SSD1306_WHITE);
+}
+
+// ---------------- Balloon ----------------
+//  Knock to puff it up. It bursts somewhere, and nobody knows where.
+//  Every burst is one puff whatever its size, so a heavy knock that
+//  bounces into three cannot cost three puffs, and no knock walks out
+//  of the game either. The bang is the end of the round.
+float    blSize = 6, blPop = 24;
+int      blPuffs = 0;
+uint32_t blBang = 0;
+
+static void blReset() {
+  blSize = 6; blPuffs = 0; blBang = 0; gScore = 0;
+  // Between 15 and 20 across. Bigger than that and it runs into the
+  // title bar at the top and its own string at the bottom, which on a
+  // screen this size means it bursts off the edge rather than on it.
+  blPop = 15 + random(6);
+}
+static void blPuff() {
+  if (blBang) return;
+  blPuffs++; gScore = blPuffs;
+  blSize += 0.85f + random(7) / 10.0f;        // eight to fourteen puffs, usually
+  if (blSize >= blPop) blBang = millis();
+}
+static void blStep() {
+  if (blBang && millis() - blBang > 1800) gState = GS_OVER;
+}
+static void blDraw() {
+  const int CX = 64, CY = 33;
+  if (blBang) {
+    // Spikes round the middle and the tally underneath, rather than a
+    // big word in the middle with the spikes drawn through it.
+    for (int i = 0; i < 12; i++) {
+      float a = i * 0.5236f;
+      oled.drawLine(CX + (int)(cosf(a) * 8),  30 + (int)(sinf(a) * 8),
+                    CX + (int)(cosf(a) * 20), 30 + (int)(sinf(a) * 18), SSD1306_WHITE);
+    }
+    char m[24];
+    snprintf(m, sizeof(m), "POP!  %d puff%s", blPuffs, blPuffs == 1 ? "" : "s");
+    ctr(m, 54, 1);
+    return;
+  }
+  int r = (int)blSize;
+  oled.drawCircle(CX, CY, r, SSD1306_WHITE);
+  oled.drawCircle(CX, CY, r - 1, SSD1306_WHITE);
+  oled.fillTriangle(CX - 3, CY + r, CX + 3, CY + r, CX, CY + r + 4, SSD1306_WHITE);
+  for (int y = CY + r + 4; y < 63; y += 2)   // a string that wiggles
+    oled.drawPixel(CX + ((y / 2) % 2 ? 2 : -2), y, SSD1306_WHITE);
+  oled.fillCircle(CX - r / 3, CY - r / 3, 2, SSD1306_WHITE);   // a shine
+
+  // No hint over the top of it: the balloon fills this space once it
+  // gets going, and the ready screen has already said what to do. The
+  // tally sits in the corner, clear of the widest it can get.
+  char m[10];
+  snprintf(m, sizeof(m), "%d", blPuffs);
+  at(3, 13, m);
+}
+
 static const char* bestKey(int g) {
   switch (g) {
     case G_SNAKE: return "bSnake";
@@ -2870,6 +3012,8 @@ static const char* bestKey(int g) {
     case G_PONG:  return "bPong";
     case G_ECHO:  return "bEcho";
     case G_MAZE:  return "bMaze";
+    case G_DIZZY: return "bDizzy";
+    case G_BALLOON: return "bBalloon";
     default:      return "bRoll";
   }
 }
@@ -2882,6 +3026,8 @@ static void gameReset(int g) {
     case G_PONG:  pgReset(); break;
     case G_ECHO:  ecReset(); break;
     case G_MAZE:  mzReset(); break;
+    case G_DIZZY: dzReset(); break;
+    case G_BALLOON: blReset(); break;
     default:      rlReset(); break;
   }
 }
@@ -2899,6 +3045,8 @@ static const char* gameHint(int g) {
     case G_PONG:  return "Tilt to return it";
     case G_ECHO:  return "Knock it back";
     case G_MAZE:  return "Tilt to the star";
+    case G_DIZZY: return "Shake me about";
+    case G_BALLOON: return "Knock to puff";
     default:      return "Tilt to roll it";
   }
 }
@@ -2977,6 +3125,8 @@ static void serviceGame() {
     case G_PONG:  gNext = now + 26;     pgStep();   break;
     case G_ECHO:  gNext = now + 40;     ecStep();   break;
     case G_MAZE:  gNext = now + 30;     mzStep();   break;
+    case G_DIZZY: gNext = now + 33;     dzStep();   break;
+    case G_BALLOON: gNext = now + 40;   blStep();   break;
     default:      gNext = now + 26;     rlStep();   break;
   }
 
@@ -2990,6 +3140,23 @@ static void serviceGame() {
 }
 
 // ---------------- the icons ----------------
+static void dizzyIcon(int x, int y) {
+  oled.drawCircle(x + 15, y + 9, 7, SSD1306_WHITE);
+  oled.drawPixel(x + 13, y + 8, SSD1306_WHITE);
+  oled.drawPixel(x + 17, y + 8, SSD1306_WHITE);
+  oled.drawCircle(x + 15, y + 12, 2, SSD1306_WHITE);
+  for (int i = 0; i < 3; i++) {                  // stars going round
+    int sx = x + 5 + i * 10, sy = y + (i == 1 ? 0 : 2);
+    oled.drawFastHLine(sx - 1, sy, 3, SSD1306_WHITE);
+    oled.drawFastVLine(sx, sy - 1, 3, SSD1306_WHITE);
+  }
+}
+static void balloonIcon(int x, int y) {
+  oled.drawCircle(x + 15, y + 8, 7, SSD1306_WHITE);
+  oled.fillTriangle(x + 13, y + 15, x + 17, y + 15, x + 15, y + 18, SSD1306_WHITE);
+  for (int yy = y + 18; yy < y + 24; yy += 2)
+    oled.drawPixel(x + 15 + ((yy / 2) % 2 ? 1 : -1), yy, SSD1306_WHITE);
+}
 static void snakeIcon(int x, int y) {
   const int8_t P[8][2] = { {2,4},{6,4},{10,4},{14,4},{14,8},{14,12},{18,12},{22,12} };
   for (int i = 0; i < 8; i++) oled.fillRect(x + P[i][0], y + P[i][1], 3, 3, SSD1306_WHITE);
@@ -3062,6 +3229,8 @@ static void gameIcon(int g, int x, int y) {
     case G_PONG:  pongIcon(x, y);  break;
     case G_ECHO:  echoIcon(x, y);  break;
     case G_MAZE:  mazeIcon(x, y);  break;
+    case G_DIZZY: dizzyIcon(x, y); break;
+    case G_BALLOON: balloonIcon(x, y); break;
     default:      rollIcon(x, y);  break;
   }
 }
@@ -3142,6 +3311,8 @@ static void drawGamePlay() {
     case G_PONG:  snprintf(t, sizeof(t), "PONG");               break;
     case G_ECHO:  snprintf(t, sizeof(t), "ECHO");               break;
     case G_MAZE:  snprintf(t, sizeof(t), "MAZE L%d", mzLevel); break;
+    case G_DIZZY: snprintf(t, sizeof(t), "DIZZY");              break;
+    case G_BALLOON: snprintf(t, sizeof(t), "BALLOON");          break;
     default:      snprintf(t, sizeof(t), "SNAKE");              break;
   }
   if (which == G_PONG) snprintf(r, sizeof(r), "%d-%d", pgMe, pgThem);
@@ -3167,6 +3338,8 @@ static void drawGamePlay() {
     case G_PONG:  pgDraw();  break;
     case G_ECHO:  ecDraw();  break;
     case G_MAZE:  mzDraw();  break;
+    case G_DIZZY: dzDraw();  break;
+    case G_BALLOON: blDraw(); break;
     default:      rlDraw();  break;
   }
   if (which == G_BRICK && brStuck && gState == GS_PLAY) ctr("Knock to launch", 44, 1);
@@ -4464,13 +4637,6 @@ static void knockOne() {
   if (canvasUntil) { canvasUntil = 0;    return; }
   if (toastUntil)  { toastUntil = 0; toastText = ""; toastKind = ""; return; }
   if (depth == 0) {
-    // Trying faces on holds the clock screen: single knocks walk the
-    // faces, not the screens, until you have kept one or put it back.
-    if (faceTrying) {
-      cfgFace = (cfgFace + 1) % FACE_N;
-      faceIdle = millis();
-      return;
-    }
     screen = (screen + 1) % S_COUNT;
     itemIdx = 0; subIdx = 0;
     return;
@@ -4557,15 +4723,12 @@ static void knockTwo() {
         // With no clock this screen is a stopwatch, and restarting it is
         // the only useful thing a double knock can mean there.
         if (!timeOk) { swStart = millis(); break; }
-        if (faceTrying) {                      // keep the one you are looking at
-          faceTrying = false;
-          prefs.putInt("face", cfgFace);
-          flash("KEPT", 900);
-        } else {
-          faceTrying = true;
-          faceWas = cfgFace;
-          faceIdle = millis();
-        }
+        // The next face, kept as you go. Written every time rather
+        // than on the way out of something, because there is no way
+        // out of this: whatever is on the screen is what it will be
+        // wearing next time it wakes up.
+        cfgFace = (cfgFace + 1) % FACE_N;
+        prefs.putInt("face", cfgFace);
         break;
       case S_WEATHER:  nextWx = 0; break;
       case S_PRAYER:   nextPrayerTry = 0; break;
@@ -4598,7 +4761,13 @@ static void knockTwo() {
     return;
   }
   if (screen == S_GAMES) {
-    if (depth == 1) { gamePending = itemIdx; navCalBegin(true); return; }
+    if (depth == 1) {
+      // Knock and shake games have nothing to calibrate, and making a
+      // small person hold it still, lean it right and lean it away
+      // before a balloon appears is how you lose them.
+      if (!gameUsesTilt(itemIdx)) { gameStart(itemIdx); depth = 2; return; }
+      gamePending = itemIdx; navCalBegin(true); return;
+    }
     if (gState == GS_OVER)  { gameStart(itemIdx); return; }
     if (gState == GS_PLAY)  { gState = GS_PAUSE;  return; }
     if (gState == GS_PAUSE) { gState = GS_PLAY; gNext = millis(); return; }
@@ -4679,15 +4848,6 @@ static void knockTwo() {
 }
 
 static void knockThree() {
-  // Out of trying faces first, and without keeping anything. Three
-  // knocks is the way back out of everywhere else, so it means the same
-  // here: whatever you were looking at is dropped.
-  if (faceTrying) {
-    faceTrying = false;
-    cfgFace = faceWas;
-    flash("PUT BACK", 900);
-    return;
-  }
   cTriple++;
   if (screen == S_FOCUS && (swOn || depth == 1)) {
     if (swOn) { swOn = false; depth = 0; return; }
@@ -4717,7 +4877,6 @@ static void knockThree() {
 
 static void knockFour() {
   cQuad++;
-  if (faceTrying) { faceTrying = false; cfgFace = faceWas; return; }
   // Ticking one off at the device, so the robot can change the list and
   // not only show it. Rafiq sees it on its next look.
   if (screen == S_FOCUS && depth == 1 && itemIdx < taskCount) {
@@ -4831,15 +4990,33 @@ static void settleBurst() {
     Serial.printf("knock x%u counted, not obeyed (trying a strength)\n", n);
     return;
   }
-  // Echo is played by knocking, so in there a burst is the move and not
-  // a command. Taken here for the same reason as the line above: once a
-  // burst has been turned into next, open or back, the count is gone.
-  if (screen == S_GAMES && depth == 2 && itemIdx == G_ECHO &&
-      gState == GS_PLAY && !ecShow) {
-    ecKnock(n);
-    lastActive = millis();
-    Serial.printf("knock x%u -> echo\n", n);
-    return;
+  // Some games are played by knocking, and in those a burst is the move
+  // and not a command. Taken here for the same reason as the line above:
+  // once a burst has been turned into next, open or back, the count is
+  // gone and the game never sees it.
+  if (screen == S_GAMES && depth == 2 && gState == GS_PLAY) {
+    if (itemIdx == G_ECHO && !ecShow) {
+      ecKnock(n);
+      lastActive = millis();
+      Serial.printf("knock x%u -> echo\n", n);
+      return;
+    }
+    if (itemIdx == G_BALLOON && !blBang) {
+      // One puff per burst, whatever size it came out as. A heavy knock
+      // that bounces into three would otherwise cost three puffs and
+      // burst a balloon that was nowhere near ready.
+      blPuff();
+      lastActive = millis();
+      Serial.printf("knock x%u -> one puff\n", n);
+      return;
+    }
+    if (itemIdx == G_DIZZY) {
+      // Shaking throws off knocks by the handful. Any of them being a
+      // command would end the game the moment it got going, so none of
+      // them is; the round has an end of its own.
+      lastActive = millis();
+      return;
+    }
   }
   if      (n == 1) knockOne();
   else if (n == 2) knockTwo();
@@ -6315,20 +6492,6 @@ void loop() {
   if (autoUpArmed && (upState == U_NONE || upState == U_FAIL)) {
     autoUpArmed = false;
     upState = U_OFF;                 // nothing found; say nothing
-  }
-
-  // Walked away mid try. Putting the old one back is the safe way to be
-  // wrong: leaving a face nobody chose is how you end up with a clock
-  // you do not recognise and no idea what changed it.
-  if (faceTrying && (now - faceIdle > FACE_TRY_MS)) {
-    faceTrying = false;
-    cfgFace = faceWas;
-  }
-  // Nothing else may hold the clock screen while faces are being tried
-  // on, or the strip would be drawn over something that is not a face.
-  if (faceTrying && (screen != S_HOME || depth != 0 || !timeOk)) {
-    faceTrying = false;
-    cfgFace = faceWas;
   }
 
   if (popupUntil && now > popupUntil) { popupUntil = 0; screen = S_HOME; depth = 0; }
