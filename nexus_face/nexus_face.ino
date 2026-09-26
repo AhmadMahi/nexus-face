@@ -59,7 +59,7 @@
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.9.0"
+#define FW_VERSION "2.10.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -131,11 +131,13 @@ unsigned long zikrNext = 0;      // when the next count lands
 
 // ---------------- settings ----------------
 enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
-       C_PRAYER, C_HOTSPOT, C_ACCEL, C_TAP, C_PAIR, C_UPDATE, C_REBOOT, C_ABOUT, C_COUNT };
+       C_PRAYER, C_HOTSPOT, C_ACCEL, C_TAP, C_PAIR, C_UPDATE, C_EARLIER,
+       C_AUTOUP, C_RESET, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
     "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Tap strength",
-    "Pair a Mac", "Check update", "Reboot", "About" };
+    "Pair a Mac", "Check update", "Earlier versions", "Auto update",
+    "Reset settings", "Reboot", "About" };
 
 // Zero is the dimmest the panel goes, not off: the SSD1306 still shows
 // faintly at contrast zero. After that, quarters.
@@ -270,6 +272,13 @@ bool  wxOk = false;
 // is nothing here for two tasks to disagree about.
 TaskHandle_t netTask = nullptr;
 volatile bool wantTime = false, wantWx = false, wantPrayerNow = false;
+// Looking for an update is the slowest thing it does over the network,
+// so it happens on that task too and the panel keeps answering.
+volatile bool wantOtaLatest = false, wantOtaList = false;
+bool cfgAutoUp = false;                  // install what it finds, without asking
+unsigned long nextAutoUp = 0;
+bool autoUpArmed = false;         // this check was started by the timer
+#define AUTOUP_EVERY_MS (24UL * 60UL * 60UL * 1000UL)
 unsigned long nextWx = 0;
 float locLat = NAN, locLon = NAN;
 
@@ -476,7 +485,12 @@ String   otaStatus = "", otaStatus2 = "";
 
 // Updating is a little conversation now rather than one button: which
 // release, then yes or no, and only then does anything get written.
-enum { U_OFF = 0, U_MENU, U_ASK, U_LIST, U_NONE, U_FAIL };
+// Checking used to be a menu you picked from before anything happened,
+// and then the check itself froze the panel for up to half a minute
+// while it talked to GitHub, which looked exactly like dropping off to
+// sleep. Now picking it starts the check, the check runs on the network
+// task, and U_LOOK is what you watch while it does.
+enum { U_OFF = 0, U_LOOK, U_ASK, U_LIST, U_NONE, U_FAIL };
 int    upState = U_OFF;
 int    upPick = 0;                  // 0 the latest one, 1 the older ones
 bool   upYes = true;
@@ -1918,6 +1932,16 @@ static void drawSettings() {
   if (depth == 2 && itemIdx == C_ABOUT) { drawAbout(); return; }
   if (depth == 2 && itemIdx == C_ACCEL) { drawAccel(); return; }
   if (depth == 2 && itemIdx == C_PAIR)  { drawPair();  return; }
+  if (depth == 2 && itemIdx == C_RESET) {
+    oled.clearDisplay();
+    bar("RESET SETTINGS");
+    ctr("Put everything back", 18, 1);
+    ctr("the way it came?", 28, 1);
+    ctr("Networks stay", 40, 1);
+    ctr("2 yes    3 no", 54, 1);
+    oled.display();
+    return;
+  }
   if (itemIdx == C_TAP && depth >= 2) {
     if (depth == 2) { drawTapMenu(); return; }
     if (subIdx == 1) { drawTapSet(); return; }
@@ -1945,6 +1969,8 @@ static void drawSettings() {
       case C_ACCEL:  snprintf(v, sizeof(v), "x2"); break;
       case C_PAIR:   snprintf(v, sizeof(v), "%s", cfgLock ? "paired" : "x2"); break;
       case C_TAP:    snprintf(v, sizeof(v), "%s", TAP_NAME[cfgTap]); break;
+      case C_AUTOUP: snprintf(v, sizeof(v), "%s", cfgAutoUp ? "on" : "off"); break;
+      case C_EARLIER:snprintf(v, sizeof(v), "%s", online() ? "x2" : "offline"); break;
       case C_ABOUT:  snprintf(v, sizeof(v), "x2"); break;
       case C_SLEEP:  if (!sleepSecs())         snprintf(v, sizeof(v), "never");
                      else if (sleepSecs() < 60) snprintf(v, sizeof(v), "%ds", sleepSecs());
@@ -2021,19 +2047,21 @@ static void drawUpdateUI() {
   oled.clearDisplay();
   char r[12];
   switch (upState) {
-    case U_MENU: {
-      snprintf(r, sizeof(r), "%d/2", upPick + 1);
-      titleBar("UPDATE", r);
-      const int TX[2] = { 14, 74 };
-      for (int i = 0; i < 2; i++) {
-        if (i == upPick) oled.drawRoundRect(TX[i] - 2, 13, 42, 28, 4, SSD1306_WHITE);
-        if (i == 0) dlIcon(TX[i] + 19, 27);
-        else        histIcon(TX[i] + 19, 27);
+    case U_LOOK: {
+      // Something to watch while it asks GitHub, instead of a panel that
+      // has apparently dropped off to sleep.
+      bar("LOOKING");
+      ctr("Asking GitHub", 22, 1);
+      int dots = (int)((millis() / 400) % 4);
+      for (int i = 0; i < 3; i++) {
+        int x = SCRW / 2 - 8 + i * 8;
+        if (i < dots) oled.fillCircle(x, 40, 2, SSD1306_WHITE);
+        else          oled.drawCircle(x, 40, 2, SSD1306_WHITE);
       }
-      ctr(upPick == 0 ? "Newest release" : "Earlier releases", 45, 1);
-      ctr("1 next   2 open", 55, 1);
+      ctr("3 knocks to stop", 54, 1);
       break;
     }
+
     case U_ASK:
       titleBar("INSTALL", "");
       ctr(upTag.length() ? upTag.c_str() : "unknown", 15, 1);
@@ -3930,6 +3958,25 @@ static long secsToNextAlert() {
 // line is the only thing that can bring the processor back. A timer is
 // set alongside it for the next prayer, so being switched off never
 // means missing one.
+// Everything back to how it arrived, except the things that would leave
+// you unable to reach it afterwards. The networks stay, the pairing
+// stays, and the shelf of reads stays, because none of those are
+// settings and losing them is not what anyone means by reset.
+static void resetSettings() {
+  cfgBright = 160;   prefs.putInt("bri", cfgBright);   applyBright();
+  cfgFace = F_CLASSIC; prefs.putInt("face", cfgFace);
+  cfgSleepIdx = 1;   prefs.putInt("slpi", cfgSleepIdx);
+  cfgPopupIdx = 2;   prefs.putInt("popi", cfgPopupIdx);
+  cfgEyes = 0;       prefs.putInt("eye", cfgEyes);     applyEyes(cfgEyes);
+  cfgAutoTurn = false; prefs.putBool("turn", cfgAutoTurn);
+  cfgTap = TAP_MED;  prefs.putInt("tap", cfgTap);      applyTap();
+  cfgAutoUp = false; prefs.putBool("autoup", cfgAutoUp);
+  deepOff = false;   prefs.putBool("nodeep", deepOff);
+  for (int i = 0; i < 5; i++) prayerAdj[i] = 0;
+  saveAdj();
+  Serial.println("settings back to how they came");
+}
+
 static void goDeep() {
   if (!intWired || deepOff) return;
   Serial.println("switching off until moved");
@@ -4314,6 +4361,12 @@ static void knockTwo() {
     }
     return;
   }
+  if (screen == S_SETTINGS && itemIdx == C_RESET && depth == 2) {
+    resetSettings();
+    depth = 1;
+    flash("RESET", 1200);
+    return;
+  }
   if (screen == S_SETTINGS && itemIdx == C_TAP && depth >= 2) {
     if (depth == 2) {
       depth = 3;
@@ -4346,9 +4399,23 @@ static void knockTwo() {
   if (screen == S_SETTINGS && depth == 1) {
     switch (itemIdx) {
       case C_REBOOT:  delay(150); ESP.restart(); break;
-      case C_UPDATE:  if (online()) { upState = U_MENU; upPick = 0; upMsg = ""; }
-                      else { otaStatus = "No network"; otaPct = -1; drawOta(); delay(1600); }
-                      break;
+      case C_UPDATE:
+        if (online()) { upState = U_LOOK; upMsg = ""; wantOtaLatest = true; }
+        else { upState = U_FAIL; upMsg = "No network"; }
+        break;
+      case C_EARLIER:
+        if (online()) { upState = U_LOOK; upMsg = ""; wantOtaList = true; }
+        else { upState = U_FAIL; upMsg = "No network"; }
+        break;
+      case C_AUTOUP:
+        cfgAutoUp = !cfgAutoUp;
+        prefs.putBool("autoup", cfgAutoUp);
+        nextAutoUp = millis() + 30000;
+        flash(cfgAutoUp ? "AUTO ON" : "AUTO OFF", 1000);
+        break;
+      case C_RESET:
+        depth = 2;                       // it asks first
+        break;
       case C_HOTSPOT: startHotspot(); break;
       case C_PRAYER:  prayerWanted = true; nextPrayerTry = 0; break;
       case C_ACCEL:   depth = 2; break;
@@ -4365,6 +4432,7 @@ static void knockThree() {
     depth = 0; itemIdx = 0;
     return;
   }
+  if (screen == S_SETTINGS && itemIdx == C_RESET && depth == 2) { depth = 1; return; }
   if (screen == S_SETTINGS && itemIdx == C_TAP && depth >= 2) {
     if (depth == 3) {
       // whatever was being tried is dropped; only Set ever commits
@@ -4404,33 +4472,24 @@ static void knockFour() {
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
 }
 
+// Picking Check update starts the check. There is no menu to get past
+// first, and the check itself runs on the network task, so the panel
+// keeps drawing while it waits instead of sitting there looking asleep.
 static void updateKnock(uint8_t n) {
   switch (upState) {
-    case U_MENU:
-      if (n == 1) { upPick = (upPick + 1) % 2; return; }
-      if (n == 2) {
-        otaStatus = "Checking"; otaStatus2 = ""; otaPct = -1; drawOta();
-        if (upPick == 0) {
-          if (!otaFetchLatest()) { upState = U_FAIL; return; }
-          if (upTag == String("v" FW_VERSION) || upTag == String(FW_VERSION)) {
-            upState = U_NONE; return;
-          }
-          upYes = true; upState = U_ASK; return;
-        }
-        if (!otaFetchList()) { upState = U_FAIL; return; }
-        upState = U_LIST; return;
-      }
-      upState = U_OFF;
+    case U_LOOK:
+      // nothing to do but wait. Three knocks gives up on it.
+      if (n >= 3) { wantOtaLatest = false; wantOtaList = false; upState = U_OFF; }
       return;
 
     case U_ASK:
       if (n == 1) { upYes = !upYes; return; }
       if (n == 2) {
-        if (upYes) { upState = U_OFF; otaInstall(); upState = U_MENU; }  // returns only if it failed
-        else upState = U_MENU;
+        if (upYes) { upState = U_OFF; otaInstall(); upState = U_FAIL; }  // returns only if it failed
+        else upState = U_OFF;
         return;
       }
-      upState = U_MENU;
+      upState = U_OFF;
       return;
 
     case U_LIST:
@@ -4440,11 +4499,11 @@ static void updateKnock(uint8_t n) {
         upYes = true; upState = U_ASK;
         return;
       }
-      upState = U_MENU;
+      upState = U_OFF;
       return;
 
-    default:                                   // nothing to do, or it went wrong
-      upState = U_MENU;
+    default:                                   // it said its piece; let it go
+      upState = U_OFF;
       return;
   }
 }
@@ -5000,6 +5059,7 @@ static void apiState() {
        ",\"slpi\":" + String(cfgSleepIdx) + ",\"popi\":" + String(cfgPopupIdx) +
        ",\"eye\":" + String(cfgEyes) + ",\"turn\":" + String(cfgAutoTurn ? "true" : "false") + ",";
   o += "\"deepOff\":" + String(deepOff ? "true" : "false") + ",";
+  o += "\"autoUp\":" + String(cfgAutoUp ? "true" : "false") + ",";
   o += "\"tapName\":\"" + String(TAP_NAME[cfgTap]) + "\",";
   o += "\"relax\":" + String(relaxOn ? "true" : "false") + ",";
   o += "\"webui\":" + String(webUiOn ? "true" : "false") + ",";
@@ -5219,6 +5279,18 @@ static void setupWeb() {
     else if (k == "popi") { cfgPopupIdx = constrain(v, 0, POPUP_N - 1);   prefs.putInt("popi", cfgPopupIdx); }
     else if (k == "eye")  { cfgEyes     = constrain(v, 0, STYLE_N - 1);   prefs.putInt("eye", cfgEyes); applyEyes(cfgEyes); }
     else { web.send(400, "application/json", "{\"ok\":false,\"err\":\"no such setting\"}"); return; }
+    okJson();
+  });
+  web.on("/api/autoup", HTTP_POST, []() {
+    if (!guard()) return;
+    cfgAutoUp = web.arg("a").toInt() != 0;
+    prefs.putBool("autoup", cfgAutoUp);
+    nextAutoUp = millis() + 30000;
+    okJson();
+  });
+  web.on("/api/reset", HTTP_POST, []() {
+    if (!guard()) return;
+    resetSettings();
     okJson();
   });
   web.on("/api/deep", HTTP_POST, []() {
@@ -5656,6 +5728,22 @@ static void netLoop(void*) {
       if (wantTime)      { wantTime = false;      trySyncTime(1500); }
       if (wantWx)        { wantWx = false;        fetchWeather(); }
       if (wantPrayerNow) { wantPrayerNow = false; fetchPrayer(); }
+
+      // Looking for an update is the slowest thing it does, and used to
+      // freeze the panel for up to half a minute while it ran. The
+      // strings are filled first and upState is set last, so the panel
+      // never reads a tag that is only half written.
+      if (wantOtaLatest) {
+        wantOtaLatest = false;
+        if (!otaFetchLatest()) upState = U_FAIL;
+        else if (upTag == String("v" FW_VERSION) || upTag == String(FW_VERSION))
+          upState = U_NONE;
+        else { upYes = true; upState = U_ASK; }
+      }
+      if (wantOtaList) {
+        wantOtaList = false;
+        upState = otaFetchList() ? U_LIST : U_FAIL;
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(40));
   }
@@ -5691,6 +5779,8 @@ void setup() {
   cfgLock     = prefs.getBool("lock", false) && cfgTok.length();
   cfgFollow   = prefs.getBool("follow", false);
   cfgTap      = constrain(prefs.getInt("tap", TAP_MED), 0, TAP_N - 1);
+  cfgAutoUp   = prefs.getBool("autoup", false);
+  nextAutoUp  = millis() + 120000;          // not in the first two minutes
   cfgTz       = prefs.getString("tz", DEF_TZ);
   cfgSsid     = prefs.getString("ssid", "");
   cfgPass     = prefs.getString("pass", "");
@@ -5900,6 +5990,28 @@ void loop() {
       nextRefill = now + 5000;
       fetchStory(false);                       // quietly, while you are elsewhere
     }
+  }
+
+  // Looking for itself once a day, and putting on whatever it finds.
+  // Only while nothing is going on: never mid game, mid read, mid focus
+  // or with a Mac driving it.
+  if (cfgAutoUp && online() && upState == U_OFF && (long)(now - nextAutoUp) >= 0 &&
+      asleep && !sessionRunning() && !storyBusy) {
+    nextAutoUp = now + AUTOUP_EVERY_MS;
+    wantOtaLatest = true;
+    autoUpArmed = true;
+  }
+  // It found one, and nobody needs asking.
+  if (autoUpArmed && upState == U_ASK) {
+    autoUpArmed = false;
+    upState = U_OFF;
+    wake("update");
+    otaInstall();
+    upState = U_FAIL;
+  }
+  if (autoUpArmed && (upState == U_NONE || upState == U_FAIL)) {
+    autoUpArmed = false;
+    upState = U_OFF;                 // nothing found; say nothing
   }
 
   if (popupUntil && now > popupUntil) { popupUntil = 0; screen = S_HOME; depth = 0; }
