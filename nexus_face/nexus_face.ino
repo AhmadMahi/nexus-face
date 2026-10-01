@@ -64,22 +64,39 @@
 // S2 and S3, so a pad on this chip means a little board that does its
 // own sensing and hands over a level.
 //
-// Which level means touched depends on that board. Most drive the pin
-// high on touch and some drive it low, so rather than guess, whatever
-// the pin is sitting at when the robot starts is taken as resting and
-// anything different is a touch. It works either way round, and the
-// System screen says which way it decided.
+// On a TTP223 the two solder pads on the back decide whether the output
+// is high or low when touched, and whether it is momentary or latching.
+// Four combinations, and the board does not say which it is in.
+//
+// So nothing is assumed. Resting is whatever level the pin has held for
+// the last minute, and a touch is anything else. A pad spends almost
+// all its life untouched, so the level it sits at longest is the level
+// it sits at. That is true of all four combinations and needs nothing
+// to be configured.
+//
+// It also digs itself out of the one thing that can go wrong. The
+// TTP223 calibrates itself in the first half second of power, so a
+// finger on the pad while the robot starts makes the chip treat a
+// touched pad as its baseline. The level read at boot is then the wrong
+// one, and a minute later this notices and takes the other one.
+//
+// v2.15.0 did this by taking a sample at boot and flipping it if a
+// touch lasted thirty seconds. That is wrong for a TTP223 wired to
+// latch: its output stays put until the next touch, quite legitimately,
+// and the flip would have fought it.
 #define TOUCH_PIN 5
 bool     touchRest  = false;     // the level it sits at with nobody near
 bool     touchOn    = false;     // inverted right now
 uint32_t touchCount = 0;
 uint32_t touchEdge  = 0;         // when the level last disagreed with us
-uint32_t touchOnAt  = 0;         // when this touch started
+bool     touchLvl   = false;     // what the pin read last time
+uint32_t touchLvlAt = 0;         // when it last changed
+#define TOUCH_REST_MS 60000UL    // held this long and it is the resting level
 #define OLED_ADDR 0x3C
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.15.0"
+#define FW_VERSION "2.16.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -5429,32 +5446,27 @@ static void input() {
   // invertDisplay is a panel command rather than anything we draw, so it
   // survives every redraw and costs one message, only on a change.
   {
-    bool want = (digitalRead(TOUCH_PIN) != touchRest);
+    bool lvl = digitalRead(TOUCH_PIN);
+    if (lvl != touchLvl) { touchLvl = lvl; touchLvlAt = now; }
+    else if (lvl != touchRest && now - touchLvlAt > TOUCH_REST_MS) {
+      // A whole minute at one level. Whatever it is, that is resting.
+      touchRest = lvl;
+      Serial.printf("pad resting level is now %s\n", touchRest ? "high" : "low");
+    }
+
+    bool want = (lvl != touchRest);
     if (want != touchOn) {
       if (!touchEdge) touchEdge = now;
       if (now - touchEdge >= 40) {             // settle, so an edge cannot flicker it
         touchOn = want; touchEdge = 0;
         oled.invertDisplay(touchOn);
-        if (touchOn) { touchCount++; touchOnAt = now; }
+        if (touchOn) touchCount++;
         lastActive = now;
         if (touchOn && asleep) wake("touch");
         Serial.printf("touch %s (%lu)\n", touchOn ? "on" : "off", (unsigned long)touchCount);
       }
     } else touchEdge = 0;
-    if (touchOn) {
-      lastActive = now;                        // do not sleep mid test
-      // Nobody holds a pad for half a minute. If it has been "touched"
-      // that long then the resting level was read wrong at boot, which
-      // a finger on the pad while it started up would do. Take it again
-      // rather than leaving the screen inverted for ever.
-      if (now - touchOnAt > 30000UL) {
-        touchRest = !touchRest;
-        touchOn = false; touchEdge = 0;
-        oled.invertDisplay(false);
-        Serial.printf("touch held 30s; resting level taken again as %s\n",
-                      touchRest ? "high" : "low");
-      }
-    }
+    if (touchOn) lastActive = now;             // do not sleep mid test
   }
 
   // A knock that dismissed a card has already been acted on. Swallow the
@@ -6720,12 +6732,15 @@ void setup() {
   if (!fsOk) Serial.println("no filesystem");
   loadShelf();
 
-  // Whatever the pad is doing before anyone has touched it is resting.
+  // A first guess at resting, so it is right from the first second
+  // rather than after a minute. Not load bearing: the poll keeps
+  // watching and will correct this on its own if it is wrong.
   // Pulled down, so an unconnected pin rests low and nothing inverts.
   pinMode(TOUCH_PIN, INPUT_PULLDOWN);
   { int hi = 0;
     for (int i = 0; i < 12; i++) { if (digitalRead(TOUCH_PIN)) hi++; delay(3); }
     touchRest = (hi >= 7);
+    touchLvl = touchRest; touchLvlAt = millis();
     Serial.printf("touch pad on GPIO%d rests %s\n", TOUCH_PIN, touchRest ? "high" : "low");
   }
 
