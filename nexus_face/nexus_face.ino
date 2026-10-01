@@ -86,17 +86,54 @@
 // and the flip would have fought it.
 #define TOUCH_PIN 5
 bool     touchRest  = false;     // the level it sits at with nobody near
-bool     touchOn    = false;     // inverted right now
+bool     touchOn    = false;     // a finger is on it right now
 uint32_t touchCount = 0;
 uint32_t touchEdge  = 0;         // when the level last disagreed with us
 bool     touchLvl   = false;     // what the pin read last time
 uint32_t touchLvlAt = 0;         // when it last changed
 #define TOUCH_REST_MS 60000UL    // held this long and it is the resting level
+
+// ---------------- what a touch means ----------------
+//  The pad is the way this is driven now, and knocking is the thing you
+//  switch on if you want it. Four gestures:
+//
+//    one     next. The next screen at the top, the next item in a list
+//    two     open, choose, confirm
+//    three   straight home from wherever you are
+//    long    back, out one level
+//
+//  A single cannot be acted on the moment you lift, because a second
+//  might be coming: it waits TOUCH_GAP_MS first. A double waits the
+//  same again in case a third is coming. A triple does not wait at all,
+//  since nothing longer can follow it, and a long press fires while
+//  your finger is still down, which is why it feels the most immediate
+//  of the four.
+#define TOUCH_LONG_MS 700UL      // held this long and it is a long press
+#define TOUCH_GAP_MS  300UL      // quiet for this long and the count is final
+#define TOUCH_DEBOUNCE 40UL
+enum { TG_ONE = 1, TG_TWO, TG_THREE, TG_LONG };
+uint32_t touchPressAt = 0;       // when the finger went down
+uint32_t touchLiftAt  = 0;       // when it last came up
+uint8_t  touchTaps    = 0;       // lifts so far in this run
+bool     touchLongDone = false;  // the long press already fired this press
+
+// Changing the watch face from the clock, with the pad. A long press on
+// the clock goes in, the screen blinks once to say so, single presses
+// walk the faces and a long press leaves. It is a mode rather than a
+// gesture because there are twenty faces and you want to sit in it.
+bool     faceMode = false;
+uint32_t blinkUntil = 0;         // the screen is inverted until this
+bool     blinkOn = false;        // and whether the panel has been told
+#define BLINK_MS 170UL
+
+// Knocking. Off unless you ask for it, and when it is on it keeps every
+// meaning it has always had rather than learning the pad's.
+bool cfgKnock = false;
 #define OLED_ADDR 0x3C
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.16.0"
+#define FW_VERSION "3.0.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -168,11 +205,11 @@ unsigned long zikrNext = 0;      // when the next count lands
 
 // ---------------- settings ----------------
 enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
-       C_PRAYER, C_HOTSPOT, C_ACCEL, C_TAP, C_PAIR, C_UPDATE,
+       C_PRAYER, C_HOTSPOT, C_ACCEL, C_KNOCK, C_TAP, C_PAIR, C_UPDATE,
        C_AUTOUP, C_RESET, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
-    "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Tap strength",
+    "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Knocks", "Tap strength",
     "Pair a Mac", "Check update", "Auto update",
     "Reset settings", "Reboot", "About" };
 
@@ -189,6 +226,7 @@ const int BRIGHT_N = sizeof(BRIGHT_OPTS) / sizeof(BRIGHT_OPTS[0]);
 //  used, so it stays the default and nothing changes unless you say so.
 enum { TAP_ULTRA = 0, TAP_LIGHT, TAP_MED, TAP_HARD, TAP_N };
 const char*   TAP_NAME[TAP_N]   = { "ultra light", "light", "medium", "hard" };
+const char* TAP_SHORT[TAP_N] = { "ultra", "light", "medium", "hard" };
 const uint8_t TAP_THRESH[TAP_N] = { 0x14, 0x1C, 0x28, 0x3C };   // 1.25g .. 3.75g
 int  cfgTap  = TAP_MED;
 int  tapPick = TAP_MED;              // what is highlighted while choosing
@@ -1475,6 +1513,13 @@ static void drawHome() {
     case F_BINARY:    faceBinary();     break;
     default:         faceClassic();     break;
   }
+  // Last, over whichever face just drew itself, or a face that fills
+  // the screen would paint straight over it. A single press means
+  // something different in here and nothing else would say so.
+  if (faceMode) {
+    oled.fillCircle(SCRW - 5, 4, 3, SSD1306_BLACK);
+    oled.fillCircle(SCRW - 5, 4, 2, SSD1306_WHITE);
+  }
   oled.display();
 }
 
@@ -1805,9 +1850,9 @@ static void drawSystem() {
   // count so a touch that happened while the screen was elsewhere still
   // shows. "rest hi" or "rest lo" says which way round it decided the
   // board drives the pin.
-  { char tc[8]; numStr(tc, sizeof(tc), touchCount);   // the count keeps growing
-    snprintf(v, sizeof(v), "%s %s %s", touchOn ? "ON" : "--",
-             tc, touchRest ? "hi" : "lo"); }
+  { char tc[8]; numStr(tc, sizeof(tc), touchCount);
+    snprintf(v, sizeof(v), "%s %s%s", touchOn ? "ON" : "--",
+             tc, cfgKnock ? " +k" : ""); }
   vals[3] = v;
 
   for (int i = 0; i < 4; i++) {
@@ -2400,8 +2445,12 @@ static void drawSettings() {
       case C_FACE:   snprintf(v, sizeof(v), "%s", FACE_NAME[cfgFace]); break;
       case C_PRAYER: snprintf(v, sizeof(v), "%s", prayerOk ? "saved" : "none"); break;
       case C_ACCEL:  snprintf(v, sizeof(v), "x2"); break;
+      case C_KNOCK:  snprintf(v, sizeof(v), "%s", cfgKnock ? "on" : "off"); break;
       case C_PAIR:   snprintf(v, sizeof(v), "%s", cfgLock ? "paired" : "x2"); break;
-      case C_TAP:    snprintf(v, sizeof(v), "%s", TAP_NAME[cfgTap]); break;
+      // Only means anything with knocking switched on, and says so
+      // rather than offering a setting that does nothing.
+      case C_TAP:    snprintf(v, sizeof(v), "%s",
+                              cfgKnock ? TAP_SHORT[cfgTap] : "off"); break;
       case C_AUTOUP: snprintf(v, sizeof(v), "%s", cfgAutoUp ? "on" : "off"); break;
       case C_ABOUT:  snprintf(v, sizeof(v), "x2"); break;
       case C_SLEEP:  if (!sleepSecs())         snprintf(v, sizeof(v), "never");
@@ -3118,7 +3167,7 @@ static void rlDraw() {
 
 // ---------------- Echo ----------------
 //  For someone small. Nothing to dodge, nothing that speeds up and no
-//  tilting: the robot knocks a little pattern and you knock it back,
+//  tilting: the robot taps a little pattern and you touch it back,
 //  and every round it adds one more. Beats are one, two or three knocks
 //  and never four, because four is the top of what the chip counts and
 //  the one most likely to come out as three on a small hand.
@@ -3164,7 +3213,7 @@ static void ecDraw() {
       else           oled.drawCircle(x0 + i * 18, 33, 7, SSD1306_WHITE);
     }
   } else {
-    ctr("knock it back", 30, 1);
+    ctr("touch it back", 30, 1);
   }
   // one block per beat, filled for the ones already knocked back
   int w = ecLen > 12 ? 5 : 7;
@@ -3350,7 +3399,7 @@ static void dzDraw() {
 }
 
 // ---------------- Balloon ----------------
-//  Knock to puff it up. It bursts somewhere, and nobody knows where.
+//  Touch to puff it up. It bursts somewhere, and nobody knows where.
 //  Every burst is one puff whatever its size, so a heavy knock that
 //  bounces into three cannot cost three puffs, and no knock walks out
 //  of the game either. The bang is the end of the round.
@@ -3398,7 +3447,7 @@ static void blDraw() {
   oled.fillCircle(CX - r / 3, CY - r / 3, 2, SSD1306_WHITE);   // a shine
 
   // No hint over the top of it: the balloon fills this space once it
-  // gets going, and the ready screen has already said what to do. The
+  // gets going, and the ready screen has already said to touch. The
   // tally sits in the corner, clear of the widest it can get.
   char m[10];
   snprintf(m, sizeof(m), "%d", blPuffs);
@@ -3445,10 +3494,10 @@ static const char* gameHint(int g) {
     case G_CAR:   return "Tilt to change lane";
     case G_CATCH: return "Tilt to catch";
     case G_PONG:  return "Tilt to return it";
-    case G_ECHO:  return "Knock it back";
+    case G_ECHO:  return "Touch it back";
     case G_MAZE:  return "Tilt to the star";
     case G_DIZZY: return "Shake me about";
-    case G_BALLOON: return "Knock to puff";
+    case G_BALLOON: return "Touch to puff";
     default:      return "Tilt to roll it";
   }
 }
@@ -4780,6 +4829,7 @@ static void resetSettings() {
   cfgAutoTurn = false; prefs.putBool("turn", cfgAutoTurn);
   cfgTap = TAP_MED;  prefs.putInt("tap", cfgTap);      applyTap();
   cfgAutoUp = false; prefs.putBool("autoup", cfgAutoUp);
+  cfgKnock = false;  prefs.putBool("knock", cfgKnock);
   deepOff = false;   prefs.putBool("nodeep", deepOff);
   for (int i = 0; i < 5; i++) prayerAdj[i] = 0;
   saveAdj();
@@ -4787,21 +4837,36 @@ static void resetSettings() {
 }
 
 static void goDeep() {
-  if (!intWired || deepOff) return;
-  Serial.println("switching off until moved");
+  // The pad can wake it now, so this no longer needs INT1 soldered.
+  // Until this version deep sleep simply never happened on a board
+  // without that wire, which is every board this has ever run on.
+  //
+  // One catch worth knowing about: the wake call takes a single level
+  // for every pin in the mask. INT1 is active high, so it can only come
+  // along when the pad is active high too. On a pad wired the other way
+  // round the pad wakes it and the accelerometer does not.
+  bool wakeHigh = !touchRest;                  // the level that means touched
+  bool useInt   = intWired && cfgKnock && wakeHigh;
+  if (deepOff) return;
+  Serial.printf("switching off until touched%s\n", useInt ? " or moved" : "");
 
-  wReg(adxl, A_THRESH_ACT, 0x08);              // about 500mg, a lift not a nudge
-  wReg(adxl, A_ACT_INACT_CTL, 0xF0);           // ac coupled, all three axes
-  wReg(adxl, A_INT_MAP, 0x00);                 // everything out of INT1
-  wReg(adxl, A_INT_ENABLE, INT_ACT);           // nothing else matters now
-  rReg(adxl, A_INT_SOURCE);                    // clear whatever is pending
+  if (useInt) {
+    wReg(adxl, A_THRESH_ACT, 0x08);            // about 500mg, a lift not a nudge
+    wReg(adxl, A_ACT_INACT_CTL, 0xF0);         // ac coupled, all three axes
+    wReg(adxl, A_INT_MAP, 0x00);               // everything out of INT1
+    wReg(adxl, A_INT_ENABLE, INT_ACT);         // nothing else matters now
+    rReg(adxl, A_INT_SOURCE);                  // clear whatever is pending
+  }
 
   screenPower(false);
   prefs.end();
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
 
-  esp_deep_sleep_enable_gpio_wakeup(BIT(TAP_INT_PIN), ESP_GPIO_WAKEUP_GPIO_HIGH);
+  uint64_t mask = BIT(TOUCH_PIN);
+  if (useInt) mask |= BIT(TAP_INT_PIN);
+  esp_deep_sleep_enable_gpio_wakeup(mask, wakeHigh ? ESP_GPIO_WAKEUP_GPIO_HIGH
+                                                   : ESP_GPIO_WAKEUP_GPIO_LOW);
   long secs = secsToNextAlert();
   if (secs > 0) esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
   esp_deep_sleep_start();
@@ -5243,6 +5308,11 @@ static void knockTwo() {
       case C_HOTSPOT: startHotspot(); break;
       case C_PRAYER:  prayerWanted = true; nextPrayerTry = 0; break;
       case C_ACCEL:   depth = 2; break;
+      case C_KNOCK:
+        cfgKnock = !cfgKnock;
+        prefs.putBool("knock", cfgKnock);
+        flash(cfgKnock ? "KNOCKS ON" : "KNOCKS OFF", 1100);
+        break;
       case C_PAIR:    depth = 2; newPairCode(); break;
       default:        depth = 2; break;
     }
@@ -5380,8 +5450,64 @@ static void onFall() {
   react(300);
 }
 
+// A gesture off the pad. Knocking, when it is switched on, keeps every
+// meaning it ever had; this is a second vocabulary beside it rather
+// than a translation of it.
+//
+//   one    next          two   open        three  home        long  back
+//
+// Most of it is the knock handlers, because "next" and "open" are the
+// same jobs whichever way you asked for them. What is not shared is the
+// clock, where a long press opens the faces instead of going back,
+// since there is nowhere back to go from the clock.
+static void touchGesture(uint8_t g) {
+  lastActive = millis();
+  Serial.printf("touch gesture %u (screen %s depth %d)\n", g, S_NAME[screen], depth);
+
+  // Trying a tap strength is the one screen where knocking is the
+  // thing being measured. The pad still works in there, so there is
+  // always a way out of it.
+  if (tapTesting && tapChosen && g == TG_LONG) { tapTesting = false; return; }
+
+  // Games played on the pad. The gesture is the move, not a command.
+  if (screen == S_GAMES && depth == 2 && gState == GS_PLAY) {
+    if (itemIdx == G_ECHO && !ecShow && g <= TG_THREE) { ecKnock(g); return; }
+    if (itemIdx == G_BALLOON && !blBang && g <= TG_THREE) { blPuff(); return; }
+    if (itemIdx == G_DIZZY && g <= TG_THREE) return;     // shaking is the game
+  }
+
+  // The faces, from the clock.
+  if (faceMode) {
+    switch (g) {
+      case TG_ONE:   cfgFace = (cfgFace + 1) % FACE_N; prefs.putInt("face", cfgFace); break;
+      case TG_TWO:   cfgFace = (cfgFace + FACE_N - 1) % FACE_N; prefs.putInt("face", cfgFace); break;
+      default:       faceMode = false; blinkUntil = millis() + BLINK_MS; break;
+    }
+    return;
+  }
+  if (g == TG_LONG && screen == S_HOME && depth == 0 && timeOk) {
+    faceMode = true;
+    blinkUntil = millis() + BLINK_MS;         // one blink, so you know where you are
+    return;
+  }
+
+  switch (g) {
+    case TG_ONE:   knockOne();   break;
+    case TG_TWO:   knockTwo();   break;
+    case TG_LONG:  knockThree(); break;       // out one level
+    case TG_THREE:                            // straight home from anywhere
+      if (dndUntil || relaxOn || canvasUntil || toastUntil) { knockOne(); break; }
+      screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
+      break;
+  }
+}
+
 static void settleBurst() {
   if (!burst) return;
+  // Knocking is off unless you switch it on. The burst is still counted
+  // up to here so that turning it on takes effect at once, and so the
+  // counters on the vitals face keep telling the truth.
+  if (!cfgKnock && !tapTesting) { burst = 0; return; }
   if (burst < 4 && millis() - burstStart < TAP_WINDOW_MS) return;   // four is all there is
   uint8_t n = burst;
   burst = 0;
@@ -5406,21 +5532,10 @@ static void settleBurst() {
   // once a burst has been turned into next, open or back, the count is
   // gone and the game never sees it.
   if (screen == S_GAMES && depth == 2 && gState == GS_PLAY) {
-    if (itemIdx == G_ECHO && !ecShow) {
-      ecKnock(n);
-      lastActive = millis();
-      Serial.printf("knock x%u -> echo\n", n);
-      return;
-    }
-    if (itemIdx == G_BALLOON && !blBang) {
-      // One puff per burst, whatever size it came out as. A heavy knock
-      // that bounces into three would otherwise cost three puffs and
-      // burst a balloon that was nowhere near ready.
-      blPuff();
-      lastActive = millis();
-      Serial.printf("knock x%u -> one puff\n", n);
-      return;
-    }
+    // Echo and Balloon are played on the pad now, so a knock in there
+    // is nothing at all rather than a second way to play: a stray knock
+    // counting as part of an answer is how you lose a round you had.
+    if (itemIdx == G_ECHO || itemIdx == G_BALLOON) { lastActive = millis(); return; }
     if (itemIdx == G_DIZZY) {
       // Shaking throws off knocks by the handful. Any of them being a
       // command would end the game the moment it got going, so none of
@@ -5454,19 +5569,41 @@ static void input() {
       Serial.printf("pad resting level is now %s\n", touchRest ? "high" : "low");
     }
 
+    // The pad settles before anything believes it, so a noisy edge is
+    // not a press and a bounce on the way up is not a lift.
     bool want = (lvl != touchRest);
     if (want != touchOn) {
       if (!touchEdge) touchEdge = now;
-      if (now - touchEdge >= 40) {             // settle, so an edge cannot flicker it
+      if (now - touchEdge >= TOUCH_DEBOUNCE) {
         touchOn = want; touchEdge = 0;
-        oled.invertDisplay(touchOn);
-        if (touchOn) touchCount++;
         lastActive = now;
-        if (touchOn && asleep) wake("touch");
-        Serial.printf("touch %s (%lu)\n", touchOn ? "on" : "off", (unsigned long)touchCount);
+        if (touchOn) {
+          touchCount++;
+          touchPressAt = now;
+          touchLongDone = false;
+          if (asleep) { wake("touch"); touchTaps = 0; touchLongDone = true; }
+        } else if (!touchLongDone) {
+          // A lift that was not already spent on a long press counts.
+          if (touchTaps < 3) touchTaps++;
+          touchLiftAt = now;
+          if (touchTaps == 3) { touchGesture(TG_THREE); touchTaps = 0; }
+        }
       }
     } else touchEdge = 0;
-    if (touchOn) lastActive = now;             // do not sleep mid test
+
+    // Long presses fire under your finger rather than after it, which
+    // is what makes them feel like the quickest of the four.
+    if (touchOn && !touchLongDone && now - touchPressAt >= TOUCH_LONG_MS) {
+      touchLongDone = true;
+      touchTaps = 0;
+      touchGesture(TG_LONG);
+    }
+    // Quiet long enough that nothing more is coming.
+    if (!touchOn && touchTaps && now - touchLiftAt >= TOUCH_GAP_MS) {
+      uint8_t n = touchTaps; touchTaps = 0;
+      touchGesture(n == 1 ? TG_ONE : TG_TWO);
+    }
+    if (touchOn) lastActive = now;             // a finger on it is not idle
   }
 
   // A knock that dismissed a card has already been acted on. Swallow the
@@ -5872,6 +6009,8 @@ static void apiState() {
   o += "\"timeOk\":" + String(timeOk ? "true" : "false") + ",";
   o += "\"clockSrc\":\"" + String(clockSrc) + "\",";
   o += "\"asleep\":" + String(asleep ? "true" : "false") + ",\"fw\":\"" FW_VERSION "\",";
+  o += "\"knock\":" + String(cfgKnock ? "true" : "false") + ",";
+  o += "\"touches\":" + String((unsigned long)touchCount) + ",";
   o += "\"k1\":" + String(cTap) + ",\"k2\":" + String(cDouble) + ",\"k3\":" + String(cTriple) +
        ",\"k4\":" + String(cQuad) + ",\"fall\":" + String(cFall) + ",\"boots\":" + String(cBoot) + ",";
   o += "\"autoTurn\":" + String(cfgAutoTurn ? "true" : "false") + ",";
@@ -6191,6 +6330,10 @@ static void setupWeb() {
     else if (k == "slpi") { cfgSleepIdx = constrain(v, 0, SLEEP_N - 1);   prefs.putInt("slpi", cfgSleepIdx); }
     else if (k == "popi") { cfgPopupIdx = constrain(v, 0, POPUP_N - 1);   prefs.putInt("popi", cfgPopupIdx); }
     else if (k == "eye")  { cfgEyes     = constrain(v, 0, STYLE_N - 1);   prefs.putInt("eye", cfgEyes); applyEyes(cfgEyes); }
+    // Reachable from the app on purpose. The pad is the only thing
+    // driving this now, so if the pad ever stops there has to be a way
+    // back in that does not involve the pad, and the network is it.
+    else if (k == "knock"){ cfgKnock    = (v != 0);                      prefs.putBool("knock", cfgKnock); }
     else { web.send(400, "application/json", "{\"ok\":false,\"err\":\"no such setting\"}"); return; }
     okJson();
   });
@@ -6699,6 +6842,7 @@ void setup() {
   cfgFollow   = prefs.getBool("follow", false);
   cfgTap      = constrain(prefs.getInt("tap", TAP_MED), 0, TAP_N - 1);
   cfgAutoUp   = prefs.getBool("autoup", false);
+  cfgKnock    = prefs.getBool("knock", false);   // the pad drives this now
   nextAutoUp  = millis() + 120000;          // not in the first two minutes
   cfgTz       = prefs.getString("tz", DEF_TZ);
   cfgSsid     = prefs.getString("ssid", "");
@@ -7123,6 +7267,12 @@ void loop() {
     return;
   }
 
+  // One inverse blink says a mode changed. A panel command rather than
+  // anything drawn, so it costs one message each way and survives every
+  // redraw in between.
+  { bool want = (long)(blinkUntil - now) > 0;
+    if (want != blinkOn) { blinkOn = want; oled.invertDisplay(blinkOn); } }
+
   if (now - lastDraw >= 110) {
     lastDraw = now;
     switch (screen) {
@@ -7136,6 +7286,17 @@ void loop() {
       case S_SETTINGS: drawSettings(); break;
       case S_SYSTEM:   drawSystem();   break;
       default:         drawHome();     break;
+    }
+    // Over the top of whatever that was. A long press is the only
+    // gesture with no sound and no movement behind it, so this is how
+    // you know it is counting and how long you have to let go.
+    if (touchOn && !touchLongDone) {
+      uint32_t held = now - touchPressAt;
+      if (held > TOUCH_LONG_MS) held = TOUCH_LONG_MS;
+      int w = (int)((SCRW - 8) * held / TOUCH_LONG_MS);
+      oled.fillRect(0, SCRH - 3, SCRW, 3, SSD1306_BLACK);
+      if (w > 0) oled.fillRect(4, SCRH - 2, w, 2, SSD1306_WHITE);
+      oled.display();
     }
   }
   delay(2);
