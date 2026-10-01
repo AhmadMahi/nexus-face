@@ -104,6 +104,12 @@
 #define BATT_MUL  2              // 200K over 200K, so half of the pack
 float    battV = NAN;
 uint32_t battNext = 0;
+// What this pack reads when it is full. Measured at 4.09V it was being
+// called 89%, which is exactly where 4.09 lands on a curve drawn for a
+// cell that charges to 4.20. It does not; most do not quite. The whole
+// curve is scaled to whatever this says, so the top of the charge is
+// the top of the scale.
+float    battFull = 4.10f;
 
 #define TOUCH_PIN 5
 bool     touchRest  = false;     // the level it sits at with nobody near
@@ -138,6 +144,12 @@ uint32_t touchLvlAt = 0;         // when it last changed
 //  your finger is still down, which is why it feels the most immediate
 //  of the four.
 #define TOUCH_LONG_MS 700UL      // held this long and it is a long press
+// Keep holding and it keeps meaning more. Nothing is shown for the
+// first five seconds, because a bar on screen during ordinary use was
+// worse than the thing it explained; nobody holds for five seconds by
+// accident, so after that it is safe to say what is about to happen.
+#define TOUCH_HOME_MS  5000UL
+#define TOUCH_SLEEP_MS 10000UL
 #define TOUCH_GAP_MS  300UL      // quiet for this long and the count is final
 #define TOUCH_DEBOUNCE 40UL
 enum { TG_ONE = 1, TG_TWO, TG_THREE, TG_LONG };
@@ -145,6 +157,8 @@ uint32_t touchPressAt = 0;       // when the finger went down
 uint32_t touchLiftAt  = 0;       // when it last came up
 uint8_t  touchTaps    = 0;       // lifts so far in this run
 bool     touchLongDone = false;  // the long press already fired this press
+uint8_t  touchHold    = 0;       // 0 nothing, 1 past home, 2 past sleep
+bool     wantDeep     = false;   // asked for, by holding or by the Mac letting go
 
 // Changing the watch face from the clock, with the pad. A long press on
 // the clock goes in, the screen blinks once to say so, single presses
@@ -155,18 +169,27 @@ bool     faceMode = false;
 // Knocking. Off unless you ask for it, and when it is on it keeps every
 // meaning it has always had rather than learning the pad's.
 bool cfgKnock = false;
+// A shake steps back one. On by default, because with the pad doing
+// everything a second way out is worth having, and a shake is the one
+// gesture you can make without looking at the thing.
+bool cfgShake = true;
 
-// What is allowed to bring it back from being switched off. Both by
-// default, because being unable to wake a thing on your own desk is a
-// worse fault than a little current.
-enum { WAKE_BOTH = 0, WAKE_TOUCH, WAKE_MOVE, WAKE_N };
-const char* WAKE_NAME[WAKE_N] = { "both", "touch", "move" };
-int cfgWake = WAKE_BOTH;
+// How long with nothing happening before it switches off properly,
+// rather than just turning the screen off. Separate from the screen
+// timeout on purpose: the screen can go dark after fifteen seconds
+// without it mattering, but powering down drops the network, and
+// coming back costs a few seconds of reconnecting before anything
+// works. Two minutes is long enough not to be in the way.
+const uint16_t DEEP_OPTS[] = { 60, 120, 300, 600, 1800, 0 };
+const char* DEEP_NAME[] = { "1m", "2m", "5m", "10m", "30m", "never" };
+#define DEEP_N 6
+int cfgDeepIdx = 1;
+static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL; }
 #define OLED_ADDR 0x3C
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "3.2.0"
+#define FW_VERSION "4.0.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -212,11 +235,31 @@ uint8_t adxl = 0, mpu = 0;
 float ax, ay, az, amag = 1, mx, my, mz, gxr, gyr, gzr, mtemp;
 
 // ---------------- screens ----------------
-enum { S_HOME = 0, S_FOCUS, S_WEATHER, S_MSG, S_PRAYER,
+enum { S_HOME = 0, S_REMIND, S_FOCUS, S_WEATHER, S_MSG, S_PRAYER,
        S_FAITH, S_READS, S_GAMES, S_SETTINGS, S_SYSTEM, S_COUNT };
 const char* S_NAME[S_COUNT] =
-  { "HOME", "FOCUS", "WEATHER", "MESSAGES", "PRAYER",
+  { "HOME", "REMINDERS", "FOCUS", "WEATHER", "MESSAGES", "PRAYER",
     "FAITH", "SHORT READS", "GAMES", "SETTINGS", "SYSTEM" };
+
+// ---------------- reminders ----------------
+//  Kept here rather than on the Mac, which is where they used to live.
+//  The Mac knew the time and the robot did not, so the Mac held the
+//  list and said the word when one came due. That stops working the
+//  moment the robot is asleep with the lid shut somewhere else: it
+//  cannot be told about nine o'clock by a laptop that is not there.
+//
+//  So the robot keeps them, and works out for itself when to wake. The
+//  clock keeps running through deep sleep, so a reminder set tonight
+//  still lands at nine tomorrow with no network and no Mac.
+#define REM_MAX 12
+#define REM_TEXT 64
+struct Rem { char text[REM_TEXT]; uint32_t at; bool done; };
+Rem  rems[REM_MAX];
+int  remCount = 0;
+int  remIdx = 0;                   // which one is being read
+uint32_t remCheck = 0;
+bool remConfirm = false;           // on the clear-them-all question
+bool remYes = false;
 
 // depth 0 the carousel, 1 a list, 2 inside it, 3 one level deeper
 int screen = S_HOME;
@@ -238,12 +281,13 @@ unsigned long zikrNext = 0;      // when the next count lands
 
 // ---------------- settings ----------------
 enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
-       C_PRAYER, C_HOTSPOT, C_ACCEL, C_KNOCK, C_TAP, C_WAKE, C_PAIR, C_UPDATE,
+       C_PRAYER, C_HOTSPOT, C_ACCEL, C_KNOCK, C_TAP, C_SHAKE, C_DEEP, C_BATT,
+       C_PAIR, C_UPDATE,
        C_AUTOUP, C_RESET, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
     "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Knocks", "Tap strength",
-    "Wake on",
+    "Shake to go back", "Power down", "Battery full at",
     "Pair a Mac", "Check update", "Auto update",
     "Reset settings", "Reboot", "About" };
 
@@ -715,6 +759,10 @@ static void startSensors() {
 // 3.0 to 4.2 would read 50% for most of an afternoon and then drop off
 // a cliff. This is the usual discharge shape, in steps.
 static int battPct(float v) {
+  // The curve below is drawn for a cell that tops out at 4.20, so a
+  // pack that stops lower is scaled up to meet it rather than being
+  // told it is never quite full.
+  if (battFull > 3.5f) v *= (4.20f / battFull);
   static const float V[] = { 3.00f, 3.45f, 3.68f, 3.74f, 3.77f, 3.79f,
                              3.82f, 3.87f, 3.93f, 4.00f, 4.10f, 4.20f };
   static const int   P[] = {     0,     5,    10,    20,    30,    40,
@@ -1410,8 +1458,10 @@ static void faceInfograph() {
   oled.setTextSize(1);
   at(64 + 5 * 6 + 2, 31, fb.ss);
 
-  char dd[12];
-  snprintf(dd, sizeof(dd), "%02d %.3s", fb.mday, fb.dshort + 3);
+  char dd[14];
+  if (isnan(battV)) snprintf(dd, sizeof(dd), "%02d %.3s", fb.mday, fb.dshort + 3);
+  else              snprintf(dd, sizeof(dd), "%02d %.3s %d%%", fb.mday, fb.dshort + 3,
+                             battPct(battV));
   at(3, 54, dd);
 
   char pn[10], pw[8];
@@ -1444,10 +1494,10 @@ static void faceStatus() {
   // a long uptime and a long boot count together came to more than the
   // screen is wide.
   char u[12]; upStr(u, sizeof(u));
-  char l[16], r2[16], b[8];
-  numStr(b, sizeof(b), cBoot);
+  char l[16], r2[16];
   snprintf(l,  sizeof(l),  "up %s", u);
-  snprintf(r2, sizeof(r2), "boots %s", b);
+  if (isnan(battV)) snprintf(r2, sizeof(r2), "no pack");
+  else              snprintf(r2, sizeof(r2), "batt %d%%", battPct(battV));
   at(3, 53, l);
   at(SCRW - 2 - (int)strlen(r2) * 6, 53, r2);
 }
@@ -1471,7 +1521,8 @@ static void faceVitals() {
   snprintf(l[1], 14, "up %s",    u);
   snprintf(l[2], 14, "slept %s", ns);
   snprintf(l[3], 14, "taps %s",  nt);
-  snprintf(l[4], 14, "heap %uk", (unsigned)(ESP.getFreeHeap() / 1024));
+  if (isnan(battV)) snprintf(l[4], 14, "batt none");
+  else              snprintf(l[4], 14, "batt %d%%", battPct(battV));
   if (online()) snprintf(l[5], 14, "rssi %d", (int)WiFi.RSSI());
   else          snprintf(l[5], 14, "offline");
   for (int i = 0; i < 6; i++) at(i % 2 ? 68 : 4, 17 + (i / 2) * 15, l[i]);
@@ -1509,8 +1560,8 @@ static void faceTerminal() {
     snprintf(l[2], 24, "net   none");
     snprintf(l[3], 24, "rssi  --");
   }
-  char nb[8]; numStr(nb, sizeof(nb), cBoot);
-  snprintf(l[4], 24, "boots %s", nb);
+  if (isnan(battV)) snprintf(l[4], 24, "batt  no pack");
+  else              snprintf(l[4], 24, "batt  %d%% %.2fV", battPct(battV), battV);
   char u[12]; upStr(u, sizeof(u));
   snprintf(l[5], 24, "up    %s", u);
   for (int i = 0; i < 6; i++) {
@@ -1768,7 +1819,7 @@ static void drawZikr() {
   if (zikrTotal >= 100) {
     ctr("COMPLETE", 22, 2);
     ctr("One hundred", 44, 1);
-    ctr("Four knocks to reset", 54, 1);
+    ctr("Hold to reset", 54, 1);
     oled.display();
     return;
   }
@@ -1807,7 +1858,7 @@ static void drawFaithCard() {
   oled.clearDisplay();
   bar("FAITH");
   bookIcon(SCRW / 2, 32);
-  ctr("Two knocks to open", 52, 1);
+  ctr("Hold to open", 52, 1);
   oled.display();
 }
 
@@ -1864,7 +1915,7 @@ static void drawReads() {
     if (readCount) snprintf(l, sizeof(l), "%d on the shelf", readCount);
     else           snprintf(l, sizeof(l), "%s", storyState.c_str());
     ctr(l, 45, 1);
-    ctr(readCount ? "Two knocks to open" : "Four knocks to write", 55, 1);
+    ctr(readCount ? "Hold to open" : "Hold to fetch some", 55, 1);
     oled.display();
     return;
   }
@@ -1890,6 +1941,92 @@ static void drawReads() {
 //  SYSTEM
 //    Four facts, generously spaced. No gauge, no crowding.
 // ================================================================
+// A reminder, the way a watch shows a message: the time it is for
+// along the top and the whole of it underneath, wrapped, with nothing
+// else competing for the room.
+static void drawReminders() {
+  oled.clearDisplay();
+
+  if (depth == 0) {                              // the summary
+    bar("REMINDERS");
+    int p = remPending();
+    if (!remCount) {
+      ctr("nothing to remember", 26, 1);
+      ctr("Rafiq puts them here", 40, 1);
+    } else {
+      char c[20];
+      snprintf(c, sizeof(c), "%d waiting", p);
+      ctr(c, 20, 2);
+      // the soonest one, so the summary says something useful
+      int next = -1;
+      for (int i = 0; i < remCount; i++) if (!rems[i].done) { next = i; break; }
+      if (next >= 0) {
+        time_t tt = (time_t)rems[next].at;
+        struct tm lt; localtime_r(&tt, &lt);
+        char w[24];
+        strftime(w, sizeof(w), "next at %H:%M", &lt);
+        ctr(w, 44, 1);
+      }
+      ctr("hold to read", 55, 1);
+    }
+    oled.display();
+    return;
+  }
+
+  // Past the last one: the offer to be rid of them.
+  if (remIdx >= remCount) {
+    if (remConfirm) {
+      bar("CLEAR THEM ALL");
+      ctr("Throw away every", 20, 1);
+      ctr("reminder?", 31, 1);
+      yesNo(remYes);
+      ctr("1 moves   hold yes", 55, 1);
+    } else {
+      bar("REMINDERS");
+      ctr("that is all of them", 22, 1);
+      ctr("hold to clear them", 38, 1);
+      ctr("2 to go back", 54, 1);
+    }
+    oled.display();
+    return;
+  }
+
+  const Rem& r = rems[remIdx];
+  time_t tt = (time_t)r.at;
+  struct tm lt; localtime_r(&tt, &lt);
+  char when[22];
+  strftime(when, sizeof(when), "%H:%M  %a %d %b", &lt);
+
+  // The time across the top, on its own band, then the words. Nothing
+  // else: no count, no hints, the way a watch shows you a message.
+  oled.fillRect(0, 0, SCRW, 11, SSD1306_WHITE);
+  oled.setTextColor(SSD1306_BLACK);
+  at(3, 2, when);
+  if (r.done) at(SCRW - 3 - 4 * 6, 2, "done");
+  oled.setTextColor(SSD1306_WHITE);
+
+  // wrapped on words, 21 to a line, four lines of room
+  const int CW = 21, LINES = 4;
+  char buf[REM_TEXT + 8];
+  snprintf(buf, sizeof(buf), "%s", r.text);
+  int len = (int)strlen(buf), pos = 0, line = 0;
+  while (pos < len && line < LINES) {
+    int take = len - pos; if (take > CW) take = CW;
+    if (pos + take < len) {                      // break on a space if we can
+      int sp = take;
+      while (sp > 0 && buf[pos + sp] != ' ') sp--;
+      if (sp > 4) take = sp;
+    }
+    char row[CW + 1];
+    memcpy(row, buf + pos, take); row[take] = 0;
+    at(3, 16 + line * 11, row);
+    pos += take;
+    while (pos < len && buf[pos] == ' ') pos++;
+    line++;
+  }
+  oled.display();
+}
+
 static void drawSystem() {
   oled.clearDisplay();
   titleBar("SYSTEM", FW_VERSION);
@@ -1972,10 +2109,10 @@ static void drawFocus() {
       for (int i = 0; i < taskCount; i++) if (!tasks[i].done) left++;
       snprintf(l, sizeof(l), "%d still to do", left);
       ctr(l, 24, 1);
-      ctr("Two knocks to see", 42, 1);
+      ctr("Hold to see", 42, 1);
     } else {
       ctr("Nothing planned", 22, 1);
-      ctr("Two knocks for the", 38, 1);
+      ctr("Hold for the", 38, 1);
       ctr("stopwatch", 48, 1);
     }
     oled.display();
@@ -2247,7 +2384,7 @@ static void drawPair() {
   oled.clearDisplay();
   bar("PAIR");
   if (pairCode < 0 || millis() > pairUntil) {
-    ctr("Two knocks for a code", 26, 1);
+    ctr("Hold for a code", 26, 1);
     ctr(cfgLock ? "A Mac is paired" : "Open to any Mac", 44, 1);
     oled.display();
     return;
@@ -2289,7 +2426,7 @@ static void drawToast() {
     long m = (long)(toastUntil - millis()) / 1000L;
     ctr(toastText.length() ? toastText.c_str()
                            : "Stand up, look away", 24, 1);
-    ctr("Knock twice to snooze", 40, 1);
+    ctr("Touch twice to snooze", 40, 1);
     int bw = SCRW - 30;
     oled.drawRect(15, 52, bw, 5, SSD1306_WHITE);
     if (m > 0) oled.fillRect(16, 53, (bw - 2) * constrain((int)m, 0, 20) / 20, 3, SSD1306_WHITE);
@@ -2474,7 +2611,7 @@ static void drawSettings() {
   if (depth == 0) {
     bar("SETTINGS");
     gearIcon(SCRW / 2, 32, 11);
-    ctr("Two knocks to open", 52, 1);
+    ctr("Hold to open", 52, 1);
     oled.display();
     return;
   }
@@ -2487,7 +2624,7 @@ static void drawSettings() {
     ctr("Put everything back", 18, 1);
     ctr("the way it came?", 28, 1);
     ctr("Networks stay", 40, 1);
-    ctr("2 yes    3 no", 54, 1);
+    ctr("1 moves   hold yes", 54, 1);
     oled.display();
     return;
   }
@@ -2517,7 +2654,9 @@ static void drawSettings() {
       case C_PRAYER: snprintf(v, sizeof(v), "%s", prayerOk ? "saved" : "none"); break;
       case C_ACCEL:  snprintf(v, sizeof(v), "x2"); break;
       case C_KNOCK:  snprintf(v, sizeof(v), "%s", cfgKnock ? "on" : "off"); break;
-      case C_WAKE:   snprintf(v, sizeof(v), "%s", WAKE_NAME[cfgWake]); break;
+      case C_SHAKE:  snprintf(v, sizeof(v), "%s", cfgShake ? "on" : "off"); break;
+      case C_DEEP:   snprintf(v, sizeof(v), "%s", DEEP_NAME[cfgDeepIdx]); break;
+      case C_BATT:   snprintf(v, sizeof(v), "%.2fV", battFull); break;
       case C_PAIR:   snprintf(v, sizeof(v), "%s", cfgLock ? "paired" : "x2"); break;
       // Only means anything with knocking switched on, and says so
       // rather than offering a setting that does nothing.
@@ -2610,7 +2749,7 @@ static void drawUpdateUI() {
         else        histIcon(TX[i] + 19, 27);
       }
       ctr(upPick == 0 ? "Newest release" : "Earlier releases", 45, 1);
-      ctr("1 next   2 open", 55, 1);
+      ctr("1 next   hold opens", 55, 1);
       break;
     }
 
@@ -2625,7 +2764,7 @@ static void drawUpdateUI() {
         if (i < dots) oled.fillCircle(x, 40, 2, SSD1306_WHITE);
         else          oled.drawCircle(x, 40, 2, SSD1306_WHITE);
       }
-      ctr("3 knocks to stop", 54, 1);
+      ctr("3 touches to stop", 54, 1);
       break;
     }
 
@@ -2634,7 +2773,7 @@ static void drawUpdateUI() {
       ctr(upTag.length() ? upTag.c_str() : "unknown", 15, 1);
       ctr("Put this one on?", 26, 1);
       yesNo(upYes);
-      ctr("1 moves  2 confirms", 55, 1);
+      ctr("1 moves   hold yes", 55, 1);
       break;
     case U_LIST: {
       snprintf(r, sizeof(r), "%d/%d", relSel + 1, relCount);
@@ -2666,12 +2805,12 @@ static void drawUpdateUI() {
       titleBar("UPDATE", "");
       ctr("Already current", 20, 1);
       ctr(upTag.c_str(), 32, 1);
-      ctr("Knock to go back", 50, 1);
+      ctr("Touch to go back", 50, 1);
       break;
     default:
       titleBar("UPDATE", "");
       ctr(upMsg.length() ? upMsg.c_str() : "Something went wrong", 24, 1);
-      ctr("Knock to go back", 46, 1);
+      ctr("Touch to go back", 46, 1);
       break;
   }
   oled.display();
@@ -3865,7 +4004,7 @@ static void drawGamePlay() {
     case G_BALLOON: blDraw(); break;
     default:      rlDraw();  break;
   }
-  if (which == G_BRICK && brStuck && gState == GS_PLAY) ctr("Knock to launch", 44, 1);
+  if (which == G_BRICK && brStuck && gState == GS_PLAY) ctr("Touch to launch", 44, 1);
 
   if (gState == GS_PAUSE) {
     oled.fillRect(10, 22, 108, 26, SSD1306_BLACK);
@@ -3890,7 +4029,7 @@ static void drawGames() {
     oled.clearDisplay();
     bar("GAMES");
     padIcon(SCRW / 2, 30);
-    ctr("Two knocks to open", 50, 1);
+    ctr("Hold to open", 50, 1);
     oled.display();
     return;
   }
@@ -4472,6 +4611,50 @@ static void setStory(const String& text) {
 // ================================================================
 //  WORK SESSION
 // ================================================================
+// One string, pipe separated, the way the tasks are kept. A dozen
+// short lines is not worth a filesystem.
+static void saveRems() {
+  String s;
+  for (int i = 0; i < remCount; i++) {
+    s += String(rems[i].at); s += '\x1f';
+    s += (rems[i].done ? '1' : '0'); s += '\x1f';
+    s += rems[i].text;
+    if (i < remCount - 1) s += '\x1e';
+  }
+  prefs.putString("rems", s);
+}
+static void loadRems() {
+  remCount = 0;
+  String s = prefs.getString("rems", "");
+  int i = 0;
+  while (i < (int)s.length() && remCount < REM_MAX) {
+    int e = s.indexOf('\x1e', i); if (e < 0) e = s.length();
+    String row = s.substring(i, e);
+    int a = row.indexOf('\x1f'), b = row.indexOf('\x1f', a + 1);
+    if (a > 0 && b > a) {
+      rems[remCount].at = (uint32_t)row.substring(0, a).toInt();
+      rems[remCount].done = row.substring(a + 1, b) == "1";
+      snprintf(rems[remCount].text, REM_TEXT, "%s", row.substring(b + 1).c_str());
+      remCount++;
+    }
+    i = e + 1;
+  }
+  Serial.printf("%d reminders remembered\n", remCount);
+}
+// Soonest first, so walking them is walking time.
+static void sortRems() {
+  for (int i = 1; i < remCount; i++) {
+    Rem k = rems[i]; int j = i - 1;
+    while (j >= 0 && rems[j].at > k.at) { rems[j + 1] = rems[j]; j--; }
+    rems[j + 1] = k;
+  }
+}
+static int remPending() {
+  int n = 0;
+  for (int i = 0; i < remCount; i++) if (!rems[i].done) n++;
+  return n;
+}
+
 static void saveTasks() {
   String out;
   for (int i = 0; i < taskCount; i++) {
@@ -4864,6 +5047,21 @@ static bool joinOne(int i, int ms) {
   return true;
 }
 
+// How long until the next reminder is due, in seconds, or -1.
+static long secsToNextRem() {
+  if (!timeOk) return -1;
+  time_t now = time(nullptr);
+  if (now < 1700000000) return -1;             // the clock is not set yet
+  long best = -1;
+  for (int i = 0; i < remCount; i++) {
+    if (rems[i].done) continue;
+    long d = (long)rems[i].at - (long)now;
+    if (d < 0) continue;
+    if (best < 0 || d < best) best = d;
+  }
+  return best;
+}
+
 static long secsToNextAlert() {
   struct tm t;
   if (!prayerOk || !timeOk || !getLocalTime(&t, 0)) return -1;
@@ -4902,11 +5100,40 @@ static void resetSettings() {
   cfgTap = TAP_MED;  prefs.putInt("tap", cfgTap);      applyTap();
   cfgAutoUp = false; prefs.putBool("autoup", cfgAutoUp);
   cfgKnock = false;  prefs.putBool("knock", cfgKnock);
-  cfgWake = WAKE_BOTH; prefs.putInt("wake", cfgWake);
+  cfgShake = true;   prefs.putBool("shake", cfgShake);
+  cfgDeepIdx = 1;    prefs.putInt("deepi", cfgDeepIdx);
+  battFull = 4.10f;  prefs.putFloat("bfull", battFull);
   deepOff = false;   prefs.putBool("nodeep", deepOff);
   for (int i = 0; i < 5; i++) prayerAdj[i] = 0;
   saveAdj();
   Serial.println("settings back to how they came");
+}
+
+// Said properly rather than just going dark, because a robot that
+// vanishes mid sentence looks broken and one that says goodnight looks
+// asleep. Three breaths out, then the eyes close.
+static void sleepCard() {
+  for (int f = 0; f < 22; f++) {
+    oled.clearDisplay();
+    int r = 14 - f / 2;
+    if (r > 1) {
+      oled.drawCircle(40, 34, r, SSD1306_WHITE);
+      oled.drawCircle(88, 34, r, SSD1306_WHITE);
+    } else {
+      oled.drawFastHLine(40 - 12, 34, 24, SSD1306_WHITE);
+      oled.drawFastHLine(88 - 12, 34, 24, SSD1306_WHITE);
+    }
+    ctr("going to sleep", 8, 1);
+    // zzz drifting up from the right eye
+    for (int z = 0; z < 3; z++) {
+      int zy = 24 - z * 7 - (f / 3);
+      if (zy > 10 && z * 7 < f) at(100 + z * 5, zy, "z");
+    }
+    ctr("touch to wake me", 54, 1);
+    oled.display();
+    delay(55);
+  }
+  oled.clearDisplay(); oled.display();
 }
 
 static void goDeep() {
@@ -4918,37 +5145,39 @@ static void goDeep() {
   // for every pin in the mask. INT1 is active high, so it can only come
   // along when the pad is active high too. On a pad wired the other way
   // round the pad wakes it and the accelerometer does not.
+  // The pad, and only the pad. The accelerometer used to be able to
+  // wake it and no longer is: a bag being carried, a desk being leaned
+  // on and a door closing are all enough to trip it, and every one of
+  // those cost a wake, a WiFi reconnect and a slice of the battery for
+  // nothing. Waking should be something you did on purpose.
   bool wakeHigh = !touchRest;                  // the level that means touched
-  bool usePad   = (cfgWake != WAKE_MOVE);
-  bool useInt   = (cfgWake != WAKE_TOUCH) && intWired && wakeHigh;
-  // Asking for move only on a board with no INT1 wire would leave
-  // nothing at all able to wake it, so the pad comes back rather than
-  // letting a setting switch the thing off for good.
-  if (!usePad && !useInt) usePad = true;
   if (deepOff) return;
-  Serial.printf("switching off until %s%s\n", usePad ? "touched" : "moved",
-                (usePad && useInt) ? " or moved" : "");
+  Serial.println("switching off until touched");
+  sleepCard();
 
-  if (useInt) {
-    wReg(adxl, A_THRESH_ACT, 0x08);            // about 500mg, a lift not a nudge
-    wReg(adxl, A_ACT_INACT_CTL, 0xF0);         // ac coupled, all three axes
-    wReg(adxl, A_INT_MAP, 0x00);               // everything out of INT1
-    wReg(adxl, A_INT_ENABLE, INT_ACT);         // nothing else matters now
-    rReg(adxl, A_INT_SOURCE);                  // clear whatever is pending
-  }
 
   screenPower(false);
   prefs.end();
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
 
-  uint64_t mask = 0;
-  if (usePad) mask |= BIT(TOUCH_PIN);
-  if (useInt) mask |= BIT(TAP_INT_PIN);
+  uint64_t mask = BIT(TOUCH_PIN);
   esp_deep_sleep_enable_gpio_wakeup(mask, wakeHigh ? ESP_GPIO_WAKEUP_GPIO_HIGH
                                                    : ESP_GPIO_WAKEUP_GPIO_LOW);
-  long secs = secsToNextAlert();
-  if (secs > 0) esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
+  // Whichever is sooner, a prayer or a reminder. Worked out here, from
+  // the clock, so it holds with no network: the chip keeps counting
+  // through deep sleep and comes back on its own at the right minute.
+  long pray = secsToNextAlert();
+  long rem  = secsToNextRem();
+  long secs = -1;
+  if (pray > 0 && rem > 0) secs = pray < rem ? pray : rem;
+  else if (pray > 0)       secs = pray;
+  else if (rem > 0)        secs = rem;
+  if (secs > 0) {
+    Serial.printf("next wake in %ld s (%s)\n", secs,
+                  (rem > 0 && (pray <= 0 || rem <= pray)) ? "a reminder" : "a prayer");
+    esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
+  }
   esp_deep_sleep_start();
 }
 
@@ -5388,11 +5617,25 @@ static void knockTwo() {
       case C_HOTSPOT: startHotspot(); break;
       case C_PRAYER:  prayerWanted = true; nextPrayerTry = 0; break;
       case C_ACCEL:   depth = 2; break;
-      case C_WAKE:
-        cfgWake = (cfgWake + 1) % WAKE_N;
-        prefs.putInt("wake", cfgWake);
-        flash(cfgWake == WAKE_BOTH ? "BOTH" : cfgWake == WAKE_TOUCH ? "TOUCH" : "MOVE", 900);
+      case C_SHAKE:
+        cfgShake = !cfgShake;
+        prefs.putBool("shake", cfgShake);
+        flash(cfgShake ? "SHAKE ON" : "SHAKE OFF", 1000);
         break;
+      case C_DEEP:
+        cfgDeepIdx = (cfgDeepIdx + 1) % DEEP_N;
+        prefs.putInt("deepi", cfgDeepIdx);
+        flash(DEEP_NAME[cfgDeepIdx], 900);
+        break;
+      case C_BATT: {
+        // Steps a tenth at a time round the range a single cell charges
+        // to, so a pack that tops out at 4.10 can be told so.
+        battFull += 0.05f;
+        if (battFull > 4.251f) battFull = 3.95f;
+        prefs.putFloat("bfull", battFull);
+        char m[12]; snprintf(m, sizeof(m), "%.2fV", battFull);
+        flash(m, 900);
+        break; }
       case C_KNOCK:
         cfgKnock = !cfgKnock;
         prefs.putBool("knock", cfgKnock);
@@ -5600,6 +5843,37 @@ static void touchGesture(uint8_t g) {
   // always a way out of it.
   if (tapTesting && tapChosen && g == TG_LONG) { tapTesting = false; return; }
 
+  // Reminders read like a watch does: one goes to the next, two comes
+  // back out, and holding is how you get in and how you clear them.
+  if (screen == S_REMIND && depth > 0) {
+    if (remConfirm) {
+      if (g == TG_ONE) { remYes = !remYes; return; }
+      if (g == TG_LONG) {
+        if (remYes) { remCount = 0; remIdx = 0; saveRems(); flash("CLEARED", 1100); }
+        remConfirm = false; depth = 0;
+        return;
+      }
+      if (g == TG_TWO) { remConfirm = false; return; }
+      return;
+    }
+    switch (g) {
+      case TG_ONE:  if (remIdx < remCount) remIdx++; return;   // past the end is the offer
+      case TG_TWO:  if (remIdx > 0) remIdx--; else depth = 0; return;
+      case TG_LONG:
+        if (remIdx >= remCount && remCount) { remConfirm = true; remYes = false; }
+        else if (remIdx < remCount) {        // mark it read and move on
+          rems[remIdx].done = true; saveRems(); remIdx++;
+        }
+        return;
+      default: depth = 0; return;
+    }
+  }
+  if (g == TG_LONG && screen == S_REMIND && depth == 0 && remCount) {
+    depth = 1; remIdx = 0; remConfirm = false;
+    clickShrink();
+    return;
+  }
+
   // A leaf: nothing here to open, so one goes on, two goes back a page
   // and a long press is the way out.
   if (inReader()) {
@@ -5734,12 +6008,21 @@ static void input() {
       }
     } else touchEdge = 0;
 
-    // Long presses fire under your finger rather than after it, which
-    // is what makes them feel like the quickest of the four.
+    // Going in fires under your finger rather than after it, which is
+    // what makes it feel like the quickest of the four. Holding on past
+    // that is a different question, answered when you let go.
     if (touchOn && !touchLongDone && now - touchPressAt >= TOUCH_LONG_MS) {
       touchLongDone = true;
       touchTaps = 0;
       touchGesture(TG_LONG);
+    }
+    if (touchOn && touchLongDone) {
+      uint32_t held = now - touchPressAt;
+      touchHold = held >= TOUCH_SLEEP_MS ? 2 : held >= TOUCH_HOME_MS ? 1 : 0;
+    } else if (!touchOn && touchHold) {
+      uint8_t h = touchHold; touchHold = 0;
+      if (h == 2) { wantDeep = true; }
+      else { screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; faceMode = false; }
     }
     // Quiet long enough that nothing more is coming.
     //
@@ -5805,6 +6088,16 @@ static void input() {
     lastShake = now; cShake++;
     if (asleep) { wake("shake"); return; }
     lastActive = now;
+    // One step back per shake, however long you keep shaking: the 600ms
+    // above is what stops a good rattle counting as six. It never goes
+    // past the clock, so shaking at an empty desk cannot do anything
+    // except leave you at home.
+    if (cfgShake && !(screen == S_GAMES && depth == 2) && !tapTesting) {
+      if (faceMode) faceMode = false;
+      else if (depth > 0) { depth--; if (!depth) { itemIdx = 0; subIdx = 0; } }
+      else if (screen != S_HOME) { screen = S_HOME; itemIdx = 0; subIdx = 0; }
+      Serial.println("shake -> back");
+    }
   }
   if (fabsf(amag - 1.0f) > 0.12f || fabsf(gxr) + fabsf(gyr) + fabsf(gzr) > 25.0f) {
     if (asleep) wake("picked up");
@@ -6011,6 +6304,7 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
     <div class="row" style="margin-top:8px">
       <button class="g" onclick="if(confirm('Reboot?'))act('/api/reboot')">Reboot</button>
       <button class="g" onclick="act('/api/hotspot')">Hotspot</button>
+      <button class="g" onclick="if(confirm('Let go of the Mac? It will switch itself off shortly after.'))act('/api/bye')">Disconnect from the Mac</button>
     </div></div>
 
   <h2>OpenAI</h2><div class="card">
@@ -6164,7 +6458,9 @@ static void apiState() {
   o += "\"clockSrc\":\"" + String(clockSrc) + "\",";
   o += "\"asleep\":" + String(asleep ? "true" : "false") + ",\"fw\":\"" FW_VERSION "\",";
   o += "\"knock\":" + String(cfgKnock ? "true" : "false") + ",";
-  o += "\"wake\":" + String(cfgWake) + ",";
+  o += "\"shake\":" + String(cfgShake ? "true" : "false") + ",";
+  o += "\"deepi\":" + String(cfgDeepIdx) + ",";
+  o += "\"battFull\":" + String(battFull, 2) + ",";
   o += "\"battV\":" + String(isnan(battV) ? 0.0f : battV, 2) + ",";
   o += "\"battPct\":" + String(isnan(battV) ? -1 : battPct(battV)) + ",";
   o += "\"touches\":" + String((unsigned long)touchCount) + ",";
@@ -6342,6 +6638,31 @@ static void setupWeb() {
     focusBegin(constrain((int)web.arg("m").toInt(), 0, 240));
     okJson();
   });
+  // The whole list at once, because a dozen short lines is smaller
+  // than working out what changed. The Mac owns the editing; the robot
+  // owns knowing when they are due.
+  web.on("/api/rems", HTTP_POST, []() {
+    if (!guard()) return;
+    int n = web.arg("n").toInt();
+    if (n < 0) n = 0;
+    if (n > REM_MAX) n = REM_MAX;
+    remCount = 0;
+    for (int i = 0; i < n; i++) {
+      String kt = "t" + String(i), ka = "a" + String(i), kd = "d" + String(i);
+      if (!web.hasArg(ka)) continue;
+      uint32_t at = (uint32_t)strtoul(web.arg(ka).c_str(), nullptr, 10);
+      if (!at) continue;
+      rems[remCount].at = at;
+      rems[remCount].done = web.arg(kd) == "1";
+      snprintf(rems[remCount].text, REM_TEXT, "%s", web.arg(kt).c_str());
+      remCount++;
+    }
+    sortRems();
+    saveRems();
+    if (remIdx > remCount) remIdx = remCount;
+    Serial.printf("Rafiq sent %d reminders\n", remCount);
+    okJson();
+  });
   web.on("/api/toast", HTTP_POST, []() {
     if (!guard()) return;
     String m = web.arg("m"); m.trim();
@@ -6491,7 +6812,10 @@ static void setupWeb() {
     // driving this now, so if the pad ever stops there has to be a way
     // back in that does not involve the pad, and the network is it.
     else if (k == "knock"){ cfgKnock    = (v != 0);                      prefs.putBool("knock", cfgKnock); }
-    else if (k == "wake") { cfgWake     = constrain(v, 0, WAKE_N - 1);   prefs.putInt("wake", cfgWake); }
+    else if (k == "shake"){ cfgShake    = (v != 0);                      prefs.putBool("shake", cfgShake); }
+    else if (k == "deepi"){ cfgDeepIdx  = constrain(v, 0, DEEP_N - 1);   prefs.putInt("deepi", cfgDeepIdx); }
+    // Sent in hundredths, because the form only carries whole numbers.
+    else if (k == "bfull"){ battFull    = constrain(v / 100.0f, 3.90f, 4.30f); prefs.putFloat("bfull", battFull); }
     else { web.send(400, "application/json", "{\"ok\":false,\"err\":\"no such setting\"}"); return; }
     okJson();
   });
@@ -6522,7 +6846,10 @@ static void setupWeb() {
     macSeen = 0;
     linkCardJoin = false;
     linkCardUntil = millis() + 1400;
-    sleptAt = millis();                  // the seven minutes start now
+    // The countdown to switching off starts here. With no Mac there is
+    // nothing to stay reachable for, so when it runs out it powers
+    // down properly rather than just darkening the screen.
+    sleptAt = millis();
     okJson();
   });
   web.on("/api/webui", HTTP_POST, []() {
@@ -6847,11 +7174,15 @@ static bool holdCard(unsigned long ms) {
 
 static void nameCard() {
   oled.clearDisplay();
-  oled.setTextSize(3);
-  oled.setCursor((SCRW - 5 * 18) / 2, 18);
+  // Smaller than it was, with the name of whoever built it underneath.
+  // Two sizes down leaves room to say something that is not just the
+  // product shouting at you.
+  oled.setTextSize(2);
+  oled.setCursor((SCRW - 5 * 12) / 2, 16);
   oled.print("RAFIQ");
-  oled.drawFastHLine(24, 44, SCRW - 48, SSD1306_WHITE);
-  ctr("Your companion", 50, 1);
+  oled.drawFastHLine(30, 36, SCRW - 60, SSD1306_WHITE);
+  ctr("your companion", 41, 1);
+  ctr("developed by Ahmed", 54, 1);
   oled.display();
   holdCard(900);
 }
@@ -6893,7 +7224,7 @@ static void offlineWelcome() {
   oled.clearDisplay();
   titleBar("WHEN YOU WANT WIFI", "");
   ctr("Open SETTINGS", 20, 1);
-  ctr("and knock twice on", 32, 1);
+  ctr("and hold on", 32, 1);
   ctr("Hotspot", 44, 1);
   oled.drawFastHLine(30, 56, SCRW - 60, SSD1306_WHITE);
   oled.display();
@@ -7001,7 +7332,9 @@ void setup() {
   cfgTap      = constrain(prefs.getInt("tap", TAP_MED), 0, TAP_N - 1);
   cfgAutoUp   = prefs.getBool("autoup", false);
   cfgKnock    = prefs.getBool("knock", false);   // the pad drives this now
-  cfgWake     = constrain(prefs.getInt("wake", WAKE_BOTH), 0, WAKE_N - 1);
+  cfgShake    = prefs.getBool("shake", true);    // on by default
+  cfgDeepIdx  = constrain(prefs.getInt("deepi", 1), 0, DEEP_N - 1);
+  battFull    = constrain(prefs.getFloat("bfull", 4.10f), 3.90f, 4.30f);
   nextAutoUp  = millis() + 120000;          // not in the first two minutes
   cfgTz       = prefs.getString("tz", DEF_TZ);
   cfgSsid     = prefs.getString("ssid", "");
@@ -7016,6 +7349,7 @@ void setup() {
     wCity[sizeof(wCity) - 1] = 0;
   }
   loadTasks();
+  loadRems();
   loadPrayer();
   loadAdj();
   loadTiltMap();
@@ -7126,7 +7460,7 @@ void setup() {
     at(66, 28, "4  reload");
     oled.drawFastHLine(8, 40, 112, SSD1306_WHITE);
     knockIcon(19, 51);
-    at(32, 48, "Knock to begin");
+    at(30, 48, "Touch to begin");
   }
   if (!fromDeep) {
     oled.display();
@@ -7255,6 +7589,25 @@ void loop() {
     upState = U_OFF;                 // nothing found; say nothing
   }
 
+  // A reminder coming due. Checked here rather than left to the Mac,
+  // which is the whole point of keeping them: the Mac may be shut.
+  if (timeOk && remCount && now - remCheck > 2000) {
+    remCheck = now;
+    time_t tnow = time(nullptr);
+    for (int i = 0; i < remCount; i++) {
+      if (rems[i].done || (long)rems[i].at > (long)tnow) continue;
+      if ((long)tnow - (long)rems[i].at > 3600) { rems[i].done = true; continue; }  // long gone
+      wake("reminder");
+      toastKind = "remind";
+      toastText = rems[i].text;
+      toastUntil = millis() + 60000UL;           // a minute, it is why it woke up
+      toastFlash = millis();
+      rems[i].done = true;
+      saveRems();
+      break;
+    }
+  }
+
   if (popupUntil && now > popupUntil) { popupUntil = 0; screen = S_HOME; depth = 0; }
 
   // Trying a strength is ten seconds with an end on it. No knock in
@@ -7323,8 +7676,19 @@ void loop() {
   // switch off altogether. A Mac on the other end counts as somebody
   // listening: disconnect in Rafiq and the clock starts, reconnect and
   // it never goes past a dark screen.
-  if (asleep && intWired && !deepOff && !macLinked && sleptAt &&
-      (now - sleptAt) > DEEP_AFTER_MS && upState == U_OFF && !storyBusy) {
+  if (wantDeep) {
+    // Asked for, by holding the pad or by the Mac letting go. No
+    // conditions: if you held it for ten seconds you meant it.
+    wantDeep = false;
+    goDeep();
+  }
+  // Otherwise it switches off on its own, but only when the Mac is not
+  // there. With the Mac connected it only darkens the screen, because
+  // powering down drops the network and the Mac would lose it mid
+  // sentence. Holding the pad still forces it either way.
+  if (!deepOff && deepAfterMs() && asleep && !sessionRunning() &&
+      !macLinked &&
+      (now - sleptAt) > deepAfterMs() && upState == U_OFF && !storyBusy) {
     goDeep();
   }
 
@@ -7444,8 +7808,20 @@ void loop() {
       case S_READS:    drawReads();    break;
       case S_GAMES:    drawGames();    break;
       case S_SETTINGS: drawSettings(); break;
+      case S_REMIND:   drawReminders(); break;
       case S_SYSTEM:   drawSystem();   break;
       default:         drawHome();     break;
+    }
+    // Only ever past five seconds, so it costs ordinary use nothing and
+    // the one time it appears is the one time you want telling.
+    if (touchHold) {
+      const char* w = touchHold == 2 ? "KEEP HOLDING: SLEEP" : "KEEP HOLDING: HOME";
+      int bw = (int)strlen(w) * 6 + 6;
+      int bx = (SCRW - bw) / 2;
+      oled.fillRect(bx, 26, bw, 13, SSD1306_BLACK);
+      oled.drawRect(bx, 26, bw, 13, SSD1306_WHITE);
+      at(bx + 3, 29, w);
+      oled.display();
     }
   }
   delay(2);
