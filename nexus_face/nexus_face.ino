@@ -55,11 +55,31 @@
 //
 // GPIO4 because the C3 can only wake on 0 to 5, and 2 is a strapping pin.
 #define TAP_INT_PIN 4
+
+// A touch pad on GPIO5, which is free: 8 and 9 are the I2C lines, 4 is
+// the accelerometer interrupt, and 2, 8 and 9 are the strapping pins.
+//
+// Read as an ordinary digital input, not with touchRead. The C3 has no
+// capacitive touch peripheral at all, unlike the original ESP32 and the
+// S2 and S3, so a pad on this chip means a little board that does its
+// own sensing and hands over a level.
+//
+// Which level means touched depends on that board. Most drive the pin
+// high on touch and some drive it low, so rather than guess, whatever
+// the pin is sitting at when the robot starts is taken as resting and
+// anything different is a touch. It works either way round, and the
+// System screen says which way it decided.
+#define TOUCH_PIN 5
+bool     touchRest  = false;     // the level it sits at with nobody near
+bool     touchOn    = false;     // inverted right now
+uint32_t touchCount = 0;
+uint32_t touchEdge  = 0;         // when the level last disagreed with us
+uint32_t touchOnAt  = 0;         // when this touch started
 #define OLED_ADDR 0x3C
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "2.14.0"
+#define FW_VERSION "2.15.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -1746,14 +1766,17 @@ static void drawSystem() {
   oled.clearDisplay();
   titleBar("SYSTEM", FW_VERSION);
 
+  // A fourth row, so a pad that is not working can be told apart from a
+  // pad that is not being read. Rows moved up and tightened by three to
+  // make room without touching the line or the address under it.
   char v[22];
-  const int LY[3] = { 16, 28, 40 };
-  const char* LB[3] = { "Uptime", "Network", "Memory" };
+  const int LY[4] = { 14, 23, 32, 41 };
+  const char* LB[4] = { "Uptime", "Network", "Memory", "Touch" };
 
   unsigned long s = millis() / 1000UL;
   if (s >= 3600UL) snprintf(v, sizeof(v), "%luh %lum", s / 3600UL, (s / 60UL) % 60UL);
   else             snprintf(v, sizeof(v), "%lum", s / 60UL);
-  String vals[3];
+  String vals[4];
   vals[0] = v;
   if (online())      snprintf(v, sizeof(v), "%d dBm", (int)WiFi.RSSI());
   else if (rescueAP) snprintf(v, sizeof(v), "hotspot");
@@ -1761,18 +1784,26 @@ static void drawSystem() {
   vals[1] = v;
   snprintf(v, sizeof(v), "%u kB", (unsigned)(ESP.getFreeHeap() / 1024));
   vals[2] = v;
+  // Live, so you can watch it change with a finger on the pad, and a
+  // count so a touch that happened while the screen was elsewhere still
+  // shows. "rest hi" or "rest lo" says which way round it decided the
+  // board drives the pin.
+  { char tc[8]; numStr(tc, sizeof(tc), touchCount);   // the count keeps growing
+    snprintf(v, sizeof(v), "%s %s %s", touchOn ? "ON" : "--",
+             tc, touchRest ? "hi" : "lo"); }
+  vals[3] = v;
 
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 4; i++) {
     at(4, LY[i], LB[i]);
     oled.setCursor(SCRW - 4 - (int)vals[i].length() * 6, LY[i]);
     oled.print(vals[i]);
   }
 
-  oled.drawFastHLine(4, 51, SCRW - 8, SSD1306_WHITE);
+  oled.drawFastHLine(4, 50, SCRW - 8, SSD1306_WHITE);
   String ip = online() ? WiFi.localIP().toString()
             : rescueAP ? WiFi.softAPIP().toString()
                        : String("no address");
-  ctr(ip.c_str(), 55, 1);
+  ctr(ip.c_str(), 54, 1);
   oled.display();
 }
 
@@ -5393,6 +5424,39 @@ static void input() {
   readSensors();
   unsigned long now = millis();
 
+  // The screen goes inverse while the pad is held. That is the whole of
+  // the test: nothing to find in a menu and nothing to remember.
+  // invertDisplay is a panel command rather than anything we draw, so it
+  // survives every redraw and costs one message, only on a change.
+  {
+    bool want = (digitalRead(TOUCH_PIN) != touchRest);
+    if (want != touchOn) {
+      if (!touchEdge) touchEdge = now;
+      if (now - touchEdge >= 40) {             // settle, so an edge cannot flicker it
+        touchOn = want; touchEdge = 0;
+        oled.invertDisplay(touchOn);
+        if (touchOn) { touchCount++; touchOnAt = now; }
+        lastActive = now;
+        if (touchOn && asleep) wake("touch");
+        Serial.printf("touch %s (%lu)\n", touchOn ? "on" : "off", (unsigned long)touchCount);
+      }
+    } else touchEdge = 0;
+    if (touchOn) {
+      lastActive = now;                        // do not sleep mid test
+      // Nobody holds a pad for half a minute. If it has been "touched"
+      // that long then the resting level was read wrong at boot, which
+      // a finger on the pad while it started up would do. Take it again
+      // rather than leaving the screen inverted for ever.
+      if (now - touchOnAt > 30000UL) {
+        touchRest = !touchRest;
+        touchOn = false; touchEdge = 0;
+        oled.invertDisplay(false);
+        Serial.printf("touch held 30s; resting level taken again as %s\n",
+                      touchRest ? "high" : "low");
+      }
+    }
+  }
+
   // A knock that dismissed a card has already been acted on. Swallow the
   // rest of that burst so it does not also step the carousel.
   if (now < inputMuteUntil) {
@@ -6655,6 +6719,15 @@ void setup() {
   fsOk = LittleFS.begin(true);                 // format it once if it is blank
   if (!fsOk) Serial.println("no filesystem");
   loadShelf();
+
+  // Whatever the pad is doing before anyone has touched it is resting.
+  // Pulled down, so an unconnected pin rests low and nothing inverts.
+  pinMode(TOUCH_PIN, INPUT_PULLDOWN);
+  { int hi = 0;
+    for (int i = 0; i < 12; i++) { if (digitalRead(TOUCH_PIN)) hi++; delay(3); }
+    touchRest = (hi >= 7);
+    Serial.printf("touch pad on GPIO%d rests %s\n", TOUCH_PIN, touchRest ? "high" : "low");
+  }
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
