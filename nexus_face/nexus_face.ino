@@ -84,6 +84,27 @@
 // touch lasted thirty seconds. That is wrong for a TTP223 wired to
 // latch: its output stays put until the next touch, quite legitimately,
 // and the flip would have fought it.
+// ---------------- the battery ----------------
+//  Two 200K resistors from the pack to ground with GPIO1 in the middle,
+//  so the pin sees exactly half the pack voltage and a full cell lands
+//  near 2.1V, inside what the ADC can read.
+//
+//  analogReadMilliVolts rather than analogRead: it applies the
+//  calibration burned into the chip at the factory, which is worth a
+//  good hundred millivolts of accuracy, and a hundred millivolts is
+//  most of the difference between half full and nearly flat.
+//
+//  Worth knowing: two 200K resistors put 100K in front of the ADC, and
+//  this one would rather see something under about 10K. It charges a
+//  small capacitor each sample and 100K refills it slowly, so the first
+//  read after a gap comes back low. Reading several times in a row and
+//  throwing the first away is most of the fix. A 100nF capacitor from
+//  GPIO1 to ground would be the rest of it, if the numbers look low.
+#define BATT_PIN  1
+#define BATT_MUL  2              // 200K over 200K, so half of the pack
+float    battV = NAN;
+uint32_t battNext = 0;
+
 #define TOUCH_PIN 5
 bool     touchRest  = false;     // the level it sits at with nobody near
 bool     touchOn    = false;     // a finger is on it right now
@@ -145,7 +166,7 @@ int cfgWake = WAKE_BOTH;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "3.1.0"
+#define FW_VERSION "3.2.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -690,6 +711,38 @@ static void startSensors() {
 // fires continuously at the output rate, so routing it to INT1 and
 // looking at the pin is a reliable question: connected, it sits high;
 // unconnected, the pull down holds it low.
+// A single lithium cell does not fall evenly, so a straight line from
+// 3.0 to 4.2 would read 50% for most of an afternoon and then drop off
+// a cliff. This is the usual discharge shape, in steps.
+static int battPct(float v) {
+  static const float V[] = { 3.00f, 3.45f, 3.68f, 3.74f, 3.77f, 3.79f,
+                             3.82f, 3.87f, 3.93f, 4.00f, 4.10f, 4.20f };
+  static const int   P[] = {     0,     5,    10,    20,    30,    40,
+                                50,    60,    70,    80,    90,   100 };
+  if (v <= V[0]) return 0;
+  for (int i = 1; i < 12; i++) {
+    if (v <= V[i]) {
+      float f = (v - V[i-1]) / (V[i] - V[i-1]);
+      return P[i-1] + (int)(f * (P[i] - P[i-1]) + 0.5f);
+    }
+  }
+  return 100;
+}
+
+// Read it rarely: the pack does not move quickly and every sample
+// costs a little of it through the divider.
+static void readBattery() {
+  uint32_t now = millis();
+  if (battNext && (int32_t)(now - battNext) < 0) return;
+  battNext = now + 20000;
+  analogReadMilliVolts(BATT_PIN);              // thrown away: see above
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogReadMilliVolts(BATT_PIN);
+  float v = (sum / 8.0f) * BATT_MUL / 1000.0f;
+  // Nothing plugged in reads as noise near zero rather than as a cell.
+  battV = (v > 2.5f) ? v : NAN;
+}
+
 static bool probeIntPin() {
   if (!adxl) return false;
   pinMode(TAP_INT_PIN, INPUT_PULLDOWN);
@@ -1841,17 +1894,18 @@ static void drawSystem() {
   oled.clearDisplay();
   titleBar("SYSTEM", FW_VERSION);
 
-  // A fourth row, so a pad that is not working can be told apart from a
-  // pad that is not being read. Rows moved up and tightened by three to
-  // make room without touching the line or the address under it.
+  // Five rows. A glyph is seven high in an eight high cell, so at nine
+  // apart the last paints 49 to 55 and the address below it 56 to 62,
+  // with the screen ending at 63. The rule that used to sit between
+  // them is what paid for the fifth row.
   char v[22];
-  const int LY[4] = { 14, 23, 32, 41 };
-  const char* LB[4] = { "Uptime", "Network", "Memory", "Touch" };
+  const int LY[5] = { 13, 22, 31, 40, 49 };
+  const char* LB[5] = { "Uptime", "Network", "Memory", "Touch", "Battery" };
 
   unsigned long s = millis() / 1000UL;
   if (s >= 3600UL) snprintf(v, sizeof(v), "%luh %lum", s / 3600UL, (s / 60UL) % 60UL);
   else             snprintf(v, sizeof(v), "%lum", s / 60UL);
-  String vals[4];
+  String vals[5];
   vals[0] = v;
   if (online())      snprintf(v, sizeof(v), "%d dBm", (int)WiFi.RSSI());
   else if (rescueAP) snprintf(v, sizeof(v), "hotspot");
@@ -1867,18 +1921,22 @@ static void drawSystem() {
     snprintf(v, sizeof(v), "%s %s%s", touchOn ? "ON" : "--",
              tc, cfgKnock ? " +k" : ""); }
   vals[3] = v;
+  // What is left in the pack, with the volts beside it: a percentage
+  // with nothing behind it is hard to argue with when it looks wrong.
+  if (isnan(battV)) snprintf(v, sizeof(v), "none");
+  else              snprintf(v, sizeof(v), "%d%% %.2fV", battPct(battV), battV);
+  vals[4] = v;
 
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 5; i++) {
     at(4, LY[i], LB[i]);
     oled.setCursor(SCRW - 4 - (int)vals[i].length() * 6, LY[i]);
     oled.print(vals[i]);
   }
 
-  oled.drawFastHLine(4, 50, SCRW - 8, SSD1306_WHITE);
   String ip = online() ? WiFi.localIP().toString()
             : rescueAP ? WiFi.softAPIP().toString()
                        : String("no address");
-  ctr(ip.c_str(), 54, 1);
+  ctr(ip.c_str(), 57, 1);
   oled.display();
 }
 
@@ -5520,6 +5578,19 @@ static void clickShrink() {
   }
 }
 
+// Is there anything a second press could mean from here? At the top of
+// the carousel there is not: back goes home and a triple goes home, so
+// waiting to find out costs a third of a second and buys nothing.
+// Anywhere with somewhere to go back to, and in the places where a
+// double turns a page, there is.
+static bool doubleMeansSomething() {
+  if (depth != 0) return true;                      // back one level
+  if (faceMode || inReader()) return true;          // the page before
+  if (screen == S_GAMES && gState == GS_PLAY) return true;
+  if (dndUntil || relaxOn || canvasUntil || toastUntil) return true;
+  return false;
+}
+
 static void touchGesture(uint8_t g) {
   lastActive = millis();
   Serial.printf("touch gesture %u (screen %s depth %d)\n", g, S_NAME[screen], depth);
@@ -5671,7 +5742,18 @@ static void input() {
       touchGesture(TG_LONG);
     }
     // Quiet long enough that nothing more is coming.
-    if (!touchOn && touchTaps && now - touchLiftAt >= TOUCH_GAP_MS) {
+    //
+    // Except where nothing can. At the top of the carousel a double
+    // means back, back from there means home, and a triple already
+    // means home, so a second press buys nothing at all. With nothing
+    // to wait for it does not wait, and flicking through the screens
+    // lands the instant you lift. Everywhere a double does something,
+    // the window still has to pass.
+    if (!touchOn && touchTaps == 1 && !doubleMeansSomething()) {
+      touchTaps = 0;
+      touchGesture(TG_ONE);
+    }
+    else if (!touchOn && touchTaps && now - touchLiftAt >= TOUCH_GAP_MS) {
       uint8_t n = touchTaps; touchTaps = 0;
       touchGesture(n == 1 ? TG_ONE : TG_TWO);
     }
@@ -6083,6 +6165,8 @@ static void apiState() {
   o += "\"asleep\":" + String(asleep ? "true" : "false") + ",\"fw\":\"" FW_VERSION "\",";
   o += "\"knock\":" + String(cfgKnock ? "true" : "false") + ",";
   o += "\"wake\":" + String(cfgWake) + ",";
+  o += "\"battV\":" + String(isnan(battV) ? 0.0f : battV, 2) + ",";
+  o += "\"battPct\":" + String(isnan(battV) ? -1 : battPct(battV)) + ",";
   o += "\"touches\":" + String((unsigned long)touchCount) + ",";
   o += "\"k1\":" + String(cTap) + ",\"k2\":" + String(cDouble) + ",\"k3\":" + String(cTriple) +
        ",\"k4\":" + String(cQuad) + ",\"fall\":" + String(cFall) + ",\"boots\":" + String(cBoot) + ",";
@@ -6955,6 +7039,12 @@ void setup() {
   // rather than after a minute. Not load bearing: the poll keeps
   // watching and will correct this on its own if it is wrong.
   // Pulled down, so an unconnected pin rests low and nothing inverts.
+  // The widest range the ADC has. Half of a full cell is about 2.1V,
+  // which is over the default and would simply read as "as high as it
+  // goes" for the whole top half of the pack.
+  analogSetPinAttenuation(BATT_PIN, ADC_11db);
+  readBattery();
+
   pinMode(TOUCH_PIN, INPUT_PULLDOWN);
   { int hi = 0;
     for (int i = 0; i < 12; i++) { if (digitalRead(TOUCH_PIN)) hi++; delay(3); }
@@ -7082,6 +7172,7 @@ void loop() {
   unsigned long now = millis();
 
   if (now - lastPoll >= 45) { lastPoll = now; input(); }
+  readBattery();                       // every twenty seconds, it decides
   serviceSession();
   servicePrayerAlert();
   serviceCursor();
@@ -7355,17 +7446,6 @@ void loop() {
       case S_SETTINGS: drawSettings(); break;
       case S_SYSTEM:   drawSystem();   break;
       default:         drawHome();     break;
-    }
-    // Over the top of whatever that was. A long press is the only
-    // gesture with no sound and no movement behind it, so this is how
-    // you know it is counting and how long you have to let go.
-    if (touchOn && !touchLongDone) {
-      uint32_t held = now - touchPressAt;
-      if (held > TOUCH_LONG_MS) held = TOUCH_LONG_MS;
-      int w = (int)((SCRW - 8) * held / TOUCH_LONG_MS);
-      oled.fillRect(0, SCRH - 3, SCRW, 3, SSD1306_BLACK);
-      if (w > 0) oled.fillRect(4, SCRH - 2, w, 2, SSD1306_WHITE);
-      oled.display();
     }
   }
   delay(2);
