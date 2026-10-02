@@ -189,7 +189,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "4.0.0"
+#define FW_VERSION "4.1.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -253,11 +253,21 @@ const char* S_NAME[S_COUNT] =
 //  still lands at nine tomorrow with no network and no Mac.
 #define REM_MAX 12
 #define REM_TEXT 64
-struct Rem { char text[REM_TEXT]; uint32_t at; bool done; };
+//  at    when it is next due, which moves every time it is put off
+//  first the day it was for, so a thing from Tuesday stops asking on
+//        Wednesday rather than following you around for ever
+//  done  you held the pad on it, and it is finished
+struct Rem { char text[REM_TEXT]; uint32_t at; uint32_t first; bool done; };
+// Ignored, it comes back in half an hour. Waved away with a press, it
+// comes back in fifteen minutes, because a press means "not now" and
+// saying nothing means you were not there to say anything.
+#define REM_IGNORED_MS 1800UL
+#define REM_WAVED_MS    900UL
 Rem  rems[REM_MAX];
 int  remCount = 0;
 int  remIdx = 0;                   // which one is being read
 uint32_t remCheck = 0;
+int  remShowing = -1;              // the one on screen, or none
 bool remConfirm = false;           // on the clear-them-all question
 bool remYes = false;
 
@@ -4617,6 +4627,7 @@ static void saveRems() {
   String s;
   for (int i = 0; i < remCount; i++) {
     s += String(rems[i].at); s += '\x1f';
+    s += String(rems[i].first); s += '\x1f';
     s += (rems[i].done ? '1' : '0'); s += '\x1f';
     s += rems[i].text;
     if (i < remCount - 1) s += '\x1e';
@@ -4630,11 +4641,14 @@ static void loadRems() {
   while (i < (int)s.length() && remCount < REM_MAX) {
     int e = s.indexOf('\x1e', i); if (e < 0) e = s.length();
     String row = s.substring(i, e);
-    int a = row.indexOf('\x1f'), b = row.indexOf('\x1f', a + 1);
-    if (a > 0 && b > a) {
-      rems[remCount].at = (uint32_t)row.substring(0, a).toInt();
-      rems[remCount].done = row.substring(a + 1, b) == "1";
-      snprintf(rems[remCount].text, REM_TEXT, "%s", row.substring(b + 1).c_str());
+    int a = row.indexOf('\x1f');
+    int b = a < 0 ? -1 : row.indexOf('\x1f', a + 1);
+    int c = b < 0 ? -1 : row.indexOf('\x1f', b + 1);
+    if (a > 0 && b > a && c > b) {
+      rems[remCount].at    = (uint32_t)strtoul(row.substring(0, a).c_str(), nullptr, 10);
+      rems[remCount].first = (uint32_t)strtoul(row.substring(a + 1, b).c_str(), nullptr, 10);
+      rems[remCount].done  = row.substring(b + 1, c) == "1";
+      snprintf(rems[remCount].text, REM_TEXT, "%s", row.substring(c + 1).c_str());
       remCount++;
     }
     i = e + 1;
@@ -4649,6 +4663,25 @@ static void sortRems() {
     rems[j + 1] = k;
   }
 }
+// Returns false when there is no room. The oldest finished one is
+// dropped first, so a full list of done things never blocks a new one.
+static bool addRem(const char* text, uint32_t when) {
+  if (remCount >= REM_MAX) {
+    int drop = -1;
+    for (int i = 0; i < remCount; i++)
+      if (rems[i].done && (drop < 0 || rems[i].at < rems[drop].at)) drop = i;
+    if (drop < 0) return false;
+    for (int i = drop; i < remCount - 1; i++) rems[i] = rems[i + 1];
+    remCount--;
+  }
+  snprintf(rems[remCount].text, REM_TEXT, "%s", text);
+  rems[remCount].at = when;
+  rems[remCount].first = when;
+  rems[remCount].done = false;
+  remCount++;
+  return true;
+}
+
 static int remPending() {
   int n = 0;
   for (int i = 0; i < remCount; i++) if (!rems[i].done) n++;
@@ -5411,7 +5444,17 @@ static void knockOne() {
   if (dndUntil)    { dndUntil = 0;      return; }
   if (relaxOn)     { relaxOn = false;    return; }
   if (canvasUntil) { canvasUntil = 0;    return; }
-  if (toastUntil)  { toastUntil = 0; toastText = ""; toastKind = ""; return; }
+  if (toastUntil)  {
+    // Waved away. That is "not now" rather than "done", so it comes
+    // back, and sooner than if you had said nothing at all.
+    if (remShowing >= 0 && remShowing < remCount && !rems[remShowing].done) {
+      rems[remShowing].at = (uint32_t)time(nullptr) + REM_WAVED_MS;
+      saveRems();
+      Serial.println("reminder waved away, back in fifteen minutes");
+    }
+    remShowing = -1;
+    toastUntil = 0; toastText = ""; toastKind = ""; return;
+  }
   if (depth == 0) {
     screen = (screen + 1) % S_COUNT;
     itemIdx = 0; subIdx = 0;
@@ -5836,6 +5879,20 @@ static bool doubleMeansSomething() {
 
 static void touchGesture(uint8_t g) {
   lastActive = millis();
+
+  // A reminder on screen takes the press before anything else does.
+  // Holding is how you say it is done, which is the only way a thing
+  // ever stops asking.
+  if (toastUntil && toastKind == "remind" && remShowing >= 0) {
+    if (g == TG_LONG) {
+      if (remShowing < remCount) { rems[remShowing].done = true; saveRems(); }
+      remShowing = -1;
+      toastUntil = 0; toastText = ""; toastKind = "";
+      flash("DONE", 900);
+      return;
+    }
+    // anything else falls through, and a single press waves it away
+  }
   Serial.printf("touch gesture %u (screen %s depth %d)\n", g, S_NAME[screen], depth);
 
   // Trying a tap strength is the one screen where knocking is the
@@ -6638,6 +6695,96 @@ static void setupWeb() {
     focusBegin(constrain((int)web.arg("m").toInt(), 0, 240));
     okJson();
   });
+  // ---- one reminder, from anywhere ----
+  //
+  //   POST or GET  /api/remind
+  //     text  what to be reminded of          (required)
+  //     at    "HH:MM", 24 hour                (optional)
+  //     d     "YYYY-MM-DD"                    (optional, today)
+  //
+  //  Deliberately not "t" for the text: authed() already reads "t" as
+  //  the pairing token, so a reminder sent that way would be checked
+  //  as a password, fail, and come back 401 with nothing to say why.
+  //
+  //  No date means today. No time at all means three times across the
+  //  day, at nine, noon and six, and only on that day: a thing with no
+  //  hour attached is a thing for today rather than a thing for a
+  //  moment. Slots already past are skipped, and if all of them are, it
+  //  is due now, because something you added at seven in the evening
+  //  with no time on it still wants saying this evening.
+  web.on("/api/remind", HTTP_ANY, []() {
+    if (!guard()) return;
+    String txt = web.hasArg("text") ? web.arg("text") : web.arg("m");
+    txt.trim();
+    if (!txt.length()) {
+      web.send(400, "application/json", "{\"ok\":false,\"err\":\"text is required\"}");
+      return;
+    }
+    struct tm nowT;
+    if (!timeOk || !getLocalTime(&nowT, 0)) {
+      web.send(409, "application/json", "{\"ok\":false,\"err\":\"the clock is not set yet\"}");
+      return;
+    }
+    String ds = web.hasArg("d") ? web.arg("d") : web.arg("date");
+    String ts = web.hasArg("at") ? web.arg("at") : web.arg("time");
+
+    int Y = nowT.tm_year + 1900, M = nowT.tm_mon + 1, D = nowT.tm_mday;
+    if (ds.length() >= 10 && ds.indexOf('-') == 4) {
+      Y = ds.substring(0, 4).toInt();
+      M = ds.substring(5, 7).toInt();
+      D = ds.substring(8, 10).toInt();
+      if (Y < 2024 || M < 1 || M > 12 || D < 1 || D > 31) {
+        web.send(400, "application/json", "{\"ok\":false,\"err\":\"d must be YYYY-MM-DD\"}");
+        return;
+      }
+    }
+    auto stamp = [&](int hh, int mm) -> uint32_t {
+      struct tm w = {};
+      w.tm_year = Y - 1900; w.tm_mon = M - 1; w.tm_mday = D;
+      w.tm_hour = hh; w.tm_min = mm; w.tm_isdst = -1;
+      return (uint32_t)mktime(&w);
+    };
+
+    int added = 0;
+    uint32_t firstAt = 0;
+    int colon = ts.indexOf(':');
+    if (colon > 0) {
+      int hh = ts.substring(0, colon).toInt();
+      int mm = ts.substring(colon + 1).toInt();
+      if (hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+        web.send(400, "application/json", "{\"ok\":false,\"err\":\"at must be HH:MM\"}");
+        return;
+      }
+      firstAt = stamp(hh, mm);
+      if (addRem(txt.c_str(), firstAt)) added = 1;
+    } else {
+      const int H[3] = { 9, 12, 18 };
+      uint32_t tnow = (uint32_t)time(nullptr);
+      for (int i = 0; i < 3; i++) {
+        uint32_t w = stamp(H[i], 0);
+        if (w + 60 < tnow) continue;             // that hour has gone
+        if (!firstAt) firstAt = w;
+        if (addRem(txt.c_str(), w)) added++;
+      }
+      if (!added) {                              // the whole day has gone
+        firstAt = tnow;
+        if (addRem(txt.c_str(), firstAt)) added = 1;
+      }
+    }
+    if (!added) {
+      web.send(507, "application/json", "{\"ok\":false,\"err\":\"no room, clear some first\"}");
+      return;
+    }
+    sortRems();
+    saveRems();
+    char o[120];
+    snprintf(o, sizeof(o),
+             "{\"ok\":true,\"added\":%d,\"at\":%lu,\"waiting\":%d}",
+             added, (unsigned long)firstAt, remPending());
+    web.send(200, "application/json", o);
+    Serial.printf("reminder added: %s (%d)\n", txt.c_str(), added);
+  });
+
   // The whole list at once, because a dozen short lines is smaller
   // than working out what changed. The Mac owns the editing; the robot
   // owns knowing when they are due.
@@ -6654,6 +6801,7 @@ static void setupWeb() {
       if (!at) continue;
       rems[remCount].at = at;
       rems[remCount].done = web.arg(kd) == "1";
+      rems[remCount].first = at;
       snprintf(rems[remCount].text, REM_TEXT, "%s", web.arg(kt).c_str());
       remCount++;
     }
@@ -7596,14 +7744,21 @@ void loop() {
     time_t tnow = time(nullptr);
     for (int i = 0; i < remCount; i++) {
       if (rems[i].done || (long)rems[i].at > (long)tnow) continue;
-      if ((long)tnow - (long)rems[i].at > 3600) { rems[i].done = true; continue; }  // long gone
+      // Only on the day it was for. Something from yesterday has had
+      // its chances and should not follow you into the week.
+      {
+        time_t ft = (time_t)rems[i].first, nt = (time_t)tnow;
+        struct tm fd, nd; localtime_r(&ft, &fd); localtime_r(&nt, &nd);
+        if (fd.tm_yday != nd.tm_yday || fd.tm_year != nd.tm_year) {
+          rems[i].done = true; saveRems(); continue;
+        }
+      }
       wake("reminder");
       toastKind = "remind";
       toastText = rems[i].text;
       toastUntil = millis() + 60000UL;           // a minute, it is why it woke up
       toastFlash = millis();
-      rems[i].done = true;
-      saveRems();
+      remShowing = i;                            // so a press knows which one
       break;
     }
   }
@@ -7766,7 +7921,16 @@ void loop() {
     if (now - lastDraw >= 90) { lastDraw = now; drawToast(); }
     delay(2); return;
   }
-  if (toastUntil && now >= toastUntil) { toastUntil = 0; toastText = ""; toastKind = ""; }
+  if (toastUntil && now >= toastUntil) {
+    toastUntil = 0; toastText = ""; toastKind = "";
+    // Nobody said anything, so nobody was there. Half an hour.
+    if (remShowing >= 0 && remShowing < remCount && !rems[remShowing].done) {
+      rems[remShowing].at = (uint32_t)time(nullptr) + REM_IGNORED_MS;
+      saveRems();
+      Serial.println("reminder ignored, back in half an hour");
+    }
+    remShowing = -1;
+  }
   if (canvasUntil && now < canvasUntil) {
     lastActive = now;
     if (now - lastDraw >= 120) { lastDraw = now; drawCanvas(); }
