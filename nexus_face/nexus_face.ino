@@ -150,13 +150,7 @@ uint32_t touchLvlAt = 0;         // when it last changed
 // worse than the thing it explained; nobody holds for five seconds by
 // accident, so after that it is safe to say what is about to happen.
 #define TOUCH_HOME_MS  5000UL
-// Eight, not ten. Five to be told what holding on does, three more to
-// mean it. Past this the countdown is armed and stops watching the pad
-// altogether, which is the point: a TTP223 lets go of its own accord
-// if a pad stays covered, and anything that needed the finger to still
-// be there after this moment could be beaten by the chip rather than
-// by you.
-#define TOUCH_SLEEP_MS 8000UL
+
 #define TOUCH_COUNT_MS  3000UL   // and then it counts three and goes
 #define TOUCH_GAP_MS  300UL      // quiet for this long and the count is final
 #define TOUCH_DEBOUNCE 40UL
@@ -165,14 +159,19 @@ uint32_t touchPressAt = 0;       // when the finger went down
 uint32_t touchLiftAt  = 0;       // when it last came up
 uint8_t  touchTaps    = 0;       // lifts so far in this run
 bool     touchLongDone = false;  // the long press already fired this press
-uint8_t  touchHold    = 0;       // 0 nothing, 1 past home, 2 past sleep
-// When the countdown to switching off began, or 0 if it is not running.
+// Holding, in one move.
 //
-// Once it is running it does not care about the pad. Letting go does
-// not stop it and does not hurry it along; a fresh touch is what stops
-// it. That is deliberate. The pad cannot be relied on to still be
-// reporting a finger that is still there, so a decision that waits on
-// one is a decision the hardware can take away from you.
+//  Nothing for five seconds, then it goes home and begins counting
+//  down to switching off. Let go during the count and it stays, at
+//  home, which is where you wanted to be. Hold through it and it
+//  switches off.
+//
+//  There were two tiers before this, five seconds and then eight,
+//  with a screen in between explaining the difference. One thing that
+//  does one thing, with three seconds to change your mind, is better
+//  than two things that need telling apart.
+//
+//  When the count began, or 0 if it is not running.
 uint32_t sleepArmed   = 0;
 // The longest unbroken touch the pad has ever reported, for finding
 // out what this board's own ceiling actually is rather than arguing
@@ -259,7 +258,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.7.0"
+#define FW_VERSION "5.8.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -2356,14 +2355,6 @@ static void drawReads() {
 // A reminder, the way a watch shows a message: the time it is for
 // along the top and the whole of it underneath, wrapped, with nothing
 // else competing for the room.
-// A house, for the overlay that says letting go goes home.
-static void houseGlyph(int cx, int cy) {
-  oled.drawLine(cx - 7, cy, cx, cy - 7, SSD1306_WHITE);
-  oled.drawLine(cx, cy - 7, cx + 7, cy, SSD1306_WHITE);
-  oled.drawRect(cx - 5, cy, 11, 8, SSD1306_WHITE);
-  oled.fillRect(cx - 1, cy + 4, 3, 4, SSD1306_WHITE);
-}
-
 // A ring drawn as a fraction of itself, clockwise from twelve.
 static void ringArc(int cx, int cy, int r, float frac) {
   if (frac < 0) frac = 0;
@@ -2378,50 +2369,29 @@ static void ringArc(int cx, int cy, int r, float frac) {
   }
 }
 
-// What a long hold looks like while it is happening.
+// What holding on looks like once it means something.
 //
-//  Five to ten seconds is a ring filling towards sleep with a house in
-//  the middle, because what letting go does right now is go home. Past
-//  ten it stops being a hint and becomes a countdown, and the one
-//  thing it needs to say is that the finger has to come off.
+//  Nothing at all for the first five seconds, because a bar on screen
+//  during ordinary use was worse than the thing it explained. At five
+//  it has already gone home, and this is the three seconds you have
+//  to say you did not mean the rest of it.
 //
-//  It used to flash the word HOME in a box, which said nothing about
-//  how far through you were and read like a fault.
+//  It takes the whole screen. A ring punched into the middle of a
+//  settings list left the list showing round the edges and the title
+//  band sliced in half, which looked like a glitch rather than a
+//  thing the robot meant to do.
+//
+//  Before this there were two of these screens, one offering home and
+//  one counting down, and you had to hold through the first to reach
+//  the second.
 static void drawHoldTier(uint32_t now) {
-  // Both tiers take the whole screen. A ring punched into the middle
-  // of a settings list left the list showing round the edges and the
-  // title band sliced in half, which looked like a glitch rather than
-  // a thing the robot meant to do.
-  if (!sleepArmed) {
-    uint32_t held = now - touchPressAt;
-    float frac = (float)(held - TOUCH_HOME_MS) / (float)(TOUCH_SLEEP_MS - TOUCH_HOME_MS);
-    oled.clearDisplay();
-    oled.fillRect(0, 0, SCRW, 11, SSD1306_WHITE);
-    oled.setTextColor(SSD1306_BLACK);
-    ctr("LET GO FOR HOME", 2, 1);
-    oled.setTextColor(SSD1306_WHITE);
-
-    const int CX = SCRW / 2, CY = 31, R = 16;
-    oled.drawCircle(CX, CY, R, SSD1306_WHITE);
-    ringArc(CX, CY, R, frac);
-    houseGlyph(CX, CY - 1);
-
-    oled.fillRect(0, 53, SCRW, 11, SSD1306_WHITE);
-    oled.setTextColor(SSD1306_BLACK);
-    ctr("hold on for sleep", 55, 1);
-    oled.setTextColor(SSD1306_WHITE);
-    return;
-  }
-
-  // The countdown reads off its own clock, not off the pad. Your
-  // finger may be long gone, or still there and no longer reported.
   uint32_t gone = now - sleepArmed;
   if (gone > TOUCH_COUNT_MS) gone = TOUCH_COUNT_MS;
   int left = (int)((TOUCH_COUNT_MS - gone + 999) / 1000);
   if (left < 1) left = 1;
   char n[2] = { (char)('0' + left), 0 };
 
-  oled.clearDisplay();                       // this one takes the screen
+  oled.clearDisplay();
   oled.fillRect(0, 0, SCRW, 11, SSD1306_WHITE);
   oled.setTextColor(SSD1306_BLACK);
   ctr("GOING TO SLEEP", 2, 1);
@@ -2434,7 +2404,7 @@ static void drawHoldTier(uint32_t now) {
 
   oled.fillRect(0, 53, SCRW, 11, SSD1306_WHITE);
   oled.setTextColor(SSD1306_BLACK);
-  ctr("touch to stay", 55, 1);
+  ctr("let go to stay", 55, 1);
   oled.setTextColor(SSD1306_WHITE);
 }
 
@@ -7213,15 +7183,7 @@ static void input() {
           touchCount++;
           touchPressAt = now;
           touchLongDone = false;
-          // A touch while it is counting down means stay. The finger
-          // that armed it cannot do this: it has not been lifted, so
-          // it cannot be pressed again.
-          if (sleepArmed) {
-            sleepArmed = 0; touchLongDone = true; touchTaps = 0;
-            flash("STAYING UP", 900);
-            Serial.println("touched during the countdown: staying up");
-          }
-          else if (asleep) { wake("touch"); touchTaps = 0; touchLongDone = true; }
+          if (asleep) { wake("touch"); touchTaps = 0; touchLongDone = true; }
         } else {
           // Every lift is a jolt, so every lift is recorded, including
           // the one that ends a long press. Only the ones that were
@@ -7246,30 +7208,25 @@ static void input() {
     if (touchOn && touchLongDone) {
       uint32_t held = now - touchPressAt;
       if (held > touchLongest) touchLongest = held;
-      touchHold = held >= TOUCH_SLEEP_MS ? 2 : held >= TOUCH_HOME_MS ? 1 : 0;
-      // Eight seconds and the decision is made. It goes home now, so
-      // that cancelling leaves you somewhere sensible and waking finds
-      // you there, and the countdown starts. From here the pad is out
-      // of it: see sleepArmed.
-      if (touchHold == 2 && !sleepArmed) {
+      // Five seconds. It goes home right now, not when you let go,
+      // and starts counting. Going home first means that letting go
+      // leaves you somewhere sensible and that switching off finds
+      // you there.
+      if (!sleepArmed && held >= TOUCH_HOME_MS) {
         sleepArmed = now;
         screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; faceMode = false;
         upState = U_OFF; swOn = false; swRun = false;
-        Serial.println("held to eight: going home, counting down to off");
+        Serial.println("held to five: home, and counting down to off");
       }
-    } else if (!touchOn && touchHold) {
-      // Letting go between five and eight is how you go home without
-      // switching off. Letting go after eight is nothing at all: the
-      // countdown is already running on its own.
-      uint8_t h = touchHold; touchHold = 0;
-      if (h == 1) { screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; faceMode = false;
-                    upState = U_OFF; swOn = false; swRun = false; }
-    }
-
-    // The countdown, which belongs to the clock and not to your finger.
-    if (sleepArmed) {
-      lastActive = now;                        // it holds the screen while it runs
-      if (now - sleepArmed >= TOUCH_COUNT_MS) { sleepArmed = 0; wantDeep = true; }
+      if (sleepArmed) {
+        lastActive = now;
+        if (now - sleepArmed >= TOUCH_COUNT_MS) { sleepArmed = 0; wantDeep = true; }
+      }
+    } else if (!touchOn && sleepArmed) {
+      // Let go while it was counting. It stays, and it is at home.
+      sleepArmed = 0;
+      flash("STAYING UP", 800);
+      Serial.println("let go during the countdown: staying up, at home");
     }
     // Quiet long enough that nothing more is coming.
     //
@@ -9546,7 +9503,7 @@ void loop() {
     // the ring. A hundred and ten milliseconds apart, which is what
     // the blinking was. Drawing one or the other fixes it and saves
     // a frame.
-    if (sleepArmed || touchHold) { drawHoldTier(now); oled.display(); delay(2); return; }
+    if (sleepArmed) { drawHoldTier(now); oled.display(); delay(2); return; }
     switch (screen) {
       case S_FOCUS:    drawFocus();    break;
       case S_WEATHER:  drawWeather();  break;
