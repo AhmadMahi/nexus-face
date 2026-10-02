@@ -161,6 +161,12 @@ uint8_t  touchTaps    = 0;       // lifts so far in this run
 bool     touchLongDone = false;  // the long press already fired this press
 uint8_t  touchHold    = 0;       // 0 nothing, 1 past home, 2 past sleep
 bool     wantDeep     = false;   // asked for, by holding or by the Mac letting go
+// It came back from being switched off because a reminder or a prayer
+// was due, and that is the only reason it is on. Waking that way is a
+// boot, so `asleep` is false by the time the reminder fires and
+// nothing downstream could tell this from someone picking it up.
+bool     wokeForAlarm = false;
+
 
 // Changing the watch face from the clock, with the pad. A long press on
 // the clock goes in, the screen blinks once to say so, single presses
@@ -191,7 +197,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.2.0"
+#define FW_VERSION "5.3.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -338,7 +344,10 @@ const char* HIJRI_LATIN[12] = {
 //  So the robot keeps them, and works out for itself when to wake. The
 //  clock keeps running through deep sleep, so a reminder set tonight
 //  still lands at nine tomorrow with no network and no Mac.
-#define REM_MAX 12
+// Twenty. Twelve was a number picked when a reminder was a short
+// label; the app keeps twenty and the reading view walks them one at
+// a time, so the robot may as well hold the same list the app shows.
+#define REM_MAX 20
 // Sixty three characters was not a reminder, it was a label. At
 // ninety five a sentence fits, and the reader has a crawl for the
 // ones that still do not.
@@ -657,7 +666,19 @@ const int IDLE_N = sizeof(IDLE_LINES) / sizeof(IDLE_LINES[0]);
 
 // ---------------- the stopwatch ----------------
 //  Something you pick now, rather than something home became.
-bool swOn = false;
+//
+//  It counts, it stops where it is, and it goes again from there. It
+//  used to do neither: the only thing a press did was throw the time
+//  away and start over, which is not a stopwatch, it is a reset
+//  button that happens to show a number.
+//
+//    one      start, and stop where it is
+//    hold     back to zero
+//    two      back to the list
+//    shake    back to the clock
+bool     swOn  = false;          // the stopwatch has the screen
+bool     swRun = false;          // and it is counting
+uint32_t swAcc = 0;              // milliseconds banked by earlier runs
 
 // ---------------- work session ----------------
 #define TASK_MAX 12
@@ -833,6 +854,12 @@ static bool online() { return WiFi.status() == WL_CONNECTED; }
 #define SHAKE_G 0.60f
 // How long after a press a shake is assumed to be the press.
 #define SHAKE_AFTER_MS 800UL
+// Measured from the later of the press and the lift. The jolt that
+// matters is the one from letting go, which lands after a long press
+// has already been counted, and the old guard had always expired by
+// then: you held to go into the reminders, it went in, you lifted, the
+// lift shook it, and the shake took you straight back out. That is why
+// holding looked like nothing but an animation.
 
 // ================================================================
 //  I2C
@@ -1224,10 +1251,22 @@ static void drawReader(const char* title) {
 // ================================================================
 //  SCREENS
 // ================================================================
+// However long it has been counting, banked plus whatever this run has
+// added. Reading it while stopped gives the same answer every time,
+// which is the whole point of stopping it.
+static uint32_t swMs() {
+  return swAcc + (swRun ? (uint32_t)(millis() - swStart) : 0);
+}
+static void swGo()    { if (!swRun) { swRun = true; swStart = millis(); } }
+static void swStop()  { if (swRun)  { swAcc = swMs(); swRun = false; } }
+static void swZero()  { swAcc = 0; swStart = millis(); }
 static void swStr(char* o, size_t n) {
-  unsigned long s = (millis() - swStart) / 1000UL;
+  uint32_t ms = swMs();
+  unsigned long s = ms / 1000UL;
+  // Tenths under the hour, because a stopwatch that only moves once a
+  // second looks stopped when it is running.
   if (s >= 3600UL) snprintf(o, n, "%lu:%02lu:%02lu", s / 3600UL, (s / 60UL) % 60UL, s % 60UL);
-  else             snprintf(o, n, "%lu:%02lu", s / 60UL, s % 60UL);
+  else             snprintf(o, n, "%lu:%02lu.%lu", s / 60UL, s % 60UL, (ms / 100UL) % 10UL);
 }
 
 // ================================================================
@@ -2764,8 +2803,16 @@ static void drawFocusList() {
     else      oled.setTextColor(SSD1306_WHITE);
 
     if (i == taskCount) {                       // the stopwatch, always last
-      at(4, y, "Stopwatch");
-      at(SCRW - 4 - 2 * 6, y, "go");
+      int c = on ? SSD1306_BLACK : SSD1306_WHITE;
+      // A watch face with a hand and a crown, in nine pixels.
+      oled.drawCircle(8, y + 3, 4, c);
+      oled.drawFastVLine(8, y, 4, c);
+      oled.drawFastHLine(6, y - 2, 5, c);
+      at(16, y, "Stopwatch");
+      if (swMs()) {                             // it has something on it
+        char e[14]; swStr(e, sizeof(e));
+        at(SCRW - 4 - (int)strlen(e) * 6, y, e);
+      }
     } else {
       // a tick in front of anything already finished
       if (tasks[i].done) {
@@ -2791,12 +2838,25 @@ static void drawStopwatch() {
   char e[14];
   swStr(e, sizeof(e));
   bar("STOPWATCH");
-  int sz = strlen(e) > 5 ? 2 : 3;
+
+  // Big enough to read across a desk, and it steps down a size rather
+  // than running off the edge once it has been going an hour.
+  int sz = strlen(e) > 7 ? 2 : (strlen(e) > 5 ? 2 : 3);
   oled.setTextSize(sz);
-  oled.setCursor((SCRW - (int)strlen(e) * 6 * sz) / 2, sz == 3 ? 22 : 26);
+  oled.setCursor((SCRW - (int)strlen(e) * 6 * sz) / 2, sz == 3 ? 20 : 24);
   oled.print(e);
   oled.setTextSize(1);
-  ctr("2 restart   3 leave", 54, 1);
+
+  // Running or not, said without a word: two bars for held, one
+  // triangle for going.
+  if (swRun) {
+    oled.fillRect(58, 44, 3, 8, SSD1306_WHITE);
+    oled.fillRect(64, 44, 3, 8, SSD1306_WHITE);
+  } else {
+    for (int i = 0; i < 8; i++)
+      oled.drawFastVLine(60 + i, 44 + i / 2, 8 - (i / 2) * 2, SSD1306_WHITE);
+  }
+  ctr(swRun ? "1 stop   hold zero" : (swMs() ? "1 go   hold zero" : "1 to start"), 56, 1);
   oled.display();
 }
 
@@ -2974,6 +3034,7 @@ static void drawToast() {
   if (toastKind == "paste")  head = "PASTED";
   if (toastKind == "break")  head = "TAKE A BREAK";
   if (toastKind == "remind") head = "REMINDER";
+  if (toastKind == "note")   head = "REMINDERS";
   bar(head);
 
   // A reminder you did not see is not a reminder, so the first half
@@ -2997,17 +3058,35 @@ static void drawToast() {
     oled.drawRect(15, 52, bw, 5, SSD1306_WHITE);
     if (m > 0) oled.fillRect(16, 53, (bw - 2) * constrain((int)m, 0, 20) / 20, 3, SSD1306_WHITE);
   } else {
-    // two lines of it, and no more: this is a glance, not a read
+    // Two lines of it, and no more: this is a glance, not a read.
+    //
+    // A newline in the text is where the writer wanted the break. The
+    // card that says how many reminders landed is written as two
+    // lines and was being wrapped on width instead, so the newline
+    // came out as a glyph in the middle of a sentence and neither
+    // line sat where it should.
     String t = toastText;
-    if (t.length() <= 21) ctr(t.c_str(), 28, 1);
+    int nl = t.indexOf('\n');
+    String a, b;
+    if (nl >= 0)                { a = t.substring(0, nl); b = t.substring(nl + 1); }
+    else if (t.length() <= 21)  { a = t; }
     else {
       int cut = 21;
       for (int i = 21; i > 8; i--) if (t[i] == ' ') { cut = i; break; }
-      String a = t.substring(0, cut); a.trim();
-      String b = t.substring(cut);    b.trim();
-      if (b.length() > 21) { b = b.substring(0, 20); b += "…"; }
-      ctr(a.c_str(), 22, 1);
-      ctr(b.c_str(), 34, 1);
+      a = t.substring(0, cut);
+      b = t.substring(cut);
+    }
+    a.trim(); b.trim();
+    if (a.length() > 21) { a = a.substring(0, 19); a += ".."; }
+    if (b.length() > 21) { b = b.substring(0, 19); b += ".."; }
+    bool bell = (toastKind == "note");
+    if (b.length()) {
+      if (bell) bellIcon(SCRW / 2, 24, 7);
+      ctr(a.c_str(), bell ? 38 : 22, 1);
+      ctr(b.c_str(), bell ? 50 : 34, 1);
+    } else {
+      if (bell) bellIcon(SCRW / 2, 26, 8);
+      ctr(a.c_str(), bell ? 44 : 28, 1);
     }
   }
   oled.display();
@@ -5684,6 +5763,16 @@ static void goSleep() {
   // have to stay readable, because noticing that it has been moved means
   // reading them continuously while asleep. Not worth the risk.
 }
+// Put back the way it was found. A reminder answered is a reminder
+// over with, and standing there afterwards waiting out a screen
+// timeout is the robot ignoring what just happened. Deep if it came
+// from deep or there is no Mac to keep hold of, otherwise the screen
+// goes dark again and the Mac keeps its connection.
+static void backToSleep() {
+  if (wokeForAlarm || !macLinked) { wokeForAlarm = false; wantDeep = true; }
+  else                            goSleep();
+}
+
 // How long until the next prayer wants saying something about, so a
 // processor that is switched off can set an alarm and still speak up.
 // The times are already in flash and the clock survives being switched
@@ -6126,10 +6215,10 @@ static void knockOne() {
       saveRems();
       Serial.println("reminder waved away, back in fifteen minutes");
     }
-    bool back = remWokeIt && !macLinked;
+    bool back = remWokeIt;
     remShowing = -1; remWokeIt = false;
     toastUntil = 0; toastText = ""; toastKind = "";
-    if (back) wantDeep = true;
+    if (back) backToSleep();
     return;
   }
   if (depth == 0) {
@@ -6208,7 +6297,7 @@ static void knockTwo() {
   if (depth == 0) {
     switch (screen) {
       case S_FOCUS:
-        if (swOn) { swStart = millis(); break; }      // restart it
+        if (swOn) { if (swRun) swStop(); else swGo(); break; }   // same as a press
         depth = 1; itemIdx = 0;
         break;
       case S_FAITH:    depth = 1; itemIdx = 0; subIdx = 0; break;
@@ -6218,7 +6307,7 @@ static void knockTwo() {
       case S_HOME:
         // With no clock this screen is a stopwatch, and restarting it is
         // the only useful thing a double knock can mean there.
-        if (!timeOk) { swStart = millis(); break; }
+        if (!timeOk) { swZero(); break; }
         // The next face, kept as you go. Written every time rather
         // than on the way out of something, because there is no way
         // out of this: whatever is on the screen is what it will be
@@ -6271,7 +6360,10 @@ static void knockTwo() {
   }
   if (screen == S_FOCUS && depth == 1) {
     if (itemIdx == taskCount) {                 // the stopwatch
-      swOn = true; swStart = millis(); depth = 0;
+      // Opened, not started. A stopwatch that is already running by
+      // the time you are looking at it has already lost you the bit
+      // you wanted to measure.
+      swOn = true; swRun = false; swZero(); depth = 0;
       return;
     }
     if (itemIdx < taskCount) {                  // run just this one
@@ -6406,7 +6498,7 @@ static void knockTwo() {
 static void knockThree() {
   cTriple++;
   if (screen == S_FOCUS && (swOn || depth == 1)) {
-    if (swOn) { swOn = false; depth = 0; return; }
+    if (swOn) { swOn = false; swRun = false; depth = 0; return; }
     depth = 0; itemIdx = 0;
     return;
   }
@@ -6618,13 +6710,13 @@ static void touchGesture(uint8_t g) {
   if (toastUntil && toastKind == "remind" && remShowing >= 0) {
     if (g == TG_LONG) {
       if (remShowing < remCount) { rems[remShowing].done = true; saveRems(); }
-      bool back = remWokeIt && !macLinked;
+      bool back = remWokeIt;
       remShowing = -1; remWokeIt = false;
       toastUntil = 0; toastText = ""; toastKind = "";
       flash("DONE", 900);
       // Same again: if this is the only reason it is awake, finishing
       // it is the only reason it needed to be.
-      if (back) wantDeep = true;
+      if (back) backToSleep();
       return;
     }
     // anything else falls through, and a single press waves it away
@@ -6683,6 +6775,19 @@ static void touchGesture(uint8_t g) {
     depth = 1; remIdx = 0; remConfirm = false;
     clickShrink();
     return;
+  }
+
+  // The stopwatch, while it has the screen. One starts it and stops
+  // it where it is, holding puts it back to zero, two goes back to
+  // the list. A shake is handled with every other shake and leaves
+  // altogether.
+  if (screen == S_FOCUS && swOn) {
+    switch (g) {
+      case TG_ONE:  if (swRun) swStop(); else swGo(); return;
+      case TG_LONG: swStop(); swZero(); flash("ZERO", 600); return;
+      case TG_TWO:  swOn = false; swRun = false; depth = 1; itemIdx = taskCount; return;
+      default:      swOn = false; swRun = false; depth = 0; itemIdx = 0; return;
+    }
   }
 
   // A leaf: nothing here to open, so one goes on, two goes back a page
@@ -6794,6 +6899,7 @@ static void input() {
     else if (lvl != touchRest && now - touchLvlAt > TOUCH_REST_MS) {
       // A whole minute at one level. Whatever it is, that is resting.
       touchRest = lvl;
+      prefs.putBool("trest", touchRest);     // so the next wake starts right
       Serial.printf("pad resting level is now %s\n", touchRest ? "high" : "low");
     }
 
@@ -6810,11 +6916,15 @@ static void input() {
           touchPressAt = now;
           touchLongDone = false;
           if (asleep) { wake("touch"); touchTaps = 0; touchLongDone = true; }
-        } else if (!touchLongDone) {
-          // A lift that was not already spent on a long press counts.
-          if (touchTaps < 3) touchTaps++;
+        } else {
+          // Every lift is a jolt, so every lift is recorded, including
+          // the one that ends a long press. Only the ones that were
+          // not already spent on a long press count towards a tap.
           touchLiftAt = now;
-          if (touchTaps == 3) { touchGesture(TG_THREE); touchTaps = 0; }
+          if (!touchLongDone) {
+            if (touchTaps < 3) touchTaps++;
+            if (touchTaps == 3) { touchGesture(TG_THREE); touchTaps = 0; }
+          }
         }
       }
     } else touchEdge = 0;
@@ -6919,9 +7029,14 @@ static void input() {
     //
     // So a shake counts only when nothing is touching the pad and
     // nothing has been for a moment.
-    bool byHand = touchOn || (now - touchPressAt) < SHAKE_AFTER_MS;
+    uint32_t sinceHand = now - (touchLiftAt > touchPressAt ? touchLiftAt : touchPressAt);
+    bool byHand = touchOn || sinceHand < SHAKE_AFTER_MS;
     if (cfgShake && !byHand && !(screen == S_GAMES && depth == 2) && !tapTesting) {
       if (bikeEdit) bikeEdit = false;           // out of the chooser, nothing kept
+      // The stopwatch holds the screen on its own, outside depth, so
+      // stepping back has to put it down first or the shake does
+      // nothing you can see.
+      else if (swOn) { swOn = false; swRun = false; depth = 0; itemIdx = 0; }
       else if (faceMode) faceMode = false;
       else if (depth > 0) { depth--; if (!depth) { itemIdx = 0; subIdx = 0; } }
       else if (screen != S_HOME) { screen = S_HOME; itemIdx = 0; subIdx = 0; }
@@ -8546,9 +8661,35 @@ void setup() {
   readBattery();
 
   pinMode(TOUCH_PIN, INPUT_PULLDOWN);
-  { int hi = 0;
-    for (int i = 0; i < 12; i++) { if (digitalRead(TOUCH_PIN)) hi++; delay(3); }
-    touchRest = (hi >= 7);
+  // Which level means nobody is touching it.
+  //
+  // This is sampled at boot, and waking from deep sleep IS a boot: the
+  // finger that woke it is still on the pad thirty milliseconds later
+  // when this runs. So it learned the touched level as the resting
+  // one, and from then on everything was inverted. The pad read as
+  // pressed whenever nobody was near it, and as released while you
+  // held it, and the next deep sleep armed its wake on the resting
+  // level, so touching the thing did nothing at all.
+  //
+  // It only showed up now because deep sleep itself only started
+  // happening often. Offline, the robot goes off the moment the screen
+  // darkens, so this ran on nearly every wake, and each wake made it
+  // worse.
+  //
+  // Remembered instead, and only measured when there is certainly no
+  // finger on it: a cold start, or a wake by the timer.
+  {
+    bool byTouch = (woke_ == ESP_SLEEP_WAKEUP_GPIO);
+    bool known   = prefs.isKey("trest");
+    if (byTouch && known) {
+      touchRest = prefs.getBool("trest", false);
+      Serial.println("woken by the pad, so the resting level is the remembered one");
+    } else {
+      int hi = 0;
+      for (int i = 0; i < 12; i++) { if (digitalRead(TOUCH_PIN)) hi++; delay(3); }
+      touchRest = (hi >= 7);
+      prefs.putBool("trest", touchRest);
+    }
     touchLvl = touchRest; touchLvlAt = millis();
     Serial.printf("touch pad on GPIO%d rests %s\n", TOUCH_PIN, touchRest ? "high" : "low");
   }
@@ -8563,7 +8704,12 @@ void setup() {
   eyes.begin(SCRW, SCRH, 50);
   applyEyes(cfgEyes);
 
-  if (!fromDeep) animWake();
+  // Waking is waking, however the processor got there. What is
+  // skipped on the way back from deep sleep is the introduction: the
+  // sensor sweep, the name card and the how-to card. The eyes opening
+  // is not an introduction, it is the robot waking up, and leaving it
+  // out made coming back from a touch look like a fault.
+  animWake();
   startSensors();
   applyFallInt();
   applyTap();
@@ -8667,7 +8813,8 @@ void setup() {
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
   lastActive = millis();
   if (fromDeep) {
-    wokeBy = (woke_ == ESP_SLEEP_WAKEUP_TIMER) ? "prayer" : "picked up";
+    wokeForAlarm = (woke_ == ESP_SLEEP_WAKEUP_TIMER);
+    wokeBy = wokeForAlarm ? "prayer" : "picked up";
     Serial.printf("back from being off (%s)\n", wokeBy.c_str());
   }
   drawHome();                          // on screen before anything can block
@@ -8802,7 +8949,9 @@ void loop() {
           rems[i].done = true; saveRems(); continue;
         }
       }
-      remWokeIt = asleep;            // so answering it can send it back
+      // Being switched off and brought back by the alarm counts as
+      // having been asleep: the boot is why `asleep` is already false.
+      remWokeIt = asleep || wokeForAlarm;
       wake("reminder");
       toastKind = "remind";
       toastText = rems[i].text;
@@ -8871,7 +9020,10 @@ void loop() {
   }
 
   // depth only means something on the three screens that have one
-  if (swOn) { lastActive = now; screen = S_FOCUS; }
+  // A stopwatch that is counting holds the screen; one sitting at a
+  // number does not. It used to hold it either way, so leaving a
+  // stopped stopwatch on screen kept the robot awake all night.
+  if (swOn) { screen = S_FOCUS; if (swRun) lastActive = now; }
   if (screen != S_FAITH && screen != S_READS && screen != S_GAMES &&
       screen != S_FOCUS && screen != S_SETTINGS && depth) {
     depth = 0; itemIdx = 0; subIdx = 0;
