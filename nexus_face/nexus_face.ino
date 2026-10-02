@@ -191,7 +191,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "4.4.0"
+#define FW_VERSION "5.0.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -237,11 +237,52 @@ uint8_t adxl = 0, mpu = 0;
 float ax, ay, az, amag = 1, mx, my, mz, gxr, gyr, gzr, mtemp;
 
 // ---------------- screens ----------------
-enum { S_HOME = 0, S_REMIND, S_FOCUS, S_WEATHER, S_MSG, S_PRAYER,
+enum { S_HOME = 0, S_BIKE, S_REMIND, S_FOCUS, S_WEATHER, S_MSG, S_PRAYER,
        S_FAITH, S_READS, S_GAMES, S_SETTINGS, S_SYSTEM, S_COUNT };
 const char* S_NAME[S_COUNT] =
-  { "HOME", "REMINDERS", "FOCUS", "WEATHER", "MESSAGES", "PRAYER",
+  { "HOME", "VEHICLE", "REMINDERS", "FOCUS", "WEATHER", "MESSAGES", "PRAYER",
     "FAITH", "SHORT READS", "GAMES", "SETTINGS", "SYSTEM" };
+
+// ---------------- online, or not ----------------
+//  Two different things, and keeping them apart matters.
+//
+//  cfgOffline is a decision: you said stay off the network. The radio
+//  goes off and stays off until you say otherwise.
+//
+//  netDown is a fact: it tried and there was nothing there. The radio
+//  goes off too, because a chip scanning for a network that is not
+//  coming back is just a way of spending the battery, but it tries
+//  again on the next wake.
+//
+//  Either way the robot works. Offline is a mode, not a fault.
+bool cfgOffline = false;
+bool netDown = false;
+int  netMisses = 0;                // failed joins since the last success
+static bool offlineNow() { return cfgOffline || netDown; }
+
+// The vehicle screen, off until you ask for it.
+bool cfgBike = false;
+int  cfgBikeTpl = 0;
+#define BIKE_TPL_N 4
+char bikePlate[20] = "KA 50 HJ 5683";
+char bikeModel[20] = "Meteor 350";
+char bikeOwner[20] = "Ahmed";
+
+// Which screens are worth offering at all. Weather needs the network
+// and the vehicle screen is something you asked for; neither should sit
+// in the carousel as a dead end.
+static bool screenOn_(int s) {
+  if (s == S_BIKE)    return cfgBike;
+  if (s == S_WEATHER) return !offlineNow();
+  return true;
+}
+static int nextScreen(int from) {
+  for (int i = 1; i <= S_COUNT; i++) {
+    int s = (from + i) % S_COUNT;
+    if (screenOn_(s)) return s;
+  }
+  return S_HOME;
+}
 
 // ---------------- the Hijri date ----------------
 //  The arithmetic Islamic calendar, which is a rule rather than an
@@ -331,13 +372,14 @@ unsigned long zikrNext = 0;      // when the next count lands
 
 // ---------------- settings ----------------
 enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
-       C_PRAYER, C_HIJRI, C_HOTSPOT, C_ACCEL, C_KNOCK, C_TAP, C_SHAKE, C_DEEP, C_BATT,
+       C_PRAYER, C_HIJRI, C_MODE, C_BIKE, C_HOTSPOT, C_ACCEL, C_KNOCK, C_TAP,
+       C_SHAKE, C_DEEP, C_BATT,
        C_PAIR, C_UPDATE,
        C_AUTOUP, C_RESET, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
-    "Eye style", "Prayer times", "Hijri shift", "Hotspot", "Accelerometer",
-    "Knocks", "Tap strength",
+    "Eye style", "Prayer times", "Hijri shift", "Network", "Vehicle",
+    "Hotspot", "Accelerometer", "Knocks", "Tap strength",
     "Shake to go back", "Power down", "Battery full at",
     "Pair a Mac", "Check update", "Auto update",
     "Reset settings", "Reboot", "About" };
@@ -427,7 +469,7 @@ float  calAcc[3] = { 0, 0, 0 };
 int    calN = 0;
 static bool tiltTaught() { return mapAxX >= 0 && mapAxY >= 0; }
 
-const int SLEEP_OPTS[] = { 15, 30, 45, 60, 120, 180, 300, 600, 0 };   // 0 = never
+const int SLEEP_OPTS[] = { 5, 10, 15, 30, 45, 60, 120, 180, 300, 600, 0 };  // 0 = never
 const int SLEEP_N = sizeof(SLEEP_OPTS) / sizeof(SLEEP_OPTS[0]);
 const int POPUP_OPTS[] = { 0, 5, 10, 20, 30, 60 };
 const int POPUP_N = sizeof(POPUP_OPTS) / sizeof(POPUP_OPTS[0]);
@@ -578,9 +620,14 @@ unsigned long nextStory = 0;
 //  which is how the stopwatch ended up running whether or not anyone
 //  had asked for one. Home stays home now, and says something rather
 //  than showing a clock with nothing in it.
+// Said to you, not at you. The name is yours and settable, and the
+// greeting changes so the same screen is not the same screen all week.
+char cfgName[16] = "Ahmed";
+const char* GREET[] = { "Salam", "Hello", "Assalam", "Hi", "Good to see you" };
+const int GREET_N = sizeof(GREET) / sizeof(GREET[0]);
 const char* IDLE_LINES[] = {
-  "Knock to begin",   "Everything still works",  "Reads, faith, games",
-  "No network needed", "Knock twice for more",   "Still here" };
+  "touch to begin",   "everything still works", "reads, faith, games",
+  "no network needed", "hold to go in",         "still here" };
 const int IDLE_N = sizeof(IDLE_LINES) / sizeof(IDLE_LINES[0]);
 
 // ---------------- the stopwatch ----------------
@@ -1782,6 +1829,26 @@ static void drawHome() {
     return;
   }
 
+  // Off the network, the clock is not the point any more: nothing on
+  // this screen was going to be fetched. It says hello instead, and
+  // keeps the time in the corner, because a robot that knows what time
+  // it is and will not say is an irritating robot.
+  if (offlineNow()) {
+    char hi[34];
+    snprintf(hi, sizeof(hi), "%s, %s",
+             GREET[(millis() / 11000UL) % GREET_N], cfgName);
+    robotHead(SCRW / 2, 24, false);
+    ctr(hi, 40, 1);
+    ctr("touch to begin", 54, 1);
+    at(2, 2, fb.ok ? fb.hm : "");              // small, out of the way
+    if (!isnan(battV)) {
+      char b[8]; snprintf(b, sizeof(b), "%d%%", battPct(battV));
+      at(SCRW - 2 - (int)strlen(b) * 6, 2, b);
+    }
+    oled.display();
+    return;
+  }
+
   switch (cfgFace) {
     case F_STACK:    faceStack();       break;
     case F_DATEUP:    faceDateUp();      break;
@@ -2206,6 +2273,105 @@ static void drawReminders() {
     pos += take;
     while (pos < len && buf[pos] == ' ') pos++;
     line++;
+  }
+  oled.display();
+}
+
+// A motorcycle, side on, in about 34 by 16.
+static void bikeIcon(int x, int y) {
+  oled.drawCircle(x + 5,  y + 11, 4, SSD1306_WHITE);
+  oled.drawCircle(x + 27, y + 11, 4, SSD1306_WHITE);
+  oled.drawPixel(x + 5,  y + 11, SSD1306_WHITE);
+  oled.drawPixel(x + 27, y + 11, SSD1306_WHITE);
+  oled.drawLine(x + 5,  y + 11, x + 13, y + 4,  SSD1306_WHITE);
+  oled.drawLine(x + 13, y + 4,  x + 22, y + 5,  SSD1306_WHITE);
+  oled.drawLine(x + 22, y + 5,  x + 27, y + 11, SSD1306_WHITE);
+  oled.drawLine(x + 13, y + 4,  x + 16, y + 11, SSD1306_WHITE);
+  oled.drawLine(x + 16, y + 11, x + 27, y + 11, SSD1306_WHITE);
+  oled.fillRect(x + 10, y + 2, 7, 2, SSD1306_WHITE);
+  oled.fillRect(x + 20, y + 1, 2, 4, SSD1306_WHITE);
+  oled.fillRect(x + 17, y + 6, 5, 3, SSD1306_WHITE);
+}
+// A plate with the corners knocked off, the way a real one looks.
+static void plateBox(int x, int y, int w, int h) {
+  oled.drawRect(x, y, w, h, SSD1306_WHITE);
+  oled.drawPixel(x, y, SSD1306_BLACK);
+  oled.drawPixel(x + w - 1, y, SSD1306_BLACK);
+  oled.drawPixel(x, y + h - 1, SSD1306_BLACK);
+  oled.drawPixel(x + w - 1, y + h - 1, SSD1306_BLACK);
+}
+
+static void drawBike() {
+  oled.clearDisplay();
+  switch (cfgBikeTpl) {
+
+    case 1: {                                    // badge: the bike itself
+      bikeIcon(3, 6);
+      oled.drawFastVLine(42, 4, 56, SSD1306_WHITE);
+      at(48, 6, bikePlate);
+      oled.drawFastHLine(48, 16, SCRW - 52, SSD1306_WHITE);
+      at(48, 20, bikeModel);
+      at(48, 31, bikeOwner);
+      at(48, 45, "India");
+      break; }
+
+    case 2: {                                    // ticket: like the papers
+      bar("VEHICLE");
+      const char* K[3] = { "REG", "MODEL", "OWNER" };
+      const char* V[3] = { bikePlate, bikeModel, bikeOwner };
+      for (int i = 0; i < 3; i++) {
+        int y = 16 + i * 13;
+        at(4, y, K[i]);
+        at(SCRW - 4 - (int)strlen(V[i]) * 6, y, V[i]);
+        if (i < 2) for (int x = 4; x < SCRW - 4; x += 3)
+          oled.drawPixel(x, y + 9, SSD1306_WHITE);
+      }
+      break; }
+
+    case 3: {                                    // dial, for the look of it
+      const int CX = 64, CY = 46, R = 34;
+      for (int a = 180; a <= 360; a += 2)
+        oled.drawPixel(CX + (int)(R * cosf(a * 0.01745f)),
+                       CY + (int)(R * sinf(a * 0.01745f)), SSD1306_WHITE);
+      for (int i = 0; i <= 6; i++) {
+        float a = (180 + 30 * i) * 0.01745f;
+        for (int r = R - 4; r <= R; r++)
+          oled.drawPixel(CX + (int)(r * cosf(a)), CY + (int)(r * sinf(a)), SSD1306_WHITE);
+      }
+      float a = (180 + 30 * 4.2f) * 0.01745f;
+      oled.drawLine(CX, CY, CX + (int)(27 * cosf(a)), CY + (int)(27 * sinf(a)), SSD1306_WHITE);
+      oled.fillCircle(CX, CY, 2, SSD1306_WHITE);
+      ctr(bikeModel, 2, 1);
+      ctr(bikePlate, 50, 1);
+      break; }
+
+    default: {                                   // the plate, large
+      // Thirteen characters will not go across 128 at double size, so
+      // it breaks where a real motorcycle plate breaks: state and
+      // district above, series and number below. It was going to have
+      // to shrink otherwise, and a small big-plate is no plate at all.
+      char top[12] = "", bot[12] = "";
+      const char* sp = strchr(bikePlate, ' ');
+      const char* sp2 = sp ? strchr(sp + 1, ' ') : nullptr;
+      if (sp2) {
+        int n = (int)(sp2 - bikePlate);
+        if (n > 11) n = 11;
+        memcpy(top, bikePlate, n); top[n] = 0;
+        snprintf(bot, sizeof(bot), "%s", sp2 + 1);
+      } else {
+        snprintf(top, sizeof(top), "%s", bikePlate);
+      }
+      plateBox(6, 4, SCRW - 12, bot[0] ? 38 : 24);
+      if (bot[0]) {
+        ctr(top, 9, 2);
+        ctr(bot, 26, 2);
+      } else {
+        ctr(top, 11, 2);
+      }
+      char line[34];
+      snprintf(line, sizeof(line), "%s  %s", bikeModel, bikeOwner);
+      ctr(line, 50, 1);
+      break; }
   }
   oled.display();
 }
@@ -2838,6 +3004,9 @@ static void drawSettings() {
       case C_ACCEL:  snprintf(v, sizeof(v), "x2"); break;
       case C_KNOCK:  snprintf(v, sizeof(v), "%s", cfgKnock ? "on" : "off"); break;
       case C_HIJRI:  snprintf(v, sizeof(v), "%+d d", cfgHijriAdj); break;
+      case C_MODE:   snprintf(v, sizeof(v), "%s", cfgOffline ? "off" :
+                              (netDown ? "no signal" : "on")); break;
+      case C_BIKE:   snprintf(v, sizeof(v), "%s", cfgBike ? "on" : "off"); break;
       case C_SHAKE:  snprintf(v, sizeof(v), "%s", cfgShake ? "on" : "off"); break;
       case C_DEEP:   snprintf(v, sizeof(v), "%s", DEEP_NAME[cfgDeepIdx]); break;
       case C_BATT:   snprintf(v, sizeof(v), "%.2fV", battFull); break;
@@ -5350,6 +5519,9 @@ static void resetSettings() {
   cfgAutoUp = false; prefs.putBool("autoup", cfgAutoUp);
   cfgKnock = false;  prefs.putBool("knock", cfgKnock);
   cfgHijriAdj = 0;   prefs.putInt("hadj", cfgHijriAdj);
+  cfgOffline = false; prefs.putBool("offl", cfgOffline);
+  cfgBike = false;   prefs.putBool("bike", cfgBike);
+  cfgBikeTpl = 0;    prefs.putInt("btpl", cfgBikeTpl);
   cfgShake = true;   prefs.putBool("shake", cfgShake);
   cfgDeepIdx = 1;    prefs.putInt("deepi", cfgDeepIdx);
   battFull = 4.10f;  prefs.putFloat("bfull", battFull);
@@ -5681,7 +5853,7 @@ static void knockOne() {
     return;
   }
   if (depth == 0) {
-    screen = (screen + 1) % S_COUNT;
+    screen = nextScreen(screen);
     itemIdx = 0; subIdx = 0;
     return;
   }
@@ -5885,6 +6057,30 @@ static void knockTwo() {
       case C_HOTSPOT: startHotspot(); break;
       case C_PRAYER:  prayerWanted = true; nextPrayerTry = 0; break;
       case C_ACCEL:   depth = 2; break;
+      case C_MODE:
+        cfgOffline = !cfgOffline;
+        prefs.putBool("offl", cfgOffline);
+        if (cfgOffline) {
+          // Asked for, so it goes off and stays off. Nothing scans,
+          // nothing retries, and the carousel loses the weather.
+          WiFi.disconnect(true, false);
+          WiFi.mode(WIFI_OFF);
+          netDown = false;
+          if (screen == S_WEATHER) screen = S_HOME;
+          flash("NETWORK OFF", 1200);
+        } else {
+          netDown = false;
+          netNextTry = 0;                   // the task picks it up at once
+          WiFi.mode(WIFI_STA);
+          flash("LOOKING", 1200);
+        }
+        break;
+      case C_BIKE:
+        cfgBike = !cfgBike;
+        prefs.putBool("bike", cfgBike);
+        if (!cfgBike && screen == S_BIKE) screen = S_HOME;
+        flash(cfgBike ? "VEHICLE ON" : "VEHICLE OFF", 1000);
+        break;
       case C_HIJRI: {
         // The arithmetic calendar is a rule and the real one is a
         // sighting, so they disagree by a day now and then. Two either
@@ -6138,6 +6334,18 @@ static void touchGesture(uint8_t g) {
   // thing being measured. The pad still works in there, so there is
   // always a way out of it.
   if (tapTesting && tapChosen && g == TG_LONG) { tapTesting = false; return; }
+
+  // The vehicle screen has nothing to open, so holding walks the
+  // layouts instead, and holding on the last one comes back to the
+  // first. Four of them: plate, badge, ticket, dial.
+  if (screen == S_BIKE && depth == 0) {
+    if (g == TG_LONG) {
+      cfgBikeTpl = (cfgBikeTpl + 1) % BIKE_TPL_N;
+      prefs.putInt("btpl", cfgBikeTpl);
+      clickShrink();
+      return;
+    }
+  }
 
   // Reminders read like a watch does: one goes to the next, two comes
   // back out, and holding is how you get in and how you clear them.
@@ -6764,6 +6972,14 @@ static void apiState() {
   o += "\"knock\":" + String(cfgKnock ? "true" : "false") + ",";
   o += "\"shake\":" + String(cfgShake ? "true" : "false") + ",";
   o += "\"hadj\":" + String(cfgHijriAdj) + ",";
+  o += "\"offline\":" + String(cfgOffline ? "true" : "false") + ",";
+  o += "\"netDown\":" + String(netDown ? "true" : "false") + ",";
+  o += "\"bike\":" + String(cfgBike ? "true" : "false") + ",";
+  o += "\"btpl\":" + String(cfgBikeTpl) + ",";
+  o += "\"plate\":\"" + String(bikePlate) + "\",";
+  o += "\"model\":\"" + String(bikeModel) + "\",";
+  o += "\"owner\":\"" + String(bikeOwner) + "\",";
+  o += "\"name\":\"" + String(cfgName) + "\",";
   { int hy, hm, hd;
     if (hijriNow(hy, hm, hd)) {
       o += "\"hijri\":\"" + String(hd) + " " + HIJRI_LATIN[hm - 1] + " " + String(hy) + "\","; } }
@@ -7084,6 +7300,32 @@ static void setupWeb() {
   //  have, matched on the words and the minute, and never removes
   //  anything. Clearing is a thing you do deliberately, on the robot or
   //  with clear=1 below.
+  // What is on the vehicle screen. Strings rather than numbers, so it
+  // needs its own way in rather than riding on cfgv.
+  web.on("/api/bike", HTTP_ANY, []() {
+    if (!guard()) return;
+    bool any = false;
+    struct { const char* k; char* dst; size_t n; const char* pref; } F[] = {
+      { "plate", bikePlate, sizeof(bikePlate), "bplate" },
+      { "model", bikeModel, sizeof(bikeModel), "bmodel" },
+      { "owner", bikeOwner, sizeof(bikeOwner), "bowner" },
+      { "name",  cfgName,   sizeof(cfgName),   "name"   },
+    };
+    for (auto& f : F) {
+      if (!web.hasArg(f.k)) continue;
+      String s = web.arg(f.k); s.trim();
+      if (!s.length()) continue;
+      snprintf(f.dst, f.n, "%s", s.c_str());
+      prefs.putString(f.pref, f.dst);
+      any = true;
+    }
+    char o[180];
+    snprintf(o, sizeof(o),
+             "{\"ok\":true,\"changed\":%s,\"plate\":\"%s\",\"model\":\"%s\",\"owner\":\"%s\",\"name\":\"%s\"}",
+             any ? "true" : "false", bikePlate, bikeModel, bikeOwner, cfgName);
+    web.send(200, "application/json", o);
+  });
+
   web.on("/api/rems", HTTP_ANY, []() {
     if (!guard()) return;
     if (web.arg("clear") == "1") {
@@ -7271,6 +7513,11 @@ static void setupWeb() {
     // driving this now, so if the pad ever stops there has to be a way
     // back in that does not involve the pad, and the network is it.
     else if (k == "knock"){ cfgKnock    = (v != 0);                      prefs.putBool("knock", cfgKnock); }
+    else if (k == "bike") { cfgBike     = (v != 0);                      prefs.putBool("bike", cfgBike); }
+    else if (k == "btpl") { cfgBikeTpl  = constrain(v, 0, BIKE_TPL_N - 1); prefs.putInt("btpl", cfgBikeTpl); }
+    else if (k == "offl") { cfgOffline  = (v != 0);                      prefs.putBool("offl", cfgOffline);
+                            if (cfgOffline) { WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF); }
+                            else { netDown = false; netMisses = 0; netNextTry = 0; WiFi.mode(WIFI_STA); } }
     else if (k == "hadj") { cfgHijriAdj = constrain(v, -2, 2);           prefs.putInt("hadj", cfgHijriAdj); }
     else if (k == "shake"){ cfgShake    = (v != 0);                      prefs.putBool("shake", cfgShake); }
     else if (k == "deepi"){ cfgDeepIdx  = constrain(v, 0, DEEP_N - 1);   prefs.putInt("deepi", cfgDeepIdx); }
@@ -7725,16 +7972,32 @@ static void netLoop(void*) {
       loadNets();
       netNextTry = 0;
     }
+    if (cfgOffline) {
+      // Asked to stay off. Nothing here runs at all.
+      vTaskDelay(pdMS_TO_TICKS(400));
+      continue;
+    }
     if (!online()) {
       wantTime = wantWx = wantPrayerNow = false;
       netUsing = -1;
-      // Try the next one, then the next. Waiting here costs the screen
-      // nothing, which is the whole reason this task exists.
-      if (netCount && !rescueAP && (long)(millis() - netNextTry) >= 0) {
+      // Try each saved network once. A chip scanning for something
+      // that is not coming back is a way of spending the battery, so
+      // after one pass round the list it stops and says so, and the
+      // robot carries on offline. The next wake tries again.
+      if (netCount && !rescueAP && !netDown && (long)(millis() - netNextTry) >= 0) {
         netTrying = (netTrying + 1) % netCount;
-        if (!joinOne(netTrying, 7000)) netNextTry = millis() + 4000;
+        if (!joinOne(netTrying, 7000)) {
+          netNextTry = millis() + 4000;
+          if (++netMisses >= netCount * 2) {
+            netDown = true;
+            WiFi.disconnect(true, false);
+            WiFi.mode(WIFI_OFF);
+            Serial.println("nothing to join; going offline and switching the radio off");
+          }
+        }
       }
     } else {
+      netMisses = 0;
       if (wantTime)      { wantTime = false;      trySyncTime(1500); }
       if (wantWx)        { wantWx = false;        fetchWeather(); }
       if (wantPrayerNow) { wantPrayerNow = false; fetchPrayer(); }
@@ -7798,6 +8061,14 @@ void setup() {
   cfgAutoUp   = prefs.getBool("autoup", false);
   cfgKnock    = prefs.getBool("knock", false);   // the pad drives this now
   cfgHijriAdj = constrain(prefs.getInt("hadj", 0), -2, 2);
+  cfgOffline  = prefs.getBool("offl", false);
+  cfgBike     = prefs.getBool("bike", false);
+  cfgBikeTpl  = constrain(prefs.getInt("btpl", 0), 0, BIKE_TPL_N - 1);
+  { String s;
+    s = prefs.getString("bplate", "KA 50 HJ 5683"); snprintf(bikePlate, sizeof(bikePlate), "%s", s.c_str());
+    s = prefs.getString("bmodel", "Meteor 350");    snprintf(bikeModel, sizeof(bikeModel), "%s", s.c_str());
+    s = prefs.getString("bowner", "Ahmed");         snprintf(bikeOwner, sizeof(bikeOwner), "%s", s.c_str());
+    s = prefs.getString("name",   "Ahmed");         snprintf(cfgName,   sizeof(cfgName),   "%s", s.c_str()); }
   cfgShake    = prefs.getBool("shake", true);    // on by default
   cfgDeepIdx  = constrain(prefs.getInt("deepi", 1), 0, DEEP_N - 1);
   battFull    = constrain(prefs.getFloat("bfull", 4.10f), 3.90f, 4.30f);
@@ -8160,9 +8431,13 @@ void loop() {
   // there. With the Mac connected it only darkens the screen, because
   // powering down drops the network and the Mac would lose it mid
   // sentence. Holding the pad still forces it either way.
-  if (!deepOff && deepAfterMs() && asleep && !sessionRunning() &&
-      !macLinked &&
-      (now - sleptAt) > deepAfterMs() && upState == U_OFF && !storyBusy) {
+  // Off the network there is nothing to stay reachable for, so the
+  // screen going dark and the robot switching off are the same moment.
+  // On the network it keeps the two apart, because dropping the Mac
+  // mid sentence to save a little current is a poor trade.
+  uint32_t wait = offlineNow() ? 0 : deepAfterMs();
+  if (!deepOff && (offlineNow() || deepAfterMs()) && asleep && !sessionRunning() &&
+      !macLinked && (now - sleptAt) > wait && upState == U_OFF && !storyBusy) {
     goDeep();
   }
 
@@ -8302,6 +8577,7 @@ void loop() {
       case S_READS:    drawReads();    break;
       case S_GAMES:    drawGames();    break;
       case S_SETTINGS: drawSettings(); break;
+      case S_BIKE:     drawBike();      break;
       case S_REMIND:   drawReminders(); break;
       case S_SYSTEM:   drawSystem();   break;
       default:         drawHome();     break;
