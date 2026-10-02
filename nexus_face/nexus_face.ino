@@ -146,10 +146,11 @@ uint32_t touchLvlAt = 0;         // when it last changed
 //  of the four.
 #define TOUCH_LONG_MS 700UL      // held this long and it is a long press
 // Keep holding and it keeps meaning more. Nothing is shown for the
-// first five seconds, because a bar on screen during ordinary use was
-// worse than the thing it explained; nobody holds for five seconds by
+// first four seconds, because a bar on screen during ordinary use was
+// worse than the thing it explained; nobody holds for four seconds by
 // accident, so after that it is safe to say what is about to happen.
-#define TOUCH_HOME_MS  5000UL
+// Four, then three to change your mind: seven in all.
+#define TOUCH_HOME_MS  4000UL
 
 #define TOUCH_COUNT_MS  3000UL   // and then it counts three and goes
 #define TOUCH_GAP_MS  300UL      // quiet for this long and the count is final
@@ -258,7 +259,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.8.0"
+#define FW_VERSION "5.9.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -2371,41 +2372,50 @@ static void ringArc(int cx, int cy, int r, float frac) {
 
 // What holding on looks like once it means something.
 //
-//  Nothing at all for the first five seconds, because a bar on screen
-//  during ordinary use was worse than the thing it explained. At five
+//  Nothing at all for the first four seconds, because a bar on screen
+//  during ordinary use was worse than the thing it explained. At four
 //  it has already gone home, and this is the three seconds you have
 //  to say you did not mean the rest of it.
+//
+//  A dial rather than a notice. The track is dotted all the way round
+//  so you can see how far there is to go even at a glance, the lit
+//  arc is what is left of it, and the number sits in the middle. Two
+//  solid white bands top and bottom is what this was before, and on a
+//  panel this small two bands is most of the panel.
 //
 //  It takes the whole screen. A ring punched into the middle of a
 //  settings list left the list showing round the edges and the title
 //  band sliced in half, which looked like a glitch rather than a
 //  thing the robot meant to do.
-//
-//  Before this there were two of these screens, one offering home and
-//  one counting down, and you had to hold through the first to reach
-//  the second.
 static void drawHoldTier(uint32_t now) {
   uint32_t gone = now - sleepArmed;
   if (gone > TOUCH_COUNT_MS) gone = TOUCH_COUNT_MS;
-  int left = (int)((TOUCH_COUNT_MS - gone + 999) / 1000);
-  if (left < 1) left = 1;
-  char n[2] = { (char)('0' + left), 0 };
+  const float left = 1.0f - (float)gone / (float)TOUCH_COUNT_MS;
+  int secs = (int)((TOUCH_COUNT_MS - gone + 999) / 1000);
+  if (secs < 1) secs = 1;
+  char n[2] = { (char)('0' + secs), 0 };
 
   oled.clearDisplay();
-  oled.fillRect(0, 0, SCRW, 11, SSD1306_WHITE);
-  oled.setTextColor(SSD1306_BLACK);
-  ctr("GOING TO SLEEP", 2, 1);
-  oled.setTextColor(SSD1306_WHITE);
+  ctr("GOING TO SLEEP", 0, 1);
 
-  const int CX = SCRW / 2, CY = 31, R = 16;
-  oled.drawCircle(CX, CY, R, SSD1306_WHITE);
-  ringArc(CX, CY, R, 1.0f - (float)gone / (float)TOUCH_COUNT_MS);
-  ctr(n, 19, 3);
+  const int CX = SCRW / 2, CY = 33, R = 19;
+  // The track: the whole way round, dotted, so the lit part has
+  // something to be a fraction of.
+  for (int d = 0; d < 360; d += 9) {
+    float a = d * 0.01745f;
+    oled.drawPixel(CX + (int)(R * cosf(a)), CY + (int)(R * sinf(a)), SSD1306_WHITE);
+  }
+  // Three notches, one per second, so it reads as a count and not
+  // just as something draining.
+  for (int i = 0; i < 3; i++) {
+    float a = -1.5708f + i * 2.0944f;
+    for (int rr = R + 1; rr <= R + 3; rr++)
+      oled.drawPixel(CX + (int)(rr * cosf(a)), CY + (int)(rr * sinf(a)), SSD1306_WHITE);
+  }
+  ringArc(CX, CY, R, left);
+  ctr(n, 21, 3);
 
-  oled.fillRect(0, 53, SCRW, 11, SSD1306_WHITE);
-  oled.setTextColor(SSD1306_BLACK);
   ctr("let go to stay", 55, 1);
-  oled.setTextColor(SSD1306_WHITE);
 }
 
 // A bell, drawn to the same weight as the gear so the carousel looks
