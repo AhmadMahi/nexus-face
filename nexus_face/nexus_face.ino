@@ -41,6 +41,7 @@
 #include <Adafruit_SSD1306.h>
 #include <FluxGarage_RoboEyes.h>
 #include "faith_data.h"
+#include "arabic_glyphs.h"
 
 #define SDA_PIN 8
 #define SCL_PIN 9
@@ -189,7 +190,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "4.1.0"
+#define FW_VERSION "4.2.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -241,6 +242,37 @@ const char* S_NAME[S_COUNT] =
   { "HOME", "REMINDERS", "FOCUS", "WEATHER", "MESSAGES", "PRAYER",
     "FAITH", "SHORT READS", "GAMES", "SETTINGS", "SYSTEM" };
 
+// ---------------- the Hijri date ----------------
+//  The arithmetic Islamic calendar, which is a rule rather than an
+//  observation. It agrees with the announced date most of the time and
+//  can be a day out either way, because the real one depends on
+//  somebody seeing the moon. Checked against four known first-of-the-
+//  months and it landed on all four; there is an offset in settings for
+//  the days it does not.
+int cfgHijriAdj = 0;              // -2 to +2 days
+
+static long gregToJdn(int y, int m, int d) {
+  long a = (14 - m) / 12, yy = y + 4800 - a, mm = m + 12 * a - 3;
+  return d + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045;
+}
+static void hijriFromJdn(long jd, int& hy, int& hm, int& hd) {
+  long l = jd - 1948440 + 10632;
+  long n = (l - 1) / 10631;
+  l = l - 10631 * n + 354;
+  long j = ((10985 - l) / 5316) * ((50 * l) / 17719)
+         + (l / 5670) * ((43 * l) / 15238);
+  l = l - ((30 - j) / 15) * ((17719 * j) / 50)
+        - (j / 16) * ((15238 * j) / 43) + 29;
+  hm = (int)((24 * l) / 709);
+  hd = (int)(l - (709 * hm) / 24);
+  hy = (int)(30 * n + j - 30);
+}
+// Latin, for the faces that are otherwise in English. The Arabic ones
+// are bitmaps and live in arabic_glyphs.h.
+const char* HIJRI_LATIN[12] = {
+  "Muharram", "Safar", "Rabi I", "Rabi II", "Jumada I", "Jumada II",
+  "Rajab", "Shaban", "Ramadan", "Shawwal", "Dhul Qadah", "Dhul Hijjah" };
+
 // ---------------- reminders ----------------
 //  Kept here rather than on the Mac, which is where they used to live.
 //  The Mac knew the time and the robot did not, so the Mac held the
@@ -291,12 +323,13 @@ unsigned long zikrNext = 0;      // when the next count lands
 
 // ---------------- settings ----------------
 enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
-       C_PRAYER, C_HOTSPOT, C_ACCEL, C_KNOCK, C_TAP, C_SHAKE, C_DEEP, C_BATT,
+       C_PRAYER, C_HIJRI, C_HOTSPOT, C_ACCEL, C_KNOCK, C_TAP, C_SHAKE, C_DEEP, C_BATT,
        C_PAIR, C_UPDATE,
        C_AUTOUP, C_RESET, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
-    "Eye style", "Prayer times", "Hotspot", "Accelerometer", "Knocks", "Tap strength",
+    "Eye style", "Prayer times", "Hijri shift", "Hotspot", "Accelerometer",
+    "Knocks", "Tap strength",
     "Shake to go back", "Power down", "Battery full at",
     "Pair a Mac", "Check update", "Auto update",
     "Reset settings", "Reboot", "About" };
@@ -343,12 +376,15 @@ enum { F_CLASSIC = 0, F_STACK, F_DATEUP, F_MINIMAL, F_SIDE, F_BANNER,
        // are hands, one is both, five are the numbers a desk robot
        // actually knows about itself, and one is for showing off.
        F_DIAL, F_BAUHAUS, F_REGULATOR, F_RINGS, F_INFOGRAPH,
-       F_STATUS, F_VITALS, F_BARS, F_TERMINAL, F_BINARY, FACE_N };
+       F_STATUS, F_VITALS, F_BARS, F_TERMINAL, F_BINARY,
+       // and three that know what month it is in the other calendar
+       F_ARABIC, F_HIJRI, F_CRESCENT, FACE_N };
 const char* FACE_NAME[FACE_N] =
   { "classic", "stacked", "date up", "minimal", "side", "banner",
     "drift", "parallax", "water", "sand",
     "dial", "bauhaus", "regulator", "rings", "infograph",
-    "status", "vitals", "bars", "terminal", "binary" };
+    "status", "vitals", "bars", "terminal", "binary",
+    "arabic", "hijri", "crescent" };
 int cfgFace = F_CLASSIC;
 
 // Changing the face from the clock itself rather than walking into
@@ -1371,6 +1407,59 @@ static void arc(int cx, int cy, int r, float part) {
   }
 }
 
+static bool hijriNow(int& hy, int& hm, int& hd) {
+  struct tm t;
+  if (!timeOk || !getLocalTime(&t, 0)) return false;
+  long jd = gregToJdn(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday) + cfgHijriAdj;
+  hijriFromJdn(jd, hy, hm, hd);
+  if (hm < 1) hm = 1; if (hm > 12) hm = 12;
+  return true;
+}
+
+// ---- Arabic, out of the baked bitmaps ----
+static void arDigit(int x, int y, int d, bool big) {
+  if (d < 0 || d > 9) return;
+  if (big) oled.drawBitmap(x, y, AR_BIG[d],   AR_BIG_W,   AR_BIG_H,   SSD1306_WHITE);
+  else     oled.drawBitmap(x, y, AR_SMALL[d], AR_SMALL_W, AR_SMALL_H, SSD1306_WHITE);
+}
+// Western order on purpose. A clock is read left to right whichever
+// digits it is wearing, and an Arabic reader reads ١٢:٣٠ the same way
+// round as 12:30.
+static void arNum(int x, int y, int v, int digits, bool big) {
+  int w = big ? AR_BIG_W : AR_SMALL_W;
+  for (int i = digits - 1; i >= 0; i--) { arDigit(x + i * w, y, v % 10, big); v /= 10; }
+}
+static int arNumW(int digits, bool big) { return digits * (big ? AR_BIG_W : AR_SMALL_W); }
+static void arMonth(int x, int y, int m) {
+  if (m < 1 || m > 12) return;
+  oled.drawBitmap(x, y, AR_MONTH[m - 1], AR_MONTH_W, AR_MONTH_H, SSD1306_WHITE);
+}
+
+// A band that shows one line, then the other, sliding the old one up
+// and out as the new one comes up behind it. Two seconds each.
+//
+// There is no clipping in the library, so the lines going past the top
+// and bottom of the band have to be wiped afterwards. Anything using
+// this has to keep the rows a band's height above and below it empty,
+// which the three faces below do.
+static void slideBand(int y, const char* a, const char* b) {
+  const int H = 9, PERIOD = 2000, SLIDE = 320;
+  uint32_t t = millis() % (PERIOD * 2);
+  bool second = t >= (uint32_t)PERIOD;
+  uint32_t into = second ? t - PERIOD : t;
+  const char* now_ = second ? b : a;
+  const char* was  = second ? a : b;
+  int off = into < (uint32_t)SLIDE ? (int)(into * H / SLIDE) : H;
+  if (off < H) {
+    ctr(was,  y - off, 1);
+    ctr(now_, y + H - off, 1);
+  } else {
+    ctr(now_, y, 1);
+  }
+  oled.fillRect(0, y - H, SCRW, H, SSD1306_BLACK);        // what slid off the top
+  oled.fillRect(0, y + 8, SCRW, H, SSD1306_BLACK);        // and off the bottom
+}
+
 // ---- 1. dial: a whole watch, ticks and three hands ----
 static void faceDial() {
   const int CX = 64, CY = 32, R = 30;
@@ -1580,6 +1669,69 @@ static void faceTerminal() {
   }
 }
 
+// ---- 21. arabic: the time in Arabic numerals, the month in Arabic ----
+static void faceArabic() {
+  // HH:MM across the middle. Four glyphs and a colon of two dots,
+  // centred as one block so it does not shift as the digits change.
+  const int DW = AR_BIG_W, GAP = 7;
+  int w = DW * 4 + GAP;
+  int x = (SCRW - w) / 2, y = 4;
+  arNum(x, y, fb.H, 2, true);
+  arNum(x + DW * 2 + GAP, y, fb.M, 2, true);
+  int cx = x + DW * 2 + GAP / 2;
+  oled.fillRect(cx - 1, y + 7,  2, 2, SSD1306_WHITE);
+  oled.fillRect(cx - 1, y + 15, 2, 2, SSD1306_WHITE);
+
+  int hy, hm, hd;
+  if (!hijriNow(hy, hm, hd)) { ctr("--", 40, 1); return; }
+  // the day on the left, the year on the right, the month between them
+  arNum(3, 30, hd, 2, false);
+  arNum(SCRW - 3 - arNumW(4, false), 30, hy, 4, false);
+  arMonth((SCRW - AR_MONTH_W) / 2, 45, hm);
+}
+
+// ---- 22. hijri: an English clock whose date keeps changing its mind ----
+static void faceHijri() {
+  oled.setTextSize(3);
+  oled.setCursor((SCRW - 5 * 18) / 2, 4);
+  oled.print(fb.hm);
+  oled.setTextSize(1);
+
+  int hy, hm, hd;
+  char g[24], h[26];
+  snprintf(g, sizeof(g), "%.11s", fb.dshort);
+  if (hijriNow(hy, hm, hd)) snprintf(h, sizeof(h), "%d %s %d", hd, HIJRI_LATIN[hm - 1], hy);
+  else                      snprintf(h, sizeof(h), "no date yet");
+  // 44 keeps the band and its wipe clear of the clock above it
+  slideBand(44, g, h);
+}
+
+// ---- 23. crescent: the moon, and the month it belongs to ----
+static void faceCrescent() {
+  // A crescent is two circles, one eating the other.
+  const int CX = 22, CY = 20, R = 13;
+  oled.fillCircle(CX, CY, R, SSD1306_WHITE);
+  oled.fillCircle(CX + 6, CY - 2, R, SSD1306_BLACK);
+
+  oled.setTextSize(2);
+  oled.setCursor(46, 12);
+  oled.print(fb.hm);
+  oled.setTextSize(1);
+  at(46 + 5 * 12 + 2, 19, fb.ss);
+
+  // The month name is 104 wide and 16 tall, which is most of the lower
+  // half, so everything else is placed round it rather than near it.
+  // At 40 it ran straight through the line underneath.
+  int hy, hm, hd;
+  if (hijriNow(hy, hm, hd)) {
+    arNum(3, 39, hd, 2, false);                       // 39..49
+    arMonth(SCRW - 2 - AR_MONTH_W, 37, hm);           // 37..52
+    char y[12]; snprintf(y, sizeof(y), "%d", hy);
+    at(3, 55, y);                                     // 55..61
+    at(SCRW - 3 - (int)strlen(fb.dshort) * 6, 55, fb.dshort);
+  }
+}
+
 // ---- 10. binary: hours, minutes and seconds, in dots ----
 //  One column per digit, most significant at the top, and only the dots
 //  that can ever light are drawn: there is no eight in the tens of an
@@ -1638,6 +1790,9 @@ static void drawHome() {
     case F_BARS:      faceBars();       break;
     case F_TERMINAL:  faceTerminal();   break;
     case F_BINARY:    faceBinary();     break;
+    case F_ARABIC:    faceArabic();     break;
+    case F_HIJRI:     faceHijri();      break;
+    case F_CRESCENT:  faceCrescent();   break;
     default:         faceClassic();     break;
   }
   // Last, over whichever face just drew itself, or a face that fills
@@ -2664,6 +2819,7 @@ static void drawSettings() {
       case C_PRAYER: snprintf(v, sizeof(v), "%s", prayerOk ? "saved" : "none"); break;
       case C_ACCEL:  snprintf(v, sizeof(v), "x2"); break;
       case C_KNOCK:  snprintf(v, sizeof(v), "%s", cfgKnock ? "on" : "off"); break;
+      case C_HIJRI:  snprintf(v, sizeof(v), "%+d d", cfgHijriAdj); break;
       case C_SHAKE:  snprintf(v, sizeof(v), "%s", cfgShake ? "on" : "off"); break;
       case C_DEEP:   snprintf(v, sizeof(v), "%s", DEEP_NAME[cfgDeepIdx]); break;
       case C_BATT:   snprintf(v, sizeof(v), "%.2fV", battFull); break;
@@ -5133,6 +5289,7 @@ static void resetSettings() {
   cfgTap = TAP_MED;  prefs.putInt("tap", cfgTap);      applyTap();
   cfgAutoUp = false; prefs.putBool("autoup", cfgAutoUp);
   cfgKnock = false;  prefs.putBool("knock", cfgKnock);
+  cfgHijriAdj = 0;   prefs.putInt("hadj", cfgHijriAdj);
   cfgShake = true;   prefs.putBool("shake", cfgShake);
   cfgDeepIdx = 1;    prefs.putInt("deepi", cfgDeepIdx);
   battFull = 4.10f;  prefs.putFloat("bfull", battFull);
@@ -5660,6 +5817,16 @@ static void knockTwo() {
       case C_HOTSPOT: startHotspot(); break;
       case C_PRAYER:  prayerWanted = true; nextPrayerTry = 0; break;
       case C_ACCEL:   depth = 2; break;
+      case C_HIJRI: {
+        // The arithmetic calendar is a rule and the real one is a
+        // sighting, so they disagree by a day now and then. Two either
+        // way covers every disagreement worth having.
+        cfgHijriAdj++;
+        if (cfgHijriAdj > 2) cfgHijriAdj = -2;
+        prefs.putInt("hadj", cfgHijriAdj);
+        char m[10]; snprintf(m, sizeof(m), "%+d day", cfgHijriAdj);
+        flash(m, 900);
+        break; }
       case C_SHAKE:
         cfgShake = !cfgShake;
         prefs.putBool("shake", cfgShake);
@@ -6516,6 +6683,10 @@ static void apiState() {
   o += "\"asleep\":" + String(asleep ? "true" : "false") + ",\"fw\":\"" FW_VERSION "\",";
   o += "\"knock\":" + String(cfgKnock ? "true" : "false") + ",";
   o += "\"shake\":" + String(cfgShake ? "true" : "false") + ",";
+  o += "\"hadj\":" + String(cfgHijriAdj) + ",";
+  { int hy, hm, hd;
+    if (hijriNow(hy, hm, hd)) {
+      o += "\"hijri\":\"" + String(hd) + " " + HIJRI_LATIN[hm - 1] + " " + String(hy) + "\","; } }
   o += "\"deepi\":" + String(cfgDeepIdx) + ",";
   o += "\"battFull\":" + String(battFull, 2) + ",";
   o += "\"battV\":" + String(isnan(battV) ? 0.0f : battV, 2) + ",";
@@ -6960,6 +7131,7 @@ static void setupWeb() {
     // driving this now, so if the pad ever stops there has to be a way
     // back in that does not involve the pad, and the network is it.
     else if (k == "knock"){ cfgKnock    = (v != 0);                      prefs.putBool("knock", cfgKnock); }
+    else if (k == "hadj") { cfgHijriAdj = constrain(v, -2, 2);           prefs.putInt("hadj", cfgHijriAdj); }
     else if (k == "shake"){ cfgShake    = (v != 0);                      prefs.putBool("shake", cfgShake); }
     else if (k == "deepi"){ cfgDeepIdx  = constrain(v, 0, DEEP_N - 1);   prefs.putInt("deepi", cfgDeepIdx); }
     // Sent in hundredths, because the form only carries whole numbers.
@@ -7480,6 +7652,7 @@ void setup() {
   cfgTap      = constrain(prefs.getInt("tap", TAP_MED), 0, TAP_N - 1);
   cfgAutoUp   = prefs.getBool("autoup", false);
   cfgKnock    = prefs.getBool("knock", false);   // the pad drives this now
+  cfgHijriAdj = constrain(prefs.getInt("hadj", 0), -2, 2);
   cfgShake    = prefs.getBool("shake", true);    // on by default
   cfgDeepIdx  = constrain(prefs.getInt("deepi", 1), 0, DEEP_N - 1);
   battFull    = constrain(prefs.getFloat("bfull", 4.10f), 3.90f, 4.30f);
