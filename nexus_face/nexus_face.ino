@@ -180,7 +180,24 @@ bool cfgKnock = false;
 // A shake steps back one. On by default, because with the pad doing
 // everything a second way out is worth having, and a shake is the one
 // gesture you can make without looking at the thing.
-bool cfgShake = true;
+// How you go back a level. Two presses, a shake, or either.
+//
+// It was a plain on/off for the shake, which left no way to say "the
+// shake only": a double press always went back whatever you set. Three
+// values, walked by holding on the row the way every other setting is
+// walked, and shown as the value so you can see where you are without
+// opening anything.
+//
+// A long press still goes home from anywhere and three presses still
+// go home, so there is no setting here that can strand you.
+enum { BACK_TOUCH = 0, BACK_SHAKE, BACK_BOTH, BACK_N };
+int cfgBack = BACK_BOTH;
+const char* BACK_NAME[BACK_N] = { "touch", "shake", "both" };
+static bool backByTouch() { return cfgBack != BACK_SHAKE; }
+static bool backByShake() { return cfgBack != BACK_TOUCH; }
+// Kept so the Mac can still send and read shake=0/1 without knowing
+// about any of this.
+#define cfgShake (backByShake())
 
 // How long with nothing happening before it switches off properly,
 // rather than just turning the screen off. Separate from the screen
@@ -197,7 +214,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.3.0"
+#define FW_VERSION "5.4.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -286,6 +303,27 @@ char bikeOwner[20] = "Ahmed";
 // at. Until you keep it, nothing is written and nothing is kept.
 bool bikeEdit = false;
 int  bikeTry  = 0;
+
+// Which screens have anything inside them.
+//
+// loop() clears depth on every pass for any screen that does not, so a
+// screen missing from here cannot be entered at all: the press sets
+// depth, the animation plays, and two milliseconds later the next pass
+// through the loop puts it back to zero. That is exactly what happened
+// to the reminders. They were given a depth and this list was not told,
+// so holding to read them opened them and closed them faster than the
+// screen could draw, and all you ever saw was the zoom and the summary
+// again.
+//
+// It was a bare condition in the middle of loop() before, five screens
+// written out by name. Nothing pointed at it from the screens
+// themselves and nothing complained when a sixth was added. Here, at
+// least, it is next to the enum it is about, and sim_depth.py now
+// fails the build if a screen sets a depth without being in it.
+static bool screenHasDepth(int s) {
+  return s == S_FAITH || s == S_READS || s == S_GAMES ||
+         s == S_FOCUS || s == S_SETTINGS || s == S_REMIND;
+}
 
 // Which screens are worth offering at all. Weather needs the network
 // and the vehicle screen is something you asked for; neither should sit
@@ -412,7 +450,7 @@ const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
     "Eye style", "Prayer times", "Hijri shift", "Network", "Vehicle",
     "Hotspot", "Accelerometer", "Knocks", "Tap strength",
-    "Shake to go back", "Power down", "Battery full at",
+    "Go back by", "Power down", "Battery full",
     "Pair a Mac", "Check update", "Auto update",
     "Reset settings", "Reboot", "About" };
 
@@ -2248,8 +2286,8 @@ static void drawReads() {
       oled.clearDisplay();
       titleBar("SHORT READS", "");
       ctr(storyState.c_str(), 24, 1);
-      ctr(cfgKey.length() ? "Knock four times" : "Add a key on the page", 40, 1);
-      ctr(cfgKey.length() ? "to write a new one" : "", 50, 1);
+      ctr(cfgKey.length() ? "Hold to write" : "Add a key on the page", 40, 1);
+      ctr(cfgKey.length() ? "a new one" : "", 50, 1);
       oled.display();
       return;
     }
@@ -3297,32 +3335,35 @@ static void drawSettings() {
                        snprintf(v, sizeof(v), "%s", BRIGHT_NAME[k]); break; }
       case C_FACE:   snprintf(v, sizeof(v), "%s", FACE_NAME[cfgFace]); break;
       case C_PRAYER: snprintf(v, sizeof(v), "%s", prayerOk ? "saved" : "none"); break;
-      case C_ACCEL:  snprintf(v, sizeof(v), "x2"); break;
+      case C_ACCEL:  snprintf(v, sizeof(v), "hold"); break;
       case C_KNOCK:  snprintf(v, sizeof(v), "%s", cfgKnock ? "on" : "off"); break;
       case C_HIJRI:  snprintf(v, sizeof(v), "%+d d", cfgHijriAdj); break;
       case C_MODE:   snprintf(v, sizeof(v), "%s", cfgOffline ? "off" :
                               (netDown ? "no signal" : "on")); break;
       case C_BIKE:   snprintf(v, sizeof(v), "%s", cfgBike ? "on" : "off"); break;
-      case C_SHAKE:  snprintf(v, sizeof(v), "%s", cfgShake ? "on" : "off"); break;
+      case C_SHAKE:  snprintf(v, sizeof(v), "%s", BACK_NAME[cfgBack]); break;
       case C_DEEP:   snprintf(v, sizeof(v), "%s", DEEP_NAME[cfgDeepIdx]); break;
       case C_BATT:   snprintf(v, sizeof(v), "%.2fV", battFull); break;
-      case C_PAIR:   snprintf(v, sizeof(v), "%s", cfgLock ? "paired" : "x2"); break;
+      case C_PAIR:   snprintf(v, sizeof(v), "%s", cfgLock ? "paired" : "hold"); break;
       // Only means anything with knocking switched on, and says so
       // rather than offering a setting that does nothing.
       case C_TAP:    snprintf(v, sizeof(v), "%s",
                               cfgKnock ? TAP_SHORT[cfgTap] : "off"); break;
       case C_AUTOUP: snprintf(v, sizeof(v), "%s", cfgAutoUp ? "on" : "off"); break;
-      case C_ABOUT:  snprintf(v, sizeof(v), "x2"); break;
+      case C_ABOUT:  snprintf(v, sizeof(v), "hold"); break;
       case C_SLEEP:  if (!sleepSecs())         snprintf(v, sizeof(v), "never");
                      else if (sleepSecs() < 60) snprintf(v, sizeof(v), "%ds", sleepSecs());
                      else                       snprintf(v, sizeof(v), "%dm", sleepSecs() / 60); break;
-      case C_TURN:   snprintf(v, sizeof(v), "%s", cfgAutoTurn ? "auto" : "knock"); break;
+      case C_TURN:   snprintf(v, sizeof(v), "%s", cfgAutoTurn ? "auto" : "touch"); break;
       case C_POPUP:  if (!popupSecs()) snprintf(v, sizeof(v), "off");
                      else snprintf(v, sizeof(v), "%ds", popupSecs()); break;
       case C_EYES:   snprintf(v, sizeof(v), "%s", STYLES[cfgEyes].name); break;
-      case C_HOTSPOT:snprintf(v, sizeof(v), "%s", rescueAP ? "on" : "x2"); break;
-      case C_UPDATE: snprintf(v, sizeof(v), "%s", online() ? "x2" : "offline"); break;
-      default:       snprintf(v, sizeof(v), "x2"); break;
+      case C_HOTSPOT:snprintf(v, sizeof(v), "%s", rescueAP ? "on" : "hold"); break;
+      case C_UPDATE: snprintf(v, sizeof(v), "%s", online() ? "hold" : "offline"); break;
+      // Everything left is something you open rather than something
+      // with a value. "x2" meant knock twice, from when knocking was
+      // the only way in; holding is how you open anything now.
+      default:       snprintf(v, sizeof(v), "hold"); break;
     }
     oled.setCursor(SCRW - 3 - (int)strlen(v) * 6, y);
     oled.print(v);
@@ -5881,7 +5922,7 @@ static void resetSettings() {
   cfgBike = false;   prefs.putBool("bike", cfgBike);
   cfgBikeTpl = 0;    prefs.putInt("btpl", cfgBikeTpl);
   bikeEdit = false;  bikeTry = 0;
-  cfgShake = true;   prefs.putBool("shake", cfgShake);
+  cfgBack = BACK_BOTH; prefs.putInt("back", cfgBack);
   cfgDeepIdx = 1;    prefs.putInt("deepi", cfgDeepIdx);
   battFull = 4.10f;  prefs.putFloat("bfull", battFull);
   deepOff = false;   prefs.putBool("nodeep", deepOff);
@@ -6304,6 +6345,7 @@ static void knockTwo() {
       case S_READS:    if (readCount) { depth = 1; itemIdx = 0; } else refillShelf(); break;
       case S_GAMES:    depth = 1; itemIdx = 0; navCalBegin(false); break;
       case S_SETTINGS: depth = 1; itemIdx = 0; break;
+      case S_REMIND:   if (remCount) { depth = 1; remIdx = 0; remConfirm = false; } break;
       case S_HOME:
         // With no clock this screen is a stopwatch, and restarting it is
         // the only useful thing a double knock can mean there.
@@ -6466,9 +6508,10 @@ static void knockTwo() {
         flash(m, 900);
         break; }
       case C_SHAKE:
-        cfgShake = !cfgShake;
-        prefs.putBool("shake", cfgShake);
-        flash(cfgShake ? "SHAKE ON" : "SHAKE OFF", 1000);
+        cfgBack = (cfgBack + 1) % BACK_N;
+        prefs.putInt("back", cfgBack);
+        flash(cfgBack == BACK_TOUCH ? "BACK BY TOUCH"
+            : cfgBack == BACK_SHAKE ? "BACK BY SHAKE" : "BACK BY EITHER", 1000);
         break;
       case C_DEEP:
         cfgDeepIdx = (cfgDeepIdx + 1) % DEEP_N;
@@ -6790,6 +6833,16 @@ static void touchGesture(uint8_t g) {
     }
   }
 
+  // An empty shelf has nothing to read and nothing to leave, so
+  // holding writes one. Reloading used to be four knocks, which is a
+  // gesture the pad does not have, so with knocks off there was no way
+  // to ask for a story at all.
+  if (g == TG_LONG && screen == S_READS && depth == 1 && !readCount && cfgKey.length()) {
+    refillShelf();
+    depth = readCount ? 2 : 1;
+    return;
+  }
+
   // A leaf: nothing here to open, so one goes on, two goes back a page
   // and a long press is the way out.
   if (inReader()) {
@@ -6826,7 +6879,12 @@ static void touchGesture(uint8_t g) {
 
   switch (g) {
     case TG_ONE:   knockOne();   break;
-    case TG_TWO:   knockThree(); break;       // back, out one level
+    // Back, out one level, unless you have said a shake is the only
+    // way back. This is the generic one; the doubles that turn a page
+    // inside a reader or walk back through the reminders are page
+    // moves rather than commands and are left alone, so setting this
+    // to the shake can never strand you inside something.
+    case TG_TWO:   if (backByTouch()) knockThree(); break;
     case TG_LONG:  clickShrink(); knockTwo(); break;   // in
     case TG_THREE:                            // straight home from anywhere
       if (dndUntil || relaxOn || canvasUntil || toastUntil) { knockOne(); break; }
@@ -7403,6 +7461,8 @@ static void apiState() {
   o += "\"asleep\":" + String(asleep ? "true" : "false") + ",\"fw\":\"" FW_VERSION "\",";
   o += "\"knock\":" + String(cfgKnock ? "true" : "false") + ",";
   o += "\"shake\":" + String(cfgShake ? "true" : "false") + ",";
+  o += "\"back\":" + String(cfgBack) + ",";
+  o += "\"backName\":\"" + String(BACK_NAME[cfgBack]) + "\",";
   o += "\"hadj\":" + String(cfgHijriAdj) + ",";
   o += "\"offline\":" + String(cfgOffline ? "true" : "false") + ",";
   o += "\"netDown\":" + String(netDown ? "true" : "false") + ",";
@@ -8057,7 +8117,8 @@ static void setupWeb() {
                             else { netDown = false; netMisses = 0; netNextTry = 0;
                                    WiFi.mode(WIFI_STA); WiFi.setSleep(false); setupWeb(); } }
     else if (k == "hadj") { cfgHijriAdj = constrain(v, -2, 2);           prefs.putInt("hadj", cfgHijriAdj); }
-    else if (k == "shake"){ cfgShake    = (v != 0);                      prefs.putBool("shake", cfgShake); }
+    else if (k == "shake"){ cfgBack = v ? BACK_BOTH : BACK_TOUCH;        prefs.putInt("back", cfgBack); }
+    else if (k == "back") { cfgBack = constrain(v, 0, BACK_N - 1);       prefs.putInt("back", cfgBack); }
     else if (k == "deepi"){ cfgDeepIdx  = constrain(v, 0, DEEP_N - 1);   prefs.putInt("deepi", cfgDeepIdx); }
     // Sent in hundredths, because the form only carries whole numbers.
     else if (k == "bfull"){ battFull    = constrain(v / 100.0f, 3.90f, 4.30f); prefs.putFloat("bfull", battFull); }
@@ -8613,7 +8674,14 @@ void setup() {
     s = prefs.getString("bmodel", "Meteor 350");    snprintf(bikeModel, sizeof(bikeModel), "%s", s.c_str());
     s = prefs.getString("bowner", "Ahmed");         snprintf(bikeOwner, sizeof(bikeOwner), "%s", s.c_str());
     s = prefs.getString("name",   "Ahmed");         snprintf(cfgName,   sizeof(cfgName),   "%s", s.c_str()); }
-  cfgShake    = prefs.getBool("shake", true);    // on by default
+  // Carried over from the old on/off. Shake on meant a shake and a
+  // double both went back, which is "both"; shake off meant the double
+  // only. Written back once so the next boot reads the new key.
+  if (prefs.isKey("back")) cfgBack = constrain(prefs.getInt("back", BACK_BOTH), 0, BACK_N - 1);
+  else {
+    cfgBack = prefs.getBool("shake", true) ? BACK_BOTH : BACK_TOUCH;
+    prefs.putInt("back", cfgBack);
+  }
   cfgDeepIdx  = constrain(prefs.getInt("deepi", 1), 0, DEEP_N - 1);
   battFull    = constrain(prefs.getFloat("bfull", 4.10f), 3.90f, 4.30f);
   nextAutoUp  = millis() + 120000;          // not in the first two minutes
@@ -8796,14 +8864,16 @@ void setup() {
   // the second time you pick it up.
   oled.clearDisplay();
   if (!fromDeep) {
-    titleBarC("HOW TO KNOCK");
+    // What the pad does, because the pad is how it is driven. It used
+    // to list what one to four knocks meant, which is a feature that
+    // is off unless you ask for it.
+    titleBarC("HOW TO USE ME");
     at(8,  16, "1  next");
-    at(8,  28, "2  open");
-    at(66, 16, "3  back");
-    at(66, 28, "4  reload");
+    at(8,  28, "2  back");
+    at(66, 16, "hold  open");
+    at(66, 28, "5s  home");
     oled.drawFastHLine(8, 40, 112, SSD1306_WHITE);
-    knockIcon(19, 51);
-    at(30, 48, "Touch to begin");
+    ctr("Touch the pad", 48, 1);
   }
   if (!fromDeep) {
     oled.display();
@@ -9019,15 +9089,13 @@ void loop() {
     if (fzPhase == FZ_DARK) { delay(6); return; }
   }
 
-  // depth only means something on the three screens that have one
   // A stopwatch that is counting holds the screen; one sitting at a
   // number does not. It used to hold it either way, so leaving a
   // stopped stopwatch on screen kept the robot awake all night.
   if (swOn) { screen = S_FOCUS; if (swRun) lastActive = now; }
-  if (screen != S_FAITH && screen != S_READS && screen != S_GAMES &&
-      screen != S_FOCUS && screen != S_SETTINGS && depth) {
-    depth = 0; itemIdx = 0; subIdx = 0;
-  }
+  // A depth on a screen that has no inside is a depth left behind by
+  // the screen you came from.
+  if (depth && !screenHasDepth(screen)) { depth = 0; itemIdx = 0; subIdx = 0; }
 
   // Seven minutes of a dark screen with nobody listening and it can
   // switch off altogether. A Mac on the other end counts as somebody
