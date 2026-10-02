@@ -166,6 +166,27 @@ bool     wantDeep     = false;   // asked for, by holding or by the Mac letting 
 // boot, so `asleep` is false by the time the reminder fires and
 // nothing downstream could tell this from someone picking it up.
 bool     wokeForAlarm = false;
+// When the next prayer or reminder is due, as a moment on the clock,
+// or 0 for none. In RTC memory, so it survives deep sleep: a wake that
+// comes to nothing can put itself back down without having to work
+// the answer out again from scratch, and without the chance of
+// working out a different one and losing the alarm.
+RTC_DATA_ATTR uint32_t rtcAlarmAt = 0;
+
+// How long the pad has to be held before a touch counts as waking it.
+//
+// A sleeve, a sleeve's cuff, a hand put down on the desk next to it:
+// all of them are shorter than a second, and every one of them used to
+// cost a full wake with the screen and the radio up. A second is
+// longer than any of them and shorter than anyone waits for an answer.
+// Three seconds is long enough to want telling about, so that one
+// lights the screen half a second in and fills a ring.
+const uint16_t WAKE_OPTS[] = { 0, 1000, 3000 };
+const char*    WAKE_NAME[] = { "off", "1s", "3s" };
+#define WAKE_N 3
+#define WAKE_RING_AFTER 500UL        // and only when there is a wait worth showing
+#define WAKE_RING_MIN  1200UL
+int cfgWakeIdx = 2;
 
 
 // Changing the watch face from the clock, with the pad. A long press on
@@ -220,7 +241,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.5.0"
+#define FW_VERSION "5.6.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -455,14 +476,14 @@ unsigned long zikrNext = 0;      // when the next count lands
 // ---------------- settings ----------------
 enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
        C_PRAYER, C_HIJRI, C_MODE, C_BIKE, C_HOTSPOT, C_ACCEL, C_KNOCK, C_TAP,
-       C_SHAKE, C_DEEP, C_BATT,
+       C_SHAKE, C_DEEP, C_WAKEH, C_BATT,
        C_PAIR, C_UPDATE,
        C_AUTOUP, C_RESET, C_REBOOT, C_ABOUT, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
     "Eye style", "Prayer times", "Hijri shift", "Network", "Vehicle",
     "Hotspot", "Accelerometer", "Knocks", "Tap strength",
-    "Go back by", "Power down", "Battery full",
+    "Go back by", "Power down", "Wake on hold", "Battery full",
     "Pair a Mac", "Check update", "Auto update",
     "Reset settings", "Reboot", "About" };
 
@@ -3385,6 +3406,7 @@ static void drawSettings() {
                               (cfgBack == BACK_KNOCK && !cfgKnock)
                                 ? "knock off" : BACK_NAME[cfgBack]); break;
       case C_DEEP:   snprintf(v, sizeof(v), "%s", DEEP_NAME[cfgDeepIdx]); break;
+      case C_WAKEH:  snprintf(v, sizeof(v), "%s", WAKE_NAME[cfgWakeIdx]); break;
       case C_BATT:   snprintf(v, sizeof(v), "%.2fV", battFull); break;
       case C_PAIR:   snprintf(v, sizeof(v), "%s", cfgLock ? "paired" : "hold"); break;
       // Only means anything with knocking switched on, and says so
@@ -5961,6 +5983,7 @@ static void resetSettings() {
   cfgKnock = false;  prefs.putBool("knock", cfgKnock);
   cfgHijriAdj = 0;   prefs.putInt("hadj", cfgHijriAdj);
   cfgOffline = false; prefs.putBool("offl", cfgOffline);
+  cfgWakeIdx = 2;    prefs.putInt("wakeh", cfgWakeIdx);
   cfgBike = false;   prefs.putBool("bike", cfgBike);
   cfgBikeTpl = 0;    prefs.putInt("btpl", cfgBikeTpl);
   bikeEdit = false;  bikeTry = 0;
@@ -6000,6 +6023,128 @@ static void sleepCard() {
   oled.clearDisplay(); oled.display();
 }
 
+// Lie down.
+//
+//  secs is how long until the next alarm, or -1 for none.
+//
+//  Two things have to happen in the right order. The pad wake is by
+//  LEVEL, not by edge, so entering deep sleep while a finger is still
+//  on the pad wakes the chip again immediately, and again, and again:
+//  a loop that empties the battery faster than anything it was meant
+//  to save. So it waits for the finger first.
+//
+//  And if the finger never comes, something is resting on the pad.
+//  Waiting for ever is not an option and neither is arming a wake that
+//  fires at once, so it goes down on the timer alone and sets a short
+//  one, far enough out to cost nothing and near enough that it can look
+//  again and arm the pad properly the moment the pad is free.
+#define SLEEP_RELEASE_MS 20000UL     // long enough for a hand, not for a bag
+#define SLEEP_RETRY_S    60          // and then look again this often
+static void sleepNow(long secs) {
+  uint32_t t0 = millis();
+  bool held = (digitalRead(TOUCH_PIN) != touchRest);
+  while (held && millis() - t0 < SLEEP_RELEASE_MS) {
+    delay(20);
+    held = (digitalRead(TOUCH_PIN) != touchRest);
+  }
+  if (held) {
+    Serial.println("something is on the pad; sleeping on the clock alone");
+    if (secs < 0 || secs > SLEEP_RETRY_S) secs = SLEEP_RETRY_S;
+  } else {
+    esp_deep_sleep_enable_gpio_wakeup(BIT(TOUCH_PIN),
+                                      touchRest ? ESP_GPIO_WAKEUP_GPIO_LOW
+                                                : ESP_GPIO_WAKEUP_GPIO_HIGH);
+  }
+  if (secs > 0) esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
+  esp_deep_sleep_start();
+}
+
+// Did you mean it?
+//
+//  Runs before everything. Before the serial port has settled, before
+//  the settings are read, before the sensors, the display or the
+//  radio. Nothing here costs anything except a few hundred
+//  milliseconds of a processor that was going to have to start up
+//  anyway, which is the entire point: a sleeve brushing the pad used
+//  to cost a full wake, the screen on and the radio up for the whole
+//  of a screen timeout. Now it costs almost nothing.
+//
+//  The wake itself cannot be made to wait. The chip is off, the wake
+//  is a level on a pin, and there is no duration anywhere in it. So it
+//  wakes, looks, and lies back down.
+//
+//  Three seconds is long enough that saying nothing would read as a
+//  flat battery, so past half a second the screen comes up on its own
+//  and fills a ring. Only the screen. The radio stays down either way,
+//  and if you let go the screen goes out again having cost a fraction
+//  of what the radio would have.
+//
+//  Never returns if the touch was nothing.
+static void wakeGate() {
+  prefs.begin("nexus", false);
+  int idx = constrain(prefs.getInt("wakeh", 2), 0, WAKE_N - 1);
+  uint32_t need = WAKE_OPTS[idx];
+  // Read, never measured. The finger that woke it is on the pad.
+  touchRest = prefs.getBool("trest", false);
+  int bright = constrain(prefs.getInt("bri", 160), 0, 255);
+  // Told never to switch off. It should not be here at all in that
+  // case, but if it is, refusing a touch would leave it asleep with
+  // no way back and the setting saying that cannot happen.
+  bool noDeep = prefs.getBool("nodeep", false);
+  prefs.end();
+  if (!need || noDeep) return;                 // asked for any touch at all
+
+  pinMode(TOUCH_PIN, INPUT_PULLDOWN);
+  const bool ring = need >= WAKE_RING_MIN;
+  uint32_t t0 = millis();
+  bool lit = false;
+
+  while (true) {
+    uint32_t held = millis() - t0;
+    if (digitalRead(TOUCH_PIN) == touchRest) break;        // let go: it was nothing
+    if (held >= need) {                                    // meant it
+      if (lit) { oled.clearDisplay(); oled.display(); }
+      Serial.printf("held %lums, waking up\n", (unsigned long)held);
+      return;
+    }
+    if (ring && !lit && held >= WAKE_RING_AFTER) {
+      Wire.begin(SDA_PIN, SCL_PIN);
+      Wire.setClock(400000);
+      if (oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR, true, false)) {
+        oled.setTextWrap(false);
+        oled.setTextColor(SSD1306_WHITE);
+        oled.ssd1306_command(SSD1306_SETCONTRAST);
+        oled.ssd1306_command(bright);
+        lit = true;
+      } else {
+        // No panel to draw on is not a reason to refuse to wake up.
+        break;
+      }
+    }
+    if (lit) {
+      oled.clearDisplay();
+      ringArc(SCRW / 2, SCRH / 2, 16,
+              (float)(held - WAKE_RING_AFTER) / (float)(need - WAKE_RING_AFTER));
+      oled.drawCircle(SCRW / 2, SCRH / 2, 16, SSD1306_WHITE);
+      oled.display();
+    }
+    delay(8);
+  }
+
+  // Nothing after all. Straight back down, without having loaded the
+  // reminders or the prayer times or counted this as a boot.
+  if (lit) { oled.clearDisplay(); oled.display(); oled.ssd1306_command(SSD1306_DISPLAYOFF); }
+  long secs = -1;
+  if (rtcAlarmAt) {
+    secs = (long)rtcAlarmAt - (long)time(nullptr);
+    // Due already, or near enough that going back down would miss it.
+    if (secs <= 2) { Serial.println("brushed, but something is due; staying up"); return; }
+  }
+  Serial.printf("brushed, not held; back to sleep%s\n",
+                secs > 0 ? " with the alarm still set" : "");
+  sleepNow(secs);
+}
+
 static void goDeep() {
   // The pad can wake it now, so this no longer needs INT1 soldered.
   // Until this version deep sleep simply never happened on a board
@@ -6014,35 +6159,36 @@ static void goDeep() {
   // on and a door closing are all enough to trip it, and every one of
   // those cost a wake, a WiFi reconnect and a slice of the battery for
   // nothing. Waking should be something you did on purpose.
-  bool wakeHigh = !touchRest;                  // the level that means touched
   if (deepOff) return;
   Serial.println("switching off until touched");
   sleepCard();
 
-
   screenPower(false);
-  prefs.end();
-  WiFi.disconnect(true, false);
-  WiFi.mode(WIFI_OFF);
 
-  uint64_t mask = BIT(TOUCH_PIN);
-  esp_deep_sleep_enable_gpio_wakeup(mask, wakeHigh ? ESP_GPIO_WAKEUP_GPIO_HIGH
-                                                   : ESP_GPIO_WAKEUP_GPIO_LOW);
   // Whichever is sooner, a prayer or a reminder. Worked out here, from
   // the clock, so it holds with no network: the chip keeps counting
   // through deep sleep and comes back on its own at the right minute.
+  //
+  // The answer is kept as a moment rather than a duration, in RTC
+  // memory, which survives deep sleep. A wake that turns out to be
+  // nothing can then put itself straight back down without loading
+  // the reminders and the prayer table again to work out the same
+  // number, and without the risk of working out a different one.
   long pray = secsToNextAlert();
   long rem  = secsToNextRem();
   long secs = -1;
   if (pray > 0 && rem > 0) secs = pray < rem ? pray : rem;
   else if (pray > 0)       secs = pray;
   else if (rem > 0)        secs = rem;
-  if (secs > 0) {
+  rtcAlarmAt = (secs > 0 && timeOk) ? (uint32_t)time(nullptr) + (uint32_t)secs : 0;
+  if (secs > 0)
     Serial.printf("next wake in %ld s (%s)\n", secs,
                   (rem > 0 && (pray <= 0 || rem <= pray)) ? "a reminder" : "a prayer");
-    esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
-  }
-  esp_deep_sleep_start();
+
+  prefs.end();
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  sleepNow(secs);
 }
 
 static void wake(const char* why) {
@@ -6559,6 +6705,11 @@ static void knockTwo() {
         cfgDeepIdx = (cfgDeepIdx + 1) % DEEP_N;
         prefs.putInt("deepi", cfgDeepIdx);
         flash(DEEP_NAME[cfgDeepIdx], 900);
+        break;
+      case C_WAKEH:
+        cfgWakeIdx = (cfgWakeIdx + 1) % WAKE_N;
+        prefs.putInt("wakeh", cfgWakeIdx);
+        flash(cfgWakeIdx ? "HOLD TO WAKE ME" : "ANY TOUCH WAKES ME", 1100);
         break;
       case C_BATT: {
         // Steps a tenth at a time round the range a single cell charges
@@ -7524,6 +7675,8 @@ static void apiState() {
   o += "\"knock\":" + String(cfgKnock ? "true" : "false") + ",";
   o += "\"shake\":" + String(cfgShake ? "true" : "false") + ",";
   o += "\"back\":" + String(cfgBack) + ",";
+  o += "\"wakeh\":" + String(cfgWakeIdx) + ",";
+  o += "\"wakehName\":\"" + String(WAKE_NAME[cfgWakeIdx]) + "\",";
   o += "\"backName\":\"" + String(BACK_NAME[cfgBack]) + "\",";
   o += "\"hadj\":" + String(cfgHijriAdj) + ",";
   o += "\"offline\":" + String(cfgOffline ? "true" : "false") + ",";
@@ -8181,6 +8334,7 @@ static void setupWeb() {
     else if (k == "hadj") { cfgHijriAdj = constrain(v, -2, 2);           prefs.putInt("hadj", cfgHijriAdj); }
     else if (k == "shake"){ cfgBack = v ? BACK_BOTH : BACK_KNOCK;        prefs.putInt("back", cfgBack); }
     else if (k == "back") { cfgBack = constrain(v, 0, BACK_N - 1);       prefs.putInt("back", cfgBack); }
+    else if (k == "wakeh"){ cfgWakeIdx = constrain(v, 0, WAKE_N - 1);    prefs.putInt("wakeh", cfgWakeIdx); }
     else if (k == "deepi"){ cfgDeepIdx  = constrain(v, 0, DEEP_N - 1);   prefs.putInt("deepi", cfgDeepIdx); }
     // Sent in hundredths, because the form only carries whole numbers.
     else if (k == "bfull"){ battFull    = constrain(v / 100.0f, 3.90f, 4.30f); prefs.putFloat("bfull", battFull); }
@@ -8702,6 +8856,10 @@ void setup() {
   esp_sleep_wakeup_cause_t woke_ = esp_sleep_get_wakeup_cause();
   bool fromDeep = (woke_ == ESP_SLEEP_WAKEUP_GPIO || woke_ == ESP_SLEEP_WAKEUP_TIMER);
   Serial.begin(115200);
+  // Before the serial port settles, before anything is read and long
+  // before anything is powered. A touch that was not meant costs this
+  // much and nothing else.
+  if (woke_ == ESP_SLEEP_WAKEUP_GPIO) wakeGate();
   delay(300);
 
   prefs.begin("nexus", false);
@@ -8728,6 +8886,7 @@ void setup() {
   cfgKnock    = prefs.getBool("knock", false);   // the pad drives this now
   cfgHijriAdj = constrain(prefs.getInt("hadj", 0), -2, 2);
   cfgOffline  = prefs.getBool("offl", false);
+  cfgWakeIdx  = constrain(prefs.getInt("wakeh", 2), 0, WAKE_N - 1);
   cfgBike     = prefs.getBool("bike", false);
   cfgBikeTpl  = constrain(prefs.getInt("btpl", 0), 0, BIKE_TPL_N - 1);
   { String s;
@@ -8944,6 +9103,16 @@ void setup() {
 
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
   lastActive = millis();
+  // The finger that woke it is very likely still on the pad, because
+  // holding it there is what woke it. Start with the press already
+  // down and already spent, or the three seconds you held to wake it
+  // would be read as a long press as well and open whatever a long
+  // press opens.
+  if (digitalRead(TOUCH_PIN) != touchRest) {
+    touchOn = true; touchLvl = digitalRead(TOUCH_PIN);
+    touchEdge = 0; touchPressAt = millis();
+    touchLongDone = true; touchTaps = 0;
+  }
   if (fromDeep) {
     wokeForAlarm = (woke_ == ESP_SLEEP_WAKEUP_TIMER);
     wokeBy = wokeForAlarm ? "prayer" : "picked up";
@@ -9319,6 +9488,15 @@ void loop() {
 
   if (now - lastDraw >= 110) {
     lastDraw = now;
+    // Past five seconds of holding, the overlay is the screen.
+    //
+    // It used to be drawn over the top of whatever menu was there,
+    // but the menu pushes itself to the panel before the overlay is
+    // even drawn, so every frame sent two pictures: the menu, then
+    // the ring. A hundred and ten milliseconds apart, which is what
+    // the blinking was. Drawing one or the other fixes it and saves
+    // a frame.
+    if (touchHold) { drawHoldTier(now - touchPressAt); oled.display(); delay(2); return; }
     switch (screen) {
       case S_FOCUS:    drawFocus();    break;
       case S_WEATHER:  drawWeather();  break;
@@ -9333,9 +9511,6 @@ void loop() {
       case S_SYSTEM:   drawSystem();   break;
       default:         drawHome();     break;
     }
-    // Only ever past five seconds, so it costs ordinary use nothing and
-    // the one time it appears is the one time you want telling.
-    if (touchHold) { drawHoldTier(now - touchPressAt); oled.display(); }
   }
   delay(2);
 }
