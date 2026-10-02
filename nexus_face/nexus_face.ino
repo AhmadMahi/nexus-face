@@ -191,7 +191,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.0.0"
+#define FW_VERSION "5.1.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -258,6 +258,7 @@ const char* S_NAME[S_COUNT] =
 bool cfgOffline = false;
 bool netDown = false;
 int  netMisses = 0;                // failed joins since the last success
+bool hadNet = false;               // it has been online at least once this time up
 static bool offlineNow() { return cfgOffline || netDown; }
 
 // The vehicle screen, off until you ask for it.
@@ -390,8 +391,10 @@ const char* C_NAME[C_COUNT] =
 // faintest it will go rather than off. That is the 1% step, and there
 // is nothing below it to offer. 10% sits between it and a quarter,
 // because the gap from barely-there to a quarter was the big one.
-const int BRIGHT_OPTS[] = { 0, 26, 64, 128, 191, 255 };
-const char* BRIGHT_NAME[] = { "1%", "10%", "25%", "50%", "75%", "100%" };
+// The 1% step is gone: 0 contrast is so faint it reads as a fault
+// rather than a setting. 10% is the bottom now.
+const int BRIGHT_OPTS[] = { 26, 64, 128, 191, 255 };
+const char* BRIGHT_NAME[] = { "10%", "25%", "50%", "75%", "100%" };
 const int BRIGHT_N = sizeof(BRIGHT_OPTS) / sizeof(BRIGHT_OPTS[0]);
 
 // ---------------- how hard a knock has to be ----------------
@@ -801,6 +804,8 @@ static bool online() { return WiFi.status() == WL_CONNECTED; }
 #define TAP_WINDOW_MS 450          // room to land four knocks, without dawdling
 #define TILT 0.35f
 #define SHAKE_G 0.60f
+// How long after a press a shake is assumed to be the press.
+#define SHAKE_AFTER_MS 800UL
 
 // ================================================================
 //  I2C
@@ -2239,41 +2244,42 @@ static void drawReminders() {
   time_t tt = (time_t)r.at;
   struct tm lt; localtime_r(&tt, &lt);
 
-  // The band across the top carries the time on the left and which one
-  // of how many on the right, so a long list can be walked without
-  // losing your place. The whole of the rest is the words, because a
-  // reminder can be a sentence and a sentence needs the room.
-  char when[18], ofN[10];
-  strftime(when, sizeof(when), "%H:%M %a %d", &lt);
-  snprintf(ofN, sizeof(ofN), "%d/%d", remIdx + 1, remCount);
-  oled.fillRect(0, 0, SCRW, 11, SSD1306_WHITE);
+  // Read like a watch shows a message. The time along the top, the
+  // whole of the reminder in the middle with the room to be a
+  // sentence, and which of how many along the bottom where your eye
+  // goes last. Nothing else competes with the words.
+  char when[20];
+  strftime(when, sizeof(when), "%H:%M  %a %d %b", &lt);
+  oled.fillRect(0, 0, SCRW, 10, SSD1306_WHITE);
   oled.setTextColor(SSD1306_BLACK);
   at(2, 2, when);
-  at(SCRW - 2 - (int)strlen(ofN) * 6, 2, ofN);
+  if (r.done) at(SCRW - 2 - 4 * 6, 2, "done");
   oled.setTextColor(SSD1306_WHITE);
-  if (r.done) {                              // a quiet line through a finished one
-    oled.drawFastHLine(0, 5, SCRW, SSD1306_BLACK);
-  }
 
-  // wrapped on words, 21 to a line, five lines of room
-  const int CW = 21, LINES = 5;
+  // wrapped on words, 21 to a line, four lines between the bands
+  const int CW = 21, LINES = 4;
   char buf[REM_TEXT + 8];
   snprintf(buf, sizeof(buf), "%s", r.text);
   int len = (int)strlen(buf), pos = 0, line = 0;
   while (pos < len && line < LINES) {
     int take = len - pos; if (take > CW) take = CW;
-    if (pos + take < len) {                      // break on a space if we can
+    if (pos + take < len) {
       int sp = take;
       while (sp > 0 && buf[pos + sp] != ' ') sp--;
       if (sp > 4) take = sp;
     }
     char row[CW + 1];
     memcpy(row, buf + pos, take); row[take] = 0;
-    at(3, 14 + line * 10, row);
+    at(3, 13 + line * 10, row);
     pos += take;
     while (pos < len && buf[pos] == ' ') pos++;
     line++;
   }
+
+  char ofN[12];
+  snprintf(ofN, sizeof(ofN), "%d of %d", remIdx + 1, remCount);
+  oled.drawFastHLine(0, 54, SCRW, SSD1306_WHITE);
+  ctr(ofN, 56, 1);
   oled.display();
 }
 
@@ -6308,6 +6314,25 @@ static bool doubleMeansSomething() {
   return false;
 }
 
+// A card when one lands, saying how many and when the next is due.
+static void remAddedCard(int n, uint32_t when) {
+  if (n <= 0) return;
+  wake("reminder added");
+  char a[26], b[26];
+  snprintf(a, sizeof(a), n == 1 ? "%d reminder added" : "%d reminders added", n);
+  if (when) {
+    time_t tt = (time_t)when;
+    struct tm lt; localtime_r(&tt, &lt);
+    strftime(b, sizeof(b), "first at %H:%M", &lt);
+  } else {
+    snprintf(b, sizeof(b), "%d waiting", remPending());
+  }
+  toastKind = "note";
+  toastText = String(a) + "\n" + b;
+  toastUntil = millis() + 3500;
+  toastFlash = millis();
+}
+
 static void touchGesture(uint8_t g) {
   lastActive = millis();
 
@@ -6604,7 +6629,16 @@ static void input() {
     // above is what stops a good rattle counting as six. It never goes
     // past the clock, so shaking at an empty desk cannot do anything
     // except leave you at home.
-    if (cfgShake && !(screen == S_GAMES && depth == 2) && !tapTesting) {
+    // Not from your own finger. Pressing a pad glued to a small light
+    // robot shakes the small light robot, and at six tenths of a g a
+    // firm press clears it easily. That is why holding to go into the
+    // reminders looked like nothing happening: it went in, the press
+    // registered as a shake, and the shake took it straight back out.
+    //
+    // So a shake counts only when nothing is touching the pad and
+    // nothing has been for a moment.
+    bool byHand = touchOn || (now - touchPressAt) < SHAKE_AFTER_MS;
+    if (cfgShake && !byHand && !(screen == S_GAMES && depth == 2) && !tapTesting) {
       if (faceMode) faceMode = false;
       else if (depth > 0) { depth--; if (!depth) { itemIdx = 0; subIdx = 0; } }
       else if (screen != S_HOME) { screen = S_HOME; itemIdx = 0; subIdx = 0; }
@@ -7162,6 +7196,13 @@ static void setupWeb() {
     focusBegin(constrain((int)web.arg("m").toInt(), 0, 240));
     okJson();
   });
+  // Said on the panel, not just in the log. One arriving is the only
+  // sign you get that a link you pasted did anything, so it is worth
+  // a second of screen even if the robot was asleep.
+  //
+  // (Declared here because the handlers below are lambdas and cannot
+  // see anything declared after them.)
+
   // ---- one reminder, from anywhere ----
   //
   //   POST or GET  /api/remind
@@ -7243,6 +7284,7 @@ static void setupWeb() {
                (unsigned long)firstAt, remPending());
       web.send(200, "application/json", o);
       Serial.printf("reminder in %ld min: %s\n", mins, txt.c_str());
+      remAddedCard(1, firstAt);
       return;
     }
 
@@ -7282,6 +7324,7 @@ static void setupWeb() {
              added, (unsigned long)firstAt, remPending());
     web.send(200, "application/json", o);
     Serial.printf("reminder added: %s (%d)\n", txt.c_str(), added);
+    remAddedCard(added, firstAt);
   });
 
   // Reminders arriving in bulk, from Rafiq or from anything else.
@@ -7362,6 +7405,12 @@ static void setupWeb() {
     web.send(200, "application/json", o);
     Serial.printf("%d reminders in, %d new, %d already here, %d no room\n",
                   n, added, already, full);
+    if (added) {
+      uint32_t soonest = 0;
+      for (int k = 0; k < remCount; k++)
+        if (!rems[k].done && (!soonest || rems[k].at < soonest)) soonest = rems[k].at;
+      remAddedCard(added, soonest);
+    }
   });
 
   web.on("/api/toast", HTTP_POST, []() {
@@ -7988,7 +8037,11 @@ static void netLoop(void*) {
         netTrying = (netTrying + 1) % netCount;
         if (!joinOne(netTrying, 7000)) {
           netNextTry = millis() + 4000;
-          if (++netMisses >= netCount * 2) {
+          // Only on the way up. Once it has been online this session
+          // a dropout is a dropout, not a change of mode: the Mac may
+          // be back in a second and tearing the radio down would make
+          // that worse. It decides again when it next wakes.
+          if (++netMisses >= netCount * 2 && !hadNet) {
             netDown = true;
             WiFi.disconnect(true, false);
             WiFi.mode(WIFI_OFF);
@@ -7998,6 +8051,7 @@ static void netLoop(void*) {
       }
     } else {
       netMisses = 0;
+      hadNet = true;
       if (wantTime)      { wantTime = false;      trySyncTime(1500); }
       if (wantWx)        { wantWx = false;        fetchWeather(); }
       if (wantPrayerNow) { wantPrayerNow = false; fetchPrayer(); }
