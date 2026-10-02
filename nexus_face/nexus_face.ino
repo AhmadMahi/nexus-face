@@ -151,6 +151,7 @@ uint32_t touchLvlAt = 0;         // when it last changed
 // accident, so after that it is safe to say what is about to happen.
 #define TOUCH_HOME_MS  5000UL
 #define TOUCH_SLEEP_MS 10000UL
+#define TOUCH_COUNT_MS  5000UL   // and then it counts five and goes
 #define TOUCH_GAP_MS  300UL      // quiet for this long and the count is final
 #define TOUCH_DEBOUNCE 40UL
 enum { TG_ONE = 1, TG_TWO, TG_THREE, TG_LONG };
@@ -190,7 +191,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "4.3.0"
+#define FW_VERSION "4.4.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -343,8 +344,12 @@ const char* C_NAME[C_COUNT] =
 
 // Zero is the dimmest the panel goes, not off: the SSD1306 still shows
 // faintly at contrast zero. After that, quarters.
-const int BRIGHT_OPTS[] = { 0, 64, 128, 191, 255 };
-const char* BRIGHT_NAME[] = { "dim", "25%", "50%", "75%", "100%" };
+// Contrast, not backlight: an OLED lights its own pixels, so 0 is the
+// faintest it will go rather than off. That is the 1% step, and there
+// is nothing below it to offer. 10% sits between it and a quarter,
+// because the gap from barely-there to a quarter was the big one.
+const int BRIGHT_OPTS[] = { 0, 26, 64, 128, 191, 255 };
+const char* BRIGHT_NAME[] = { "1%", "10%", "25%", "50%", "75%", "100%" };
 const int BRIGHT_N = sizeof(BRIGHT_OPTS) / sizeof(BRIGHT_OPTS[0]);
 
 // ---------------- how hard a knock has to be ----------------
@@ -2166,19 +2171,25 @@ static void drawReminders() {
   const Rem& r = rems[remIdx];
   time_t tt = (time_t)r.at;
   struct tm lt; localtime_r(&tt, &lt);
-  char when[22];
-  strftime(when, sizeof(when), "%H:%M  %a %d %b", &lt);
 
-  // The time across the top, on its own band, then the words. Nothing
-  // else: no count, no hints, the way a watch shows you a message.
+  // The band across the top carries the time on the left and which one
+  // of how many on the right, so a long list can be walked without
+  // losing your place. The whole of the rest is the words, because a
+  // reminder can be a sentence and a sentence needs the room.
+  char when[18], ofN[10];
+  strftime(when, sizeof(when), "%H:%M %a %d", &lt);
+  snprintf(ofN, sizeof(ofN), "%d/%d", remIdx + 1, remCount);
   oled.fillRect(0, 0, SCRW, 11, SSD1306_WHITE);
   oled.setTextColor(SSD1306_BLACK);
-  at(3, 2, when);
-  if (r.done) at(SCRW - 3 - 4 * 6, 2, "done");
+  at(2, 2, when);
+  at(SCRW - 2 - (int)strlen(ofN) * 6, 2, ofN);
   oled.setTextColor(SSD1306_WHITE);
+  if (r.done) {                              // a quiet line through a finished one
+    oled.drawFastHLine(0, 5, SCRW, SSD1306_BLACK);
+  }
 
-  // wrapped on words, 21 to a line, four lines of room
-  const int CW = 21, LINES = 4;
+  // wrapped on words, 21 to a line, five lines of room
+  const int CW = 21, LINES = 5;
   char buf[REM_TEXT + 8];
   snprintf(buf, sizeof(buf), "%s", r.text);
   int len = (int)strlen(buf), pos = 0, line = 0;
@@ -2191,7 +2202,7 @@ static void drawReminders() {
     }
     char row[CW + 1];
     memcpy(row, buf + pos, take); row[take] = 0;
-    at(3, 16 + line * 11, row);
+    at(3, 14 + line * 10, row);
     pos += take;
     while (pos < len && buf[pos] == ' ') pos++;
     line++;
@@ -4548,10 +4559,48 @@ static void fetchPrayer() {
 
   JsonDocument filter;
   filter["data"]["timings"] = true;
+  filter["data"]["date"]["hijri"]["day"] = true;
+  filter["data"]["date"]["hijri"]["month"]["number"] = true;
+  filter["data"]["date"]["hijri"]["year"] = true;
+  filter["data"]["date"]["gregorian"]["date"] = true;
   JsonDocument doc;
   if (deserializeJson(doc, b, DeserializationOption::Filter(filter))) return;
   JsonObject tm_ = doc["data"]["timings"];
   if (tm_.isNull()) return;
+
+  // The same answer carries the Hijri date, announced rather than
+  // worked out, so take it while we are here. It is kept as a day
+  // offset from the arithmetic one rather than as a date, because an
+  // offset stays right while the robot is off the network and a date
+  // would go stale overnight.
+  {
+    int hd = doc["data"]["date"]["hijri"]["day"] | 0;
+    int hm = doc["data"]["date"]["hijri"]["month"]["number"] | 0;
+    int hy = atoi(doc["data"]["date"]["hijri"]["year"] | "0");
+    if (hd && hm && hy) {
+      // No inverse conversion. Writing one by hand put it 385 days out
+      // and the round trip caught it, so instead this tries each shift
+      // worth having and keeps the one that reproduces the announced
+      // date. Only the forward conversion is trusted, and that one is
+      // checked against four known first-of-the-months.
+      long have = gregToJdn(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+      int shift = 99;
+      for (int s = -3; s <= 3; s++) {
+        int ay, am, ad;
+        hijriFromJdn(have + s, ay, am, ad);
+        if (ay == hy && am == hm && ad == hd) { shift = s; break; }
+      }
+      // Further out than three days is not a shift, it is a
+      // disagreement about which calendar, and guessing would be worse
+      // than leaving it where the user put it.
+      if (shift != 99 && shift != cfgHijriAdj) {
+        cfgHijriAdj = shift;
+        prefs.putInt("hadj", cfgHijriAdj);
+        Serial.printf("hijri shifted %+d day to match the announced date\n", shift);
+      }
+      prefs.putUInt("hsync", (uint32_t)time(nullptr));
+    }
+  }
 
   int tmp[5];
   for (int i = 0; i < 5; i++) {
@@ -6266,6 +6315,14 @@ static void input() {
     if (touchOn && touchLongDone) {
       uint32_t held = now - touchPressAt;
       touchHold = held >= TOUCH_SLEEP_MS ? 2 : held >= TOUCH_HOME_MS ? 1 : 0;
+      // Past ten seconds it counts itself down and goes, held or not.
+      // Waiting for a finger that is clearly not coming off is a way
+      // of looking broken; the five seconds are there to be read and
+      // to give you time to change your mind by letting go early.
+      if (touchHold == 2 && held >= TOUCH_SLEEP_MS + TOUCH_COUNT_MS) {
+        touchHold = 0; touchLongDone = true; touchTaps = 0;
+        wantDeep = true;
+      }
     } else if (!touchOn && touchHold) {
       uint8_t h = touchHold; touchHold = 0;
       if (h == 2) { wantDeep = true; }
@@ -7011,33 +7068,60 @@ static void setupWeb() {
     Serial.printf("reminder added: %s (%d)\n", txt.c_str(), added);
   });
 
-  // The whole list at once, because a dozen short lines is smaller
-  // than working out what changed. The Mac owns the editing; the robot
-  // owns knowing when they are due.
-  web.on("/api/rems", HTTP_POST, []() {
+  // Reminders arriving in bulk, from Rafiq or from anything else.
+  //
+  //  POST /api/rems   n=3  t0=..&a0=..  t1=..&a1=..  t2=..&a2=..
+  //    tN  the words        aN  unix seconds        dN  1 if done
+  //
+  //  This used to empty the list and refill it from whatever arrived,
+  //  on the assumption that Rafiq owned the reminders and the robot
+  //  merely displayed them. That was wrong and it lost things: anything
+  //  added through /api/remind vanished the next time the Mac saved,
+  //  which it does whenever it marks one done. You would get ok:true
+  //  and then find nothing on the robot.
+  //
+  //  The robot owns the list now. This adds what it does not already
+  //  have, matched on the words and the minute, and never removes
+  //  anything. Clearing is a thing you do deliberately, on the robot or
+  //  with clear=1 below.
+  web.on("/api/rems", HTTP_ANY, []() {
     if (!guard()) return;
+    if (web.arg("clear") == "1") {
+      remCount = 0; remIdx = 0; saveRems();
+      web.send(200, "application/json", "{\"ok\":true,\"waiting\":0}");
+      return;
+    }
     int n = web.arg("n").toInt();
     if (n < 0) n = 0;
-    if (n > REM_MAX) n = REM_MAX;
-    remCount = 0;
+    if (n > 64) n = 64;                      // more than the list can hold, on purpose
+    int added = 0, already = 0, full = 0;
     for (int i = 0; i < n; i++) {
       String kt = "t" + String(i), ka = "a" + String(i), kd = "d" + String(i);
       if (!web.hasArg(ka)) continue;
       uint32_t at = (uint32_t)strtoul(web.arg(ka).c_str(), nullptr, 10);
       if (!at) continue;
-      rems[remCount].at = at;
-      rems[remCount].done = web.arg(kd) == "1";
-      rems[remCount].first = at;
-      rems[remCount].tries = 0;
-      snprintf(rems[remCount].text, REM_TEXT, "%s", web.arg(kt).c_str());
-      remCount++;
+      String txt = web.arg(kt); txt.trim();
+      if (!txt.length()) continue;
+      // Same words, same minute: the same reminder arriving twice.
+      bool dup = false;
+      for (int k = 0; k < remCount; k++)
+        if (rems[k].at / 60 == at / 60 && txt == rems[k].text) { dup = true; break; }
+      if (dup) { already++; continue; }
+      if (!addRem(txt.c_str(), at)) { full++; continue; }
+      if (web.arg(kd) == "1") rems[remCount - 1].done = true;
+      added++;
     }
-    sortRems();
-    saveRems();
+    if (added) { sortRems(); saveRems(); }
     if (remIdx > remCount) remIdx = remCount;
-    Serial.printf("Rafiq sent %d reminders\n", remCount);
-    okJson();
+    char o[120];
+    snprintf(o, sizeof(o),
+             "{\"ok\":true,\"added\":%d,\"already\":%d,\"full\":%d,\"waiting\":%d}",
+             added, already, full, remPending());
+    web.send(200, "application/json", o);
+    Serial.printf("%d reminders in, %d new, %d already here, %d no room\n",
+                  n, added, already, full);
   });
+
   web.on("/api/toast", HTTP_POST, []() {
     if (!guard()) return;
     String m = web.arg("m"); m.trim();
@@ -8225,12 +8309,25 @@ void loop() {
     // Only ever past five seconds, so it costs ordinary use nothing and
     // the one time it appears is the one time you want telling.
     if (touchHold) {
-      const char* w = touchHold == 2 ? "KEEP HOLDING: SLEEP" : "KEEP HOLDING: HOME";
-      int bw = (int)strlen(w) * 6 + 6;
+      char w[26]; const char* under = nullptr;
+      if (touchHold == 2) {
+        uint32_t held = now - touchPressAt;
+        uint32_t gone = held - TOUCH_SLEEP_MS;
+        int left = (int)((TOUCH_COUNT_MS - (gone > TOUCH_COUNT_MS ? TOUCH_COUNT_MS : gone)
+                          + 999) / 1000);
+        if (left < 1) left = 1;
+        snprintf(w, sizeof(w), "SLEEPING IN %d", left);
+        under = "let go to stop it";
+      } else {
+        snprintf(w, sizeof(w), "KEEP HOLDING: HOME");
+      }
+      int bw = (int)strlen(w) * 6 + 8;
       int bx = (SCRW - bw) / 2;
-      oled.fillRect(bx, 26, bw, 13, SSD1306_BLACK);
-      oled.drawRect(bx, 26, bw, 13, SSD1306_WHITE);
-      at(bx + 3, 29, w);
+      int bh = under ? 24 : 13;
+      oled.fillRect(bx, 24, bw, bh, SSD1306_BLACK);
+      oled.drawRect(bx, 24, bw, bh, SSD1306_WHITE);
+      at(bx + 4, 27, w);
+      if (under) ctr(under, 38, 1);
       oled.display();
     }
   }
