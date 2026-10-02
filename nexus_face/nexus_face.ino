@@ -180,21 +180,27 @@ bool cfgKnock = false;
 // A shake steps back one. On by default, because with the pad doing
 // everything a second way out is worth having, and a shake is the one
 // gesture you can make without looking at the thing.
-// How you go back a level. Two presses, a shake, or either.
+// Which gesture on the body of the robot goes back a level.
 //
-// It was a plain on/off for the shake, which left no way to say "the
-// shake only": a double press always went back whatever you set. Three
-// values, walked by holding on the row the way every other setting is
-// walked, and shown as the value so you can see where you are without
+// Two presses on the pad always go back. That is how the thing is
+// driven and it is not a setting. What this picks is what the
+// accelerometer does: a knock on the shell, a shake of it, or either.
+// It was a plain on/off for the shake before, which left no way to
+// ask for the knock on its own, and for one release it offered
+// "touch" as one of the three, which was me misreading what was being
+// asked for: the pad is not the question here, the body is.
+//
+// Walked by holding on the row, the way every other setting is
+// walked, and the value is shown so you can see where you are without
 // opening anything.
 //
-// A long press still goes home from anywhere and three presses still
-// go home, so there is no setting here that can strand you.
-enum { BACK_TOUCH = 0, BACK_SHAKE, BACK_BOTH, BACK_N };
+// Knocking has to be switched on for the knock to mean anything, and
+// the row says so rather than offering a setting that does nothing.
+enum { BACK_KNOCK = 0, BACK_SHAKE, BACK_BOTH, BACK_N };
 int cfgBack = BACK_BOTH;
-const char* BACK_NAME[BACK_N] = { "touch", "shake", "both" };
-static bool backByTouch() { return cfgBack != BACK_SHAKE; }
-static bool backByShake() { return cfgBack != BACK_TOUCH; }
+const char* BACK_NAME[BACK_N] = { "knock", "shake", "both" };
+static bool backByShake() { return cfgBack != BACK_KNOCK; }
+static bool backByKnock() { return cfgBack != BACK_SHAKE; }
 // Kept so the Mac can still send and read shake=0/1 without knowing
 // about any of this.
 #define cfgShake (backByShake())
@@ -214,7 +220,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.4.0"
+#define FW_VERSION "5.5.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -402,16 +408,22 @@ const char* HIJRI_LATIN[12] = {
 struct Rem { char text[REM_TEXT]; uint32_t id; uint32_t at; uint32_t first;
              uint8_t tries; bool done; };
 
-// Ignoring it gets you asked again, and the gaps grow. Three quick
-// ones in case you were simply looking the other way, then it backs
-// off, and after the last of them it stops rather than following you
-// round the house all evening.
-const uint16_t REM_LADDER[] = { 5, 5, 5, 30, 30, 60, 60 };
-#define REM_STEPS (sizeof(REM_LADDER) / sizeof(REM_LADDER[0]))
+// Ignoring it gets you asked again, every fifteen minutes, and after
+// seven goes it stops rather than following you round the house all
+// evening.
+//
+// The gaps used to grow: three at five minutes, two at thirty, two at
+// an hour. That was two different behaviours for one situation, since
+// waving it away by hand already meant fifteen minutes, and an hour is
+// long enough that the thing you were being reminded of has usually
+// gone past. One interval, one meaning.
+#define REM_STEPS 7
 // A press is different. It means "I have seen it, not now", so it comes
 // back sooner and does not count against the ladder: you can keep
 // saying not now for as long as you like.
 #define REM_WAVED_MIN 15
+// How long a reminder holds the screen before it puts itself off.
+#define REM_SHOW_MS 10000UL
 Rem  rems[REM_MAX];
 int  remCount = 0;
 int  remIdx = 0;                   // which one is being read
@@ -2424,6 +2436,47 @@ static int wrapInto(const char* t, int cols, int maxLines) {
   return n;
 }
 
+// Fill a window with words.
+//
+// Two big lines if they will go, small ones if not, and a slow crawl
+// when even small will not fit. `since` is when this text went up, so
+// a crawl starts from the top rather than continuing mid sentence from
+// whatever was there before.
+//
+// The window is cut hard at both ends afterwards. Adafruit's text has
+// no clip, so a line halfway out of it would paint straight over
+// whatever band sits above or below; this cuts it off instead, and
+// anything that belongs in those bands is drawn after this returns.
+static void fitText(const char* text, int top, int bottom, uint32_t since) {
+  const int h = bottom - top + 1;
+  int size = 2, n = wrapInto(text, 10, REM_LN);
+  if (n * 18 > h) { size = 1; n = wrapInto(text, 21, REM_LN); }
+  const int lh = size == 2 ? 18 : 10;
+  const int blockH = n * lh;
+  int off;
+  if (blockH > h) {
+    uint32_t travel = (uint32_t)(blockH - h);
+    uint32_t climb  = travel * 1000UL / 9;       // nine pixels a second
+    uint32_t cycle  = 1800 + climb + 1800;       // read, climb, read, again
+    uint32_t t      = (millis() - since) % cycle;
+    if      (t < 1800)         off = 0;
+    else if (t < 1800 + climb) off = (int)((t - 1800) * travel / climb);
+    else                       off = (int)travel;
+  } else {
+    off = -(h - blockH) / 2;                     // centred when it fits
+  }
+
+  const bool mid = (size == 2) || n <= 2;
+  for (int i = 0; i < n; i++) {
+    int y = top + i * lh - off;
+    if (y > bottom || y + 8 * size < top) continue;
+    if (mid) ctr(remLines[i], y, size);
+    else     at(2, y, remLines[i], size);
+  }
+  oled.fillRect(0, 0, SCRW, top, SSD1306_BLACK);
+  oled.fillRect(0, bottom + 1, SCRW, SCRH - bottom - 1, SSD1306_BLACK);
+}
+
 // When the one on screen last changed, so a crawl starts from the top
 // every time you turn the page instead of continuing mid-sentence.
 static uint32_t remShownAt = 0;
@@ -2476,51 +2529,36 @@ static void drawReminders() {
   // Off the mains and off the network it can come back not knowing
   // what day it is, and a reminder stamped with a time the board
   // invented is worse than one with no time on it.
-  char when[24]; when[0] = 0;
+  char day[16], hm[8]; day[0] = hm[0] = 0;
   bool hasWhen = r.at && timeOk;
   if (hasWhen) {
     time_t tt = (time_t)r.at;
     struct tm lt; localtime_r(&tt, &lt);
-    strftime(when, sizeof(when), "%H:%M  %a %d %b", &lt);
+    strftime(day, sizeof(day), "%a %d %b", &lt);
+    strftime(hm,  sizeof(hm),  "%H:%M", &lt);
   }
-  const int top = hasWhen ? 13 : 3, bottom = 52;
+  // 14 to 53 is forty pixels, which is exactly four small lines. The
+  // ribbon took one off the top and for a moment the window was 39,
+  // so a four line reminder that used to sit still started crawling
+  // for the sake of one pixel. The count sits at 56, so 53 is free.
+  const int top = hasWhen ? 14 : 3, bottom = 53;
   const int h = bottom - top + 1;
 
-  // Fit the words to the room. Two big lines if they will go, small
-  // ones if not, and a slow crawl when even small will not fit.
-  int size = 2, n = wrapInto(r.text, 10, REM_LN);
-  if (n * 18 > h) { size = 1; n = wrapInto(r.text, 21, REM_LN); }
-  const int lh = size == 2 ? 18 : 10;
-  const int blockH = n * lh;
-  int off;
-  if (blockH > h) {
-    uint32_t travel = (uint32_t)(blockH - h);
-    uint32_t climb  = travel * 1000UL / 9;       // nine pixels a second
-    uint32_t cycle  = 1800 + climb + 1800;       // read, climb, read, again
-    uint32_t t      = (millis() - remShownAt) % cycle;
-    if      (t < 1800)         off = 0;
-    else if (t < 1800 + climb) off = (int)((t - 1800) * travel / climb);
-    else                       off = (int)travel;
-  } else {
-    off = -(h - blockH) / 2;                     // centred when it fits
+  fitText(r.text, top, bottom, remShownAt);
+
+  // A ribbon across the top: the day on one edge, the time on the
+  // other. The two used to run together on one unmarked line, which
+  // read as a sentence rather than a header.
+  if (hasWhen) {
+    oled.fillRect(0, 0, SCRW, 12, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    at(2, 2, day);
+    const char* right = r.done ? "done" : hm;
+    at(SCRW - 2 - (int)strlen(right) * 6, 2, right);
+    oled.setTextColor(SSD1306_WHITE);
+  } else if (r.done) {
+    at(SCRW - 2 - 4 * 6, 2, "done");
   }
-
-  const bool mid = (size == 2) || n <= 2;
-  for (int i = 0; i < n; i++) {
-    int y = top + i * lh - off;
-    if (y > bottom || y + 8 * size < top) continue;
-    if (mid) ctr(remLines[i], y, size);
-    else     at(2, y, remLines[i], size);
-  }
-
-  // Hard edges. Adafruit's text has no clip, so a line halfway out of
-  // the window would paint straight over the bands; this cuts it off
-  // instead, and everything that belongs in the bands is drawn after.
-  oled.fillRect(0, 0, SCRW, top, SSD1306_BLACK);
-  oled.fillRect(0, bottom + 1, SCRW, SCRH - bottom - 1, SSD1306_BLACK);
-
-  if (hasWhen) at(2, 2, when);
-  if (r.done)  at(SCRW - 2 - 4 * 6, 2, "done");
   char ofN[14];
   snprintf(ofN, sizeof(ofN), "%d of %d", remIdx + 1, remCount);
   ctr(ofN, 56, 1);
@@ -3075,26 +3113,28 @@ static void drawToast() {
   if (toastKind == "note")   head = "REMINDERS";
   bar(head);
 
-  // A reminder you did not see is not a reminder, so the first half
-  // second of one is inverted. It catches the eye from across a desk
-  // the way a quiet change of screen never does.
   bool loud = (toastKind == "remind" || toastKind == "break");
-  if (loud && toastFlash && (long)(millis() - toastFlash) < 500) {
-    bool on = ((millis() - toastFlash) / 125) % 2 == 0;
-    if (on) {
-      oled.fillRect(0, 0, SCRW, SCRH, SSD1306_WHITE);
-      oled.display();
-      return;
-    }
-  }
-  if (toastKind == "break" || toastKind == "remind") {
-    long m = (long)(toastUntil - millis()) / 1000L;
-    ctr(toastText.length() ? toastText.c_str()
-                           : "Stand up, look away", 24, 1);
-    ctr("Touch twice to snooze", 40, 1);
-    int bw = SCRW - 30;
-    oled.drawRect(15, 52, bw, 5, SSD1306_WHITE);
-    if (m > 0) oled.fillRect(16, 53, (bw - 2) * constrain((int)m, 0, 20) / 20, 3, SSD1306_WHITE);
+  if (loud) {
+    // A ribbon that says what a press does, then the whole of the
+    // message filling everything under it. There was a bar along the
+    // bottom counting down the card's own life, which is not
+    // something anyone needs to watch, and the message was squeezed
+    // into one centred line above it whatever its length.
+    // The words first: fitText cuts the window at both ends, so a
+    // ribbon drawn before it is a ribbon painted over.
+    fitText(toastText.length() ? toastText.c_str() : "Stand up, look away",
+            14, 62, toastFlash);
+    oled.fillRect(0, 0, SCRW, 12, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    ctr("2 to snooze 15 min", 2, 1);
+    oled.setTextColor(SSD1306_WHITE);
+    // Caught from across a desk: the whole card turns over for a
+    // sixth of a second every three seconds. It used to flash white
+    // for half a second once, at the start, which you had to be
+    // looking at it to see. Inverting the buffer keeps the words
+    // readable through the flash instead of blanking them.
+    if ((millis() - toastFlash) % 3000UL < 170UL)
+      oled.fillRect(0, 0, SCRW, SCRH, SSD1306_INVERSE);
   } else {
     // Two lines of it, and no more: this is a glance, not a read.
     //
@@ -3341,7 +3381,9 @@ static void drawSettings() {
       case C_MODE:   snprintf(v, sizeof(v), "%s", cfgOffline ? "off" :
                               (netDown ? "no signal" : "on")); break;
       case C_BIKE:   snprintf(v, sizeof(v), "%s", cfgBike ? "on" : "off"); break;
-      case C_SHAKE:  snprintf(v, sizeof(v), "%s", BACK_NAME[cfgBack]); break;
+      case C_SHAKE:  snprintf(v, sizeof(v), "%s",
+                              (cfgBack == BACK_KNOCK && !cfgKnock)
+                                ? "knock off" : BACK_NAME[cfgBack]); break;
       case C_DEEP:   snprintf(v, sizeof(v), "%s", DEEP_NAME[cfgDeepIdx]); break;
       case C_BATT:   snprintf(v, sizeof(v), "%.2fV", battFull); break;
       case C_PAIR:   snprintf(v, sizeof(v), "%s", cfgLock ? "paired" : "hold"); break;
@@ -6510,8 +6552,8 @@ static void knockTwo() {
       case C_SHAKE:
         cfgBack = (cfgBack + 1) % BACK_N;
         prefs.putInt("back", cfgBack);
-        flash(cfgBack == BACK_TOUCH ? "BACK BY TOUCH"
-            : cfgBack == BACK_SHAKE ? "BACK BY SHAKE" : "BACK BY EITHER", 1000);
+        flash(cfgBack == BACK_KNOCK ? (cfgKnock ? "BACK BY KNOCK" : "KNOCKS ARE OFF")
+            : cfgBack == BACK_SHAKE ? "BACK BY SHAKE" : "BACK BY EITHER", 1200);
         break;
       case C_DEEP:
         cfgDeepIdx = (cfgDeepIdx + 1) % DEEP_N;
@@ -6747,6 +6789,24 @@ static void remAddedCard(int n, uint32_t when) {
 static void touchGesture(uint8_t g) {
   lastActive = millis();
 
+  // The update screen, first, because while it is up it owns the
+  // panel and returns from loop() before anything else draws.
+  //
+  // It was only ever driven by knocks, and knocks are off unless you
+  // ask for them. So opening Check update put a screen in front of
+  // you that the pad could not touch: presses fell through to the
+  // carousel underneath, invisibly, and nothing would come back. Not
+  // a freeze in the sense of a crash, but there was no way out of it
+  // short of the battery.
+  if (upState != U_OFF) {
+    switch (g) {
+      case TG_ONE:  updateKnock(1); return;     // the next one
+      case TG_LONG: updateKnock(2); return;     // this one
+      case TG_TWO:  updateKnock(3); return;     // back
+      default:      upState = U_OFF; return;    // three presses leave it
+    }
+  }
+
   // A reminder on screen takes the press before anything else does.
   // Holding is how you say it is done, which is the only way a thing
   // ever stops asking.
@@ -6879,12 +6939,7 @@ static void touchGesture(uint8_t g) {
 
   switch (g) {
     case TG_ONE:   knockOne();   break;
-    // Back, out one level, unless you have said a shake is the only
-    // way back. This is the generic one; the doubles that turn a page
-    // inside a reader or walk back through the reminders are page
-    // moves rather than commands and are left alone, so setting this
-    // to the shake can never strand you inside something.
-    case TG_TWO:   if (backByTouch()) knockThree(); break;
+    case TG_TWO:   knockThree(); break;       // back, out one level
     case TG_LONG:  clickShrink(); knockTwo(); break;   // in
     case TG_THREE:                            // straight home from anywhere
       if (dndUntil || relaxOn || canvasUntil || toastUntil) { knockOne(); break; }
@@ -6937,7 +6992,10 @@ static void settleBurst() {
   }
   if      (n == 1) knockOne();
   else if (n == 2) knockTwo();
-  else if (n == 3) knockThree();
+  // Three knocks go back, unless you have said the shake is the only
+  // thing on the body that does. Knocking is still counted and still
+  // drives everything else; it just stops being a way out.
+  else if (n == 3) { if (backByKnock()) knockThree(); }
   else             knockFour();
   Serial.printf("knock x%u -> %s depth %d item %d sub %d\n",
                 n, S_NAME[screen], depth, itemIdx, subIdx);
@@ -7009,7 +7067,8 @@ static void input() {
     } else if (!touchOn && touchHold) {
       uint8_t h = touchHold; touchHold = 0;
       if (h == 2) { wantDeep = true; }
-      else { screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; faceMode = false; }
+      else { screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; faceMode = false;
+             upState = U_OFF; swOn = false; swRun = false; }
     }
     // Quiet long enough that nothing more is coming.
     //
@@ -7090,7 +7149,10 @@ static void input() {
     uint32_t sinceHand = now - (touchLiftAt > touchPressAt ? touchLiftAt : touchPressAt);
     bool byHand = touchOn || sinceHand < SHAKE_AFTER_MS;
     if (cfgShake && !byHand && !(screen == S_GAMES && depth == 2) && !tapTesting) {
-      if (bikeEdit) bikeEdit = false;           // out of the chooser, nothing kept
+      // The update screen owns the panel, so stepping back has to put
+      // it down before anything else can be seen to happen.
+      if (upState != U_OFF) { updateKnock(3); }
+      else if (bikeEdit) bikeEdit = false;      // out of the chooser, nothing kept
       // The stopwatch holds the screen on its own, outside depth, so
       // stepping back has to put it down first or the shake does
       // nothing you can see.
@@ -8117,7 +8179,7 @@ static void setupWeb() {
                             else { netDown = false; netMisses = 0; netNextTry = 0;
                                    WiFi.mode(WIFI_STA); WiFi.setSleep(false); setupWeb(); } }
     else if (k == "hadj") { cfgHijriAdj = constrain(v, -2, 2);           prefs.putInt("hadj", cfgHijriAdj); }
-    else if (k == "shake"){ cfgBack = v ? BACK_BOTH : BACK_TOUCH;        prefs.putInt("back", cfgBack); }
+    else if (k == "shake"){ cfgBack = v ? BACK_BOTH : BACK_KNOCK;        prefs.putInt("back", cfgBack); }
     else if (k == "back") { cfgBack = constrain(v, 0, BACK_N - 1);       prefs.putInt("back", cfgBack); }
     else if (k == "deepi"){ cfgDeepIdx  = constrain(v, 0, DEEP_N - 1);   prefs.putInt("deepi", cfgDeepIdx); }
     // Sent in hundredths, because the form only carries whole numbers.
@@ -8679,7 +8741,7 @@ void setup() {
   // only. Written back once so the next boot reads the new key.
   if (prefs.isKey("back")) cfgBack = constrain(prefs.getInt("back", BACK_BOTH), 0, BACK_N - 1);
   else {
-    cfgBack = prefs.getBool("shake", true) ? BACK_BOTH : BACK_TOUCH;
+    cfgBack = prefs.getBool("shake", true) ? BACK_BOTH : BACK_KNOCK;
     prefs.putInt("back", cfgBack);
   }
   cfgDeepIdx  = constrain(prefs.getInt("deepi", 1), 0, DEEP_N - 1);
@@ -9025,7 +9087,10 @@ void loop() {
       wake("reminder");
       toastKind = "remind";
       toastText = rems[i].text;
-      toastUntil = millis() + 60000UL;           // a minute, it is why it woke up
+      // Ten seconds of asking, then it takes itself away for fifteen
+      // minutes. A minute of a flashing card nobody is there for is a
+      // minute of the screen on and the battery going.
+      toastUntil = millis() + REM_SHOW_MS;
       toastFlash = millis();
       remShowing = i;                            // so a press knows which one
       break;
@@ -9206,10 +9271,16 @@ void loop() {
         r.done = true;
         Serial.println("reminder asked all it is going to, letting it go");
       } else {
-        uint16_t mins = REM_LADDER[r.tries++];
-        r.at = (uint32_t)time(nullptr) + (uint32_t)mins * 60UL;
-        Serial.printf("reminder ignored, back in %u min (%u of %u)\n",
-                      mins, r.tries, (unsigned)REM_STEPS);
+        // The same fifteen minutes as snoozing it by hand. Nobody
+        // answering and you waving it away mean the same thing, and
+        // a ladder that asked again in five and then not for an hour
+        // was two different behaviours for one situation. The count
+        // still runs, so it still gives up rather than asking all
+        // evening.
+        r.tries++;
+        r.at = (uint32_t)time(nullptr) + (uint32_t)REM_WAVED_MIN * 60UL;
+        Serial.printf("reminder not answered, back in %d min (%u of %u)\n",
+                      REM_WAVED_MIN, r.tries, (unsigned)REM_STEPS);
       }
       saveRems();
     }
