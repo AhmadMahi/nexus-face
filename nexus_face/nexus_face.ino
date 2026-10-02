@@ -151,7 +151,7 @@ uint32_t touchLvlAt = 0;         // when it last changed
 // accident, so after that it is safe to say what is about to happen.
 #define TOUCH_HOME_MS  5000UL
 #define TOUCH_SLEEP_MS 10000UL
-#define TOUCH_COUNT_MS  5000UL   // and then it counts five and goes
+#define TOUCH_COUNT_MS  3000UL   // and then it counts three and goes
 #define TOUCH_GAP_MS  300UL      // quiet for this long and the count is final
 #define TOUCH_DEBOUNCE 40UL
 enum { TG_ONE = 1, TG_TWO, TG_THREE, TG_LONG };
@@ -191,7 +191,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.1.0"
+#define FW_VERSION "5.2.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -262,12 +262,24 @@ bool hadNet = false;               // it has been online at least once this time
 static bool offlineNow() { return cfgOffline || netDown; }
 
 // The vehicle screen, off until you ask for it.
+//
+//  Make and model are two fields rather than one because
+//  "Royal Enfield Meteor 350" is twenty four characters and the screen
+//  is twenty one wide. Split at the source and every template can put
+//  them where it has the room, instead of each one guessing where to
+//  break a string someone typed.
 bool cfgBike = false;
 int  cfgBikeTpl = 0;
-#define BIKE_TPL_N 4
+#define BIKE_TPL_N 6
 char bikePlate[20] = "KA 50 HJ 5683";
+char bikeMake[20]  = "Royal Enfield";
 char bikeModel[20] = "Meteor 350";
 char bikeOwner[20] = "Ahmed";
+// Picking a layout is a mode, not a side effect of a press: hold to
+// get in, press to walk the six, hold to keep the one you are looking
+// at. Until you keep it, nothing is written and nothing is kept.
+bool bikeEdit = false;
+int  bikeTry  = 0;
 
 // Which screens are worth offering at all. Weather needs the network
 // and the vehicle screen is something you asked for; neither should sit
@@ -327,12 +339,21 @@ const char* HIJRI_LATIN[12] = {
 //  clock keeps running through deep sleep, so a reminder set tonight
 //  still lands at nine tomorrow with no network and no Mac.
 #define REM_MAX 12
-#define REM_TEXT 64
+// Sixty three characters was not a reminder, it was a label. At
+// ninety five a sentence fits, and the reader has a crawl for the
+// ones that still do not.
+#define REM_TEXT 96
 //  at    when it is next due, which moves every time it is put off
 //  first the day it was for, so a thing from Tuesday stops asking on
 //        Wednesday rather than following you around for ever
 //  done  you held the pad on it, and it is finished
-struct Rem { char text[REM_TEXT]; uint32_t at; uint32_t first; uint8_t tries; bool done; };
+// id is what the Mac holds on to. Matching on the words and the
+// minute worked for spotting a duplicate but not for editing one: the
+// moment the app changed a time, the thing it was changing stopped
+// matching what it had sent. The id is assigned here, never reused,
+// and survives a save.
+struct Rem { char text[REM_TEXT]; uint32_t id; uint32_t at; uint32_t first;
+             uint8_t tries; bool done; };
 
 // Ignoring it gets you asked again, and the gaps grow. Three quick
 // ones in case you were simply looking the other way, then it backs
@@ -349,6 +370,7 @@ int  remCount = 0;
 int  remIdx = 0;                   // which one is being read
 uint32_t remCheck = 0;
 int  remShowing = -1;              // the one on screen, or none
+uint32_t remNextId = 1;            // never goes backwards, never reused
 bool remWokeIt = false;            // it was asleep, and this is why it is not
 bool remConfirm = false;           // on the clear-them-all question
 bool remYes = false;
@@ -757,6 +779,11 @@ unsigned long sleptAt = 0;           // when the screen went dark
 
 // ---------------- runtime ----------------
 bool asleep = false, screenOn = true, timeOk = false, rescueAP = false, fsOk = false;
+// The web server is not started at boot when the radio is meant to be
+// down, so whether it has been started is a separate question from
+// whether the board has booted.
+bool webUp = false;
+static void setupWeb();
 unsigned long lastActive = 0, lastDraw = 0, lastPoll = 0, reactUntil = 0, lastShake = 0;
 unsigned long nextTimeTry = 0, swStart = 0, inputMuteUntil = 0;
 unsigned long lastLowG = 0, lastFallAt = 0;
@@ -1821,35 +1848,43 @@ static void drawHome() {
   oled.clearDisplay();
   loadBits();
 
-  // No clock yet. This used to become a stopwatch, which is why one was
-  // always running whether or not anyone wanted it. Home stays home, and
-  // says something rather than showing an empty clock.
-  if (!fb.ok) {
-    offlineIcon(6, 3);
-    at(18, 4, "OFFLINE MODE");
-    robotHead(SCRW / 2, 37, true);        // 23px of aerial clears the title
-    // a different line every eight seconds, so it is never a dead panel
-    ctr(IDLE_LINES[(millis() / 8000UL) % IDLE_N], 55, 1);
-    oled.display();
-    return;
-  }
-
   // Off the network, the clock is not the point any more: nothing on
-  // this screen was going to be fetched. It says hello instead, and
-  // keeps the time in the corner, because a robot that knows what time
-  // it is and will not say is an irritating robot.
+  // this screen was going to be fetched. It says hello instead.
+  //
+  // The time in the corner is there only when there is a time. The
+  // clock runs through deep sleep and comes back with the hour still
+  // right, so most of the time there is one and it belongs on screen.
+  // When it has been off the mains and lost it, the corner stays
+  // empty: a robot that invents the time is worse than one that does
+  // not know it. This comes before the no-clock screen because off
+  // the network with no clock is still the offline home, not a board
+  // sitting there waiting for something that is not coming.
   if (offlineNow()) {
     char hi[34];
     snprintf(hi, sizeof(hi), "%s, %s",
              GREET[(millis() / 11000UL) % GREET_N], cfgName);
-    robotHead(SCRW / 2, 24, false);
-    ctr(hi, 40, 1);
-    ctr("touch to begin", 54, 1);
-    at(2, 2, fb.ok ? fb.hm : "");              // small, out of the way
+    offlineIcon(4, 2);
+    if (fb.ok) at(15, 2, fb.hm);
     if (!isnan(battV)) {
       char b[8]; snprintf(b, sizeof(b), "%d%%", battPct(battV));
       at(SCRW - 2 - (int)strlen(b) * 6, 2, b);
     }
+    robotHead(SCRW / 2, 27, false);
+    ctr(hi, 44, 1);
+    ctr("touch to begin", 55, 1);
+    oled.display();
+    return;
+  }
+
+  // On a network but the clock has not landed yet. This used to become
+  // a stopwatch, which is why one was always running whether or not
+  // anyone wanted it. Home stays home, and says what it is waiting for
+  // rather than showing an empty clock.
+  if (!fb.ok) {
+    ctr("WAITING FOR THE CLOCK", 4, 1);
+    robotHead(SCRW / 2, 37, true);        // 23px of aerial clears the title
+    // a different line every eight seconds, so it is never a dead panel
+    ctr(IDLE_LINES[(millis() / 8000UL) % IDLE_N], 55, 1);
     oled.display();
     return;
   }
@@ -2193,31 +2228,144 @@ static void drawReads() {
 // A reminder, the way a watch shows a message: the time it is for
 // along the top and the whole of it underneath, wrapped, with nothing
 // else competing for the room.
+// A house, for the overlay that says letting go goes home.
+static void houseGlyph(int cx, int cy) {
+  oled.drawLine(cx - 7, cy, cx, cy - 7, SSD1306_WHITE);
+  oled.drawLine(cx, cy - 7, cx + 7, cy, SSD1306_WHITE);
+  oled.drawRect(cx - 5, cy, 11, 8, SSD1306_WHITE);
+  oled.fillRect(cx - 1, cy + 4, 3, 4, SSD1306_WHITE);
+}
+
+// A ring drawn as a fraction of itself, clockwise from twelve.
+static void ringArc(int cx, int cy, int r, float frac) {
+  if (frac < 0) frac = 0;
+  if (frac > 1) frac = 1;
+  const int SEG = 140;                  // not N: RoboEyes #defines that
+  int steps = (int)(frac * SEG);
+  for (int i = 0; i < steps; i++) {
+    float a = -1.5708f + i * (6.2832f / SEG);
+    float c = cosf(a), sn = sinf(a);
+    for (int rr = r - 2; rr <= r; rr++)
+      oled.drawPixel(cx + (int)(rr * c), cy + (int)(rr * sn), SSD1306_WHITE);
+  }
+}
+
+// What a long hold looks like while it is happening.
+//
+//  Five to ten seconds is a ring filling towards sleep with a house in
+//  the middle, because what letting go does right now is go home. Past
+//  ten it stops being a hint and becomes a countdown, and the one
+//  thing it needs to say is that the finger has to come off.
+//
+//  It used to flash the word HOME in a box, which said nothing about
+//  how far through you were and read like a fault.
+static void drawHoldTier(uint32_t held) {
+  // Both tiers take the whole screen. A ring punched into the middle
+  // of a settings list left the list showing round the edges and the
+  // title band sliced in half, which looked like a glitch rather than
+  // a thing the robot meant to do.
+  if (held < TOUCH_SLEEP_MS) {
+    float frac = (float)(held - TOUCH_HOME_MS) / (float)(TOUCH_SLEEP_MS - TOUCH_HOME_MS);
+    oled.clearDisplay();
+    oled.fillRect(0, 0, SCRW, 11, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    ctr("LET GO FOR HOME", 2, 1);
+    oled.setTextColor(SSD1306_WHITE);
+
+    const int CX = SCRW / 2, CY = 31, R = 16;
+    oled.drawCircle(CX, CY, R, SSD1306_WHITE);
+    ringArc(CX, CY, R, frac);
+    houseGlyph(CX, CY - 1);
+
+    oled.fillRect(0, 53, SCRW, 11, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    ctr("hold on for sleep", 55, 1);
+    oled.setTextColor(SSD1306_WHITE);
+    return;
+  }
+
+  uint32_t gone = held - TOUCH_SLEEP_MS;
+  if (gone > TOUCH_COUNT_MS) gone = TOUCH_COUNT_MS;
+  int left = (int)((TOUCH_COUNT_MS - gone + 999) / 1000);
+  if (left < 1) left = 1;
+  char n[2] = { (char)('0' + left), 0 };
+
+  oled.clearDisplay();                       // this one takes the screen
+  oled.fillRect(0, 0, SCRW, 11, SSD1306_WHITE);
+  oled.setTextColor(SSD1306_BLACK);
+  ctr("GOING TO SLEEP", 2, 1);
+  oled.setTextColor(SSD1306_WHITE);
+
+  const int CX = SCRW / 2, CY = 31, R = 16;
+  oled.drawCircle(CX, CY, R, SSD1306_WHITE);
+  ringArc(CX, CY, R, 1.0f - (float)gone / (float)TOUCH_COUNT_MS);
+  ctr(n, 19, 3);
+
+  oled.fillRect(0, 53, SCRW, 11, SSD1306_WHITE);
+  oled.setTextColor(SSD1306_BLACK);
+  ctr("lift your finger", 55, 1);
+  oled.setTextColor(SSD1306_WHITE);
+}
+
+// A bell, drawn to the same weight as the gear so the carousel looks
+// like one thing rather than a collection of drawings.
+static void bellIcon(int cx, int cy, int r) {
+  const float dr = r * 0.78f;
+  for (int d = 180; d <= 360; d += 2)
+    oled.drawPixel(cx + (int)(dr * cosf(d * 0.01745f)),
+                   cy - 2 + (int)(dr * sinf(d * 0.01745f)), SSD1306_WHITE);
+  oled.drawFastVLine(cx - (int)dr, cy - 2, r - 1, SSD1306_WHITE);
+  oled.drawFastVLine(cx + (int)dr, cy - 2, r - 1, SSD1306_WHITE);
+  oled.drawFastHLine(cx - r, cy + r - 3, r * 2 + 1, SSD1306_WHITE);   // the lip
+  oled.fillCircle(cx, cy + r, 2, SSD1306_WHITE);                      // the clapper
+  oled.drawPixel(cx, cy - 3 - (int)dr, SSD1306_WHITE);                // the loop
+}
+
+// Break text on spaces into lines of at most cols characters. Returns
+// how many lines it made, which may be fewer than it wanted if the
+// buffer ran out, and never splits a word that will fit on its own.
+#define REM_LN   10
+#define REM_COLS 32
+static char remLines[REM_LN][REM_COLS];
+static int wrapInto(const char* t, int cols, int maxLines) {
+  if (cols > REM_COLS - 1) cols = REM_COLS - 1;
+  int len = (int)strlen(t), pos = 0, n = 0;
+  while (pos < len && n < maxLines) {
+    int take = len - pos;
+    if (take > cols) take = cols;
+    if (pos + take < len) {                 // more to come: break on a space
+      int sp = take;
+      while (sp > 0 && t[pos + sp] != ' ') sp--;
+      if (sp > 0) take = sp;
+    }
+    memcpy(remLines[n], t + pos, take);
+    remLines[n][take] = 0;
+    pos += take;
+    while (pos < len && t[pos] == ' ') pos++;
+    n++;
+  }
+  return n;
+}
+
+// When the one on screen last changed, so a crawl starts from the top
+// every time you turn the page instead of continuing mid-sentence.
+static uint32_t remShownAt = 0;
+static int      remShownIdx = -1;
+
 static void drawReminders() {
   oled.clearDisplay();
 
   if (depth == 0) {                              // the summary
     bar("REMINDERS");
+    bellIcon(SCRW / 2, 30, 11);
     int p = remPending();
-    if (!remCount) {
-      ctr("nothing to remember", 26, 1);
-      ctr("Rafiq puts them here", 40, 1);
-    } else {
-      char c[20];
-      snprintf(c, sizeof(c), "%d waiting", p);
-      ctr(c, 20, 2);
-      // the soonest one, so the summary says something useful
-      int next = -1;
-      for (int i = 0; i < remCount; i++) if (!rems[i].done) { next = i; break; }
-      if (next >= 0) {
-        time_t tt = (time_t)rems[next].at;
-        struct tm lt; localtime_r(&tt, &lt);
-        char w[24];
-        strftime(w, sizeof(w), "next at %H:%M", &lt);
-        ctr(w, 44, 1);
-      }
-      ctr("hold to read", 55, 1);
-    }
+    char c[24];
+    if (!remCount)   snprintf(c, sizeof(c), "nothing waiting");
+    else if (p == 1) snprintf(c, sizeof(c), "1 reminder");
+    else if (p)      snprintf(c, sizeof(c), "%d reminders", p);
+    else             snprintf(c, sizeof(c), "all done");
+    ctr(c, 46, 1);
+    ctr(remCount ? "hold to read" : "Rafiq puts them here", 55, 1);
     oled.display();
     return;
   }
@@ -2241,44 +2389,63 @@ static void drawReminders() {
   }
 
   const Rem& r = rems[remIdx];
-  time_t tt = (time_t)r.at;
-  struct tm lt; localtime_r(&tt, &lt);
+  if (remShownIdx != remIdx) { remShownIdx = remIdx; remShownAt = millis(); }
 
-  // Read like a watch shows a message. The time along the top, the
-  // whole of the reminder in the middle with the room to be a
-  // sentence, and which of how many along the bottom where your eye
-  // goes last. Nothing else competes with the words.
-  char when[20];
-  strftime(when, sizeof(when), "%H:%M  %a %d %b", &lt);
-  oled.fillRect(0, 0, SCRW, 10, SSD1306_WHITE);
-  oled.setTextColor(SSD1306_BLACK);
-  at(2, 2, when);
-  if (r.done) at(SCRW - 2 - 4 * 6, 2, "done");
-  oled.setTextColor(SSD1306_WHITE);
+  // A plain page. No title band and no rules: the reminder is the
+  // screen, the way a watch shows a message. A header band across the
+  // top of a short sentence makes the sentence look like a caption.
+  //
+  // The stored time only goes up when the clock is actually running.
+  // Off the mains and off the network it can come back not knowing
+  // what day it is, and a reminder stamped with a time the board
+  // invented is worse than one with no time on it.
+  char when[24]; when[0] = 0;
+  bool hasWhen = r.at && timeOk;
+  if (hasWhen) {
+    time_t tt = (time_t)r.at;
+    struct tm lt; localtime_r(&tt, &lt);
+    strftime(when, sizeof(when), "%H:%M  %a %d %b", &lt);
+  }
+  const int top = hasWhen ? 13 : 3, bottom = 52;
+  const int h = bottom - top + 1;
 
-  // wrapped on words, 21 to a line, four lines between the bands
-  const int CW = 21, LINES = 4;
-  char buf[REM_TEXT + 8];
-  snprintf(buf, sizeof(buf), "%s", r.text);
-  int len = (int)strlen(buf), pos = 0, line = 0;
-  while (pos < len && line < LINES) {
-    int take = len - pos; if (take > CW) take = CW;
-    if (pos + take < len) {
-      int sp = take;
-      while (sp > 0 && buf[pos + sp] != ' ') sp--;
-      if (sp > 4) take = sp;
-    }
-    char row[CW + 1];
-    memcpy(row, buf + pos, take); row[take] = 0;
-    at(3, 13 + line * 10, row);
-    pos += take;
-    while (pos < len && buf[pos] == ' ') pos++;
-    line++;
+  // Fit the words to the room. Two big lines if they will go, small
+  // ones if not, and a slow crawl when even small will not fit.
+  int size = 2, n = wrapInto(r.text, 10, REM_LN);
+  if (n * 18 > h) { size = 1; n = wrapInto(r.text, 21, REM_LN); }
+  const int lh = size == 2 ? 18 : 10;
+  const int blockH = n * lh;
+  int off;
+  if (blockH > h) {
+    uint32_t travel = (uint32_t)(blockH - h);
+    uint32_t climb  = travel * 1000UL / 9;       // nine pixels a second
+    uint32_t cycle  = 1800 + climb + 1800;       // read, climb, read, again
+    uint32_t t      = (millis() - remShownAt) % cycle;
+    if      (t < 1800)         off = 0;
+    else if (t < 1800 + climb) off = (int)((t - 1800) * travel / climb);
+    else                       off = (int)travel;
+  } else {
+    off = -(h - blockH) / 2;                     // centred when it fits
   }
 
-  char ofN[12];
+  const bool mid = (size == 2) || n <= 2;
+  for (int i = 0; i < n; i++) {
+    int y = top + i * lh - off;
+    if (y > bottom || y + 8 * size < top) continue;
+    if (mid) ctr(remLines[i], y, size);
+    else     at(2, y, remLines[i], size);
+  }
+
+  // Hard edges. Adafruit's text has no clip, so a line halfway out of
+  // the window would paint straight over the bands; this cuts it off
+  // instead, and everything that belongs in the bands is drawn after.
+  oled.fillRect(0, 0, SCRW, top, SSD1306_BLACK);
+  oled.fillRect(0, bottom + 1, SCRW, SCRH - bottom - 1, SSD1306_BLACK);
+
+  if (hasWhen) at(2, 2, when);
+  if (r.done)  at(SCRW - 2 - 4 * 6, 2, "done");
+  char ofN[14];
   snprintf(ofN, sizeof(ofN), "%d of %d", remIdx + 1, remCount);
-  oled.drawFastHLine(0, 54, SCRW, SSD1306_WHITE);
   ctr(ofN, 56, 1);
   oled.display();
 }
@@ -2307,77 +2474,121 @@ static void plateBox(int x, int y, int w, int h) {
   oled.drawPixel(x + w - 1, y + h - 1, SSD1306_BLACK);
 }
 
+// A plate breaks where a real Indian plate breaks: state and district
+// on top, series and number under. Thirteen characters will not cross
+// 128 pixels at double size, and a small big-plate is no plate at all.
+static void plateSplit(char* top, int tn, char* bot, int bn) {
+  top[0] = bot[0] = 0;
+  const char* sp  = strchr(bikePlate, ' ');
+  const char* sp2 = sp ? strchr(sp + 1, ' ') : nullptr;
+  if (sp2) {
+    int n = (int)(sp2 - bikePlate);
+    if (n > tn - 1) n = tn - 1;
+    memcpy(top, bikePlate, n); top[n] = 0;
+    snprintf(bot, bn, "%s", sp2 + 1);
+  } else {
+    snprintf(top, tn, "%s", bikePlate);
+  }
+}
+
+// A dotted rule, for the templates that want a leader rather than a line.
+static void dots(int x0, int x1, int y) {
+  for (int x = x0; x < x1; x += 3) oled.drawPixel(x, y, SSD1306_WHITE);
+}
+
+// The torn edge of a ticket: little bites taken out of a white band.
+static void tornEdge(int y) {
+  for (int x = 4; x < SCRW; x += 9) oled.fillCircle(x, y, 3, SSD1306_BLACK);
+}
+
 static void drawBike() {
   oled.clearDisplay();
-  switch (cfgBikeTpl) {
+  char top[14], bot[14];
+  plateSplit(top, sizeof(top), bot, sizeof(bot));
+  char line[34];
+
+  switch (bikeEdit ? bikeTry : cfgBikeTpl) {
 
     case 1: {                                    // badge: the bike itself
-      bikeIcon(3, 6);
-      oled.drawFastVLine(42, 4, 56, SSD1306_WHITE);
-      at(48, 6, bikePlate);
-      oled.drawFastHLine(48, 16, SCRW - 52, SSD1306_WHITE);
-      at(48, 20, bikeModel);
-      at(48, 31, bikeOwner);
-      at(48, 45, "India");
+      ctr(bikePlate, 2, 1);
+      oled.drawFastHLine(0, 12, SCRW, SSD1306_WHITE);
+      bikeIcon(3, 20);
+      oled.drawFastVLine(40, 15, 47, SSD1306_WHITE);
+      at(44, 17, bikeMake);
+      at(44, 29, bikeModel);
+      at(44, 43, bikeOwner);
       break; }
 
-    case 2: {                                    // ticket: like the papers
+    case 2: {                                    // garage board: the paperwork
       bar("VEHICLE");
-      const char* K[3] = { "REG", "MODEL", "OWNER" };
-      const char* V[3] = { bikePlate, bikeModel, bikeOwner };
-      for (int i = 0; i < 3; i++) {
-        int y = 16 + i * 13;
+      const char* K[4] = { "PLATE", "MAKE", "MODEL", "OWNER" };
+      const char* V[4] = { bikePlate, bikeMake, bikeModel, bikeOwner };
+      for (int i = 0; i < 4; i++) {
+        int y = 14 + i * 10;
         at(4, y, K[i]);
-        at(SCRW - 4 - (int)strlen(V[i]) * 6, y, V[i]);
-        if (i < 2) for (int x = 4; x < SCRW - 4; x += 3)
-          oled.drawPixel(x, y + 9, SSD1306_WHITE);
+        int vw = (int)strlen(V[i]) * 6;
+        at(SCRW - 4 - vw, y, V[i]);
+        if (i < 3) dots(6 + (int)strlen(K[i]) * 6, SCRW - 6 - vw, y + 4);
       }
       break; }
 
-    case 3: {                                    // dial, for the look of it
-      const int CX = 64, CY = 46, R = 34;
-      for (int a = 180; a <= 360; a += 2)
-        oled.drawPixel(CX + (int)(R * cosf(a * 0.01745f)),
-                       CY + (int)(R * sinf(a * 0.01745f)), SSD1306_WHITE);
-      for (int i = 0; i <= 6; i++) {
+    case 3: {                                    // ticket stub: make on the tab
+      oled.fillRect(0, 0, SCRW, 13, SSD1306_WHITE);
+      oled.setTextColor(SSD1306_BLACK);
+      ctr(bikeMake, 3, 1);
+      oled.setTextColor(SSD1306_WHITE);
+      tornEdge(13);
+      if (bot[0]) { ctr(top, 19, 2); ctr(bot, 36, 2); }
+      else        { ctr(top, 28, 2); }
+      snprintf(line, sizeof(line), "%s / %s", bikeModel, bikeOwner);
+      ctr(line, 55, 1);
+      break; }
+
+    case 4: {                                    // speedo: for the look of it
+      const int CX = 64, CY = 50, R = 36;
+      for (int d = 180; d <= 360; d += 2)
+        oled.drawPixel(CX + (int)(R * cosf(d * 0.01745f)),
+                       CY + (int)(R * sinf(d * 0.01745f)), SSD1306_WHITE);
+      for (int i = 0; i <= 6; i++) {             // seven ticks, long every other
         float a = (180 + 30 * i) * 0.01745f;
-        for (int r = R - 4; r <= R; r++)
+        int len = (i & 1) ? 3 : 6;
+        for (int r = R - len; r <= R; r++)
           oled.drawPixel(CX + (int)(r * cosf(a)), CY + (int)(r * sinf(a)), SSD1306_WHITE);
       }
-      float a = (180 + 30 * 4.2f) * 0.01745f;
-      oled.drawLine(CX, CY, CX + (int)(27 * cosf(a)), CY + (int)(27 * sinf(a)), SSD1306_WHITE);
+      float a = (180 + 30 * 4.2f) * 0.01745f;    // parked somewhere believable
+      oled.drawLine(CX, CY, CX + (int)(20 * cosf(a)), CY + (int)(20 * sinf(a)),
+                    SSD1306_WHITE);
       oled.fillCircle(CX, CY, 2, SSD1306_WHITE);
       ctr(bikeModel, 2, 1);
-      ctr(bikePlate, 50, 1);
+      plateBox(18, 51, 92, 13);
+      ctr(bikePlate, 54, 1);
       break; }
 
-    default: {                                   // the plate, large
-      // Thirteen characters will not go across 128 at double size, so
-      // it breaks where a real motorcycle plate breaks: state and
-      // district above, series and number below. It was going to have
-      // to shrink otherwise, and a small big-plate is no plate at all.
-      char top[12] = "", bot[12] = "";
-      const char* sp = strchr(bikePlate, ' ');
-      const char* sp2 = sp ? strchr(sp + 1, ' ') : nullptr;
-      if (sp2) {
-        int n = (int)(sp2 - bikePlate);
-        if (n > 11) n = 11;
-        memcpy(top, bikePlate, n); top[n] = 0;
-        snprintf(bot, sizeof(bot), "%s", sp2 + 1);
-      } else {
-        snprintf(top, sizeof(top), "%s", bikePlate);
-      }
-      plateBox(6, 4, SCRW - 12, bot[0] ? 38 : 24);
-      if (bot[0]) {
-        ctr(top, 9, 2);
-        ctr(bot, 26, 2);
-      } else {
-        ctr(top, 11, 2);
-      }
-      char line[34];
-      snprintf(line, sizeof(line), "%s  %s", bikeModel, bikeOwner);
-      ctr(line, 50, 1);
+    case 5: {                                    // minimal: the plate, nothing else
+      if (bot[0]) { ctr(top, 16, 2); ctr(bot, 36, 2); }
+      else        { ctr(top, 24, 2); }
       break; }
+
+    default: {                                   // plate card: the plate, framed
+      plateBox(6, 2, SCRW - 12, bot[0] ? 38 : 24);
+      if (bot[0]) { ctr(top, 5, 2); ctr(bot, 22, 2); }
+      else        { ctr(top, 9, 2); }
+      ctr(bikeMake, 43, 1);
+      snprintf(line, sizeof(line), "%s  %s", bikeModel, bikeOwner);
+      ctr(line, 53, 1);
+      break; }
+  }
+
+  // Choosing says so, over whatever is underneath, because half of
+  // these fill the screen and a hint drawn politely into a gap would
+  // land on top of a number plate.
+  if (bikeEdit) {
+    char w[24];
+    snprintf(w, sizeof(w), "%d of %d  hold to keep", bikeTry + 1, BIKE_TPL_N);
+    oled.fillRect(0, 53, SCRW, 11, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    ctr(w, 56, 1);
+    oled.setTextColor(SSD1306_WHITE);
   }
   oled.display();
 }
@@ -5010,9 +5221,15 @@ static void setStory(const String& text) {
 // ================================================================
 // One string, pipe separated, the way the tasks are kept. A dozen
 // short lines is not worth a filesystem.
+// Version 2 of the row format, marked as such on the front. Version 1
+// had no id and five fields; guessing which one you are holding from
+// the field count is the kind of thing that works until a reminder
+// contains a separator, so it says which it is instead.
+#define REM_FMT "2\x1e"
 static void saveRems() {
-  String s;
+  String s = REM_FMT;
   for (int i = 0; i < remCount; i++) {
+    s += String(rems[i].id); s += '\x1f';
     s += String(rems[i].at); s += '\x1f';
     s += String(rems[i].first); s += '\x1f';
     s += String(rems[i].tries); s += '\x1f';
@@ -5021,37 +5238,78 @@ static void saveRems() {
     if (i < remCount - 1) s += '\x1e';
   }
   prefs.putString("rems", s);
+  prefs.putUInt("remid", remNextId);
 }
 static void loadRems() {
   remCount = 0;
   String s = prefs.getString("rems", "");
+  remNextId = prefs.getUInt("remid", 1);
   int i = 0;
+  bool v2 = s.startsWith(REM_FMT);
+  if (v2) i = (int)strlen(REM_FMT);
   while (i < (int)s.length() && remCount < REM_MAX) {
     int e = s.indexOf('\x1e', i); if (e < 0) e = s.length();
     String row = s.substring(i, e);
-    int a = row.indexOf('\x1f');
-    int b = a < 0 ? -1 : row.indexOf('\x1f', a + 1);
-    int c = b < 0 ? -1 : row.indexOf('\x1f', b + 1);
-    int g = c < 0 ? -1 : row.indexOf('\x1f', c + 1);
-    if (a > 0 && b > a && c > b && g > c) {
-      rems[remCount].at    = (uint32_t)strtoul(row.substring(0, a).c_str(), nullptr, 10);
-      rems[remCount].first = (uint32_t)strtoul(row.substring(a + 1, b).c_str(), nullptr, 10);
-      rems[remCount].tries = (uint8_t)row.substring(b + 1, c).toInt();
-      rems[remCount].done  = row.substring(c + 1, g) == "1";
-      snprintf(rems[remCount].text, REM_TEXT, "%s", row.substring(g + 1).c_str());
+    Rem& r = rems[remCount];
+    int f[5] = { -1, -1, -1, -1, -1 };          // where each separator is
+    int want = v2 ? 5 : 4, at = -1, ok = 1;
+    for (int k = 0; k < want; k++) {
+      at = row.indexOf('\x1f', at + 1);
+      if (at < 0) { ok = 0; break; }
+      f[k] = at;
+    }
+    if (ok && f[0] > 0) {
+      int k = 0;
+      if (v2) r.id = (uint32_t)strtoul(row.substring(0, f[k++]).c_str(), nullptr, 10);
+      else    r.id = remNextId++;               // a version 1 row, given one now
+      int p0 = v2 ? f[0] + 1 : 0;
+      r.at    = (uint32_t)strtoul(row.substring(p0, f[k]).c_str(), nullptr, 10);
+      r.first = (uint32_t)strtoul(row.substring(f[k] + 1, f[k + 1]).c_str(), nullptr, 10);
+      r.tries = (uint8_t)row.substring(f[k + 1] + 1, f[k + 2]).toInt();
+      r.done  = row.substring(f[k + 2] + 1, f[k + 3]) == "1";
+      snprintf(r.text, REM_TEXT, "%s", row.substring(f[k + 3] + 1).c_str());
+      if (r.id >= remNextId) remNextId = r.id + 1;
       remCount++;
     }
     i = e + 1;
   }
-  Serial.printf("%d reminders remembered\n", remCount);
+  Serial.printf("%d reminders remembered (format %d, next id %lu)\n",
+                remCount, v2 ? 2 : 1, (unsigned long)remNextId);
+}
+// Quotes, backslashes and anything below a space, so a reminder with
+// an apostrophe or a quote mark in it cannot break the response it is
+// being sent in.
+static String jstr(const char* t) {
+  String o = "\"";
+  for (const char* c = t; *c; c++) {
+    if (*c == '"' || *c == '\\') { o += '\\'; o += *c; }
+    else if ((uint8_t)*c < 0x20)   { o += ' '; }
+    else                            o += *c;
+  }
+  o += '"';
+  return o;
+}
+
+// The one with this id, or -1.
+static int remById(uint32_t id) {
+  if (!id) return -1;
+  for (int i = 0; i < remCount; i++) if (rems[i].id == id) return i;
+  return -1;
 }
 // Soonest first, so walking them is walking time.
+//
+// remShowing is an index into this array, so sorting it moves the
+// reminder out from under whatever is pointing at it: answering the
+// card would have marked a different reminder done. The id goes in
+// and comes back out the other side.
 static void sortRems() {
+  uint32_t showId = (remShowing >= 0 && remShowing < remCount) ? rems[remShowing].id : 0;
   for (int i = 1; i < remCount; i++) {
     Rem k = rems[i]; int j = i - 1;
     while (j >= 0 && rems[j].at > k.at) { rems[j + 1] = rems[j]; j--; }
     rems[j + 1] = k;
   }
+  if (showId) remShowing = remById(showId);
 }
 // Returns false when there is no room. The oldest finished one is
 // dropped first, so a full list of done things never blocks a new one.
@@ -5065,6 +5323,11 @@ static bool addRem(const char* text, uint32_t when) {
     remCount--;
   }
   snprintf(rems[remCount].text, REM_TEXT, "%s", text);
+  // The separators are the save format, so a reminder is not allowed
+  // to contain one. Nothing types these; a bad request could send one.
+  for (char* c = rems[remCount].text; *c; c++)
+    if (*c == '\x1e' || *c == '\x1f' || *c == '\n' || *c == '\r') *c = ' ';
+  rems[remCount].id = remNextId++;
   rems[remCount].at = when;
   rems[remCount].first = when;
   rems[remCount].tries = 0;
@@ -5528,6 +5791,7 @@ static void resetSettings() {
   cfgOffline = false; prefs.putBool("offl", cfgOffline);
   cfgBike = false;   prefs.putBool("bike", cfgBike);
   cfgBikeTpl = 0;    prefs.putInt("btpl", cfgBikeTpl);
+  bikeEdit = false;  bikeTry = 0;
   cfgShake = true;   prefs.putBool("shake", cfgShake);
   cfgDeepIdx = 1;    prefs.putInt("deepi", cfgDeepIdx);
   battFull = 4.10f;  prefs.putFloat("bfull", battFull);
@@ -5826,6 +6090,16 @@ static void zikrTick() {
 
 static void startHotspot() {
   if (rescueAP) return;
+  // Asking for the hotspot is asking for the radio, so it says so and
+  // turns the mode back rather than quietly contradicting a setting
+  // you chose. There is no third state where the radio is both off and
+  // serving an access point.
+  if (cfgOffline) {
+    cfgOffline = false;
+    prefs.putBool("offl", cfgOffline);
+    netDown = false; netMisses = 0; netNextTry = 0;
+    flash("NETWORK BACK ON", 1100);
+  }
   WiFi.mode(online() ? WIFI_AP_STA : WIFI_AP);
   WiFi.softAP(RESCUE_SSID, RESCUE_PASS);
   rescueAP = true;
@@ -6078,6 +6352,8 @@ static void knockTwo() {
           netDown = false;
           netNextTry = 0;                   // the task picks it up at once
           WiFi.mode(WIFI_STA);
+          WiFi.setSleep(false);
+          setupWeb();                       // never started if it booted offline
           flash("LOOKING", 1200);
         }
         break;
@@ -6360,15 +6636,21 @@ static void touchGesture(uint8_t g) {
   // always a way out of it.
   if (tapTesting && tapChosen && g == TG_LONG) { tapTesting = false; return; }
 
-  // The vehicle screen has nothing to open, so holding walks the
-  // layouts instead, and holding on the last one comes back to the
-  // first. Four of them: plate, badge, ticket, dial.
+  // The vehicle screen picks its layout the way the clock picks its
+  // time: hold to get into it, press to walk the six, hold again to
+  // keep the one in front of you. Walking them used to happen on a
+  // long press with nothing asked and nothing confirmed, so a layout
+  // changed and stayed changed before you had decided anything.
   if (screen == S_BIKE && depth == 0) {
-    if (g == TG_LONG) {
-      cfgBikeTpl = (cfgBikeTpl + 1) % BIKE_TPL_N;
-      prefs.putInt("btpl", cfgBikeTpl);
-      clickShrink();
-      return;
+    if (!bikeEdit) {
+      if (g == TG_LONG) { bikeEdit = true; bikeTry = cfgBikeTpl; clickShrink(); return; }
+    } else {
+      switch (g) {
+        case TG_ONE:  bikeTry = (bikeTry + 1) % BIKE_TPL_N; return;
+        case TG_LONG: cfgBikeTpl = bikeTry; prefs.putInt("btpl", cfgBikeTpl);
+                      bikeEdit = false; flash("KEPT", 800); return;
+        default:      bikeEdit = false; return;    // two, three: leave it alone
+      }
     }
   }
 
@@ -6639,7 +6921,8 @@ static void input() {
     // nothing has been for a moment.
     bool byHand = touchOn || (now - touchPressAt) < SHAKE_AFTER_MS;
     if (cfgShake && !byHand && !(screen == S_GAMES && depth == 2) && !tapTesting) {
-      if (faceMode) faceMode = false;
+      if (bikeEdit) bikeEdit = false;           // out of the chooser, nothing kept
+      else if (faceMode) faceMode = false;
       else if (depth > 0) { depth--; if (!depth) { itemIdx = 0; subIdx = 0; } }
       else if (screen != S_HOME) { screen = S_HOME; itemIdx = 0; subIdx = 0; }
       Serial.println("shake -> back");
@@ -7011,6 +7294,7 @@ static void apiState() {
   o += "\"bike\":" + String(cfgBike ? "true" : "false") + ",";
   o += "\"btpl\":" + String(cfgBikeTpl) + ",";
   o += "\"plate\":\"" + String(bikePlate) + "\",";
+  o += "\"make\":\"" + String(bikeMake) + "\",";
   o += "\"model\":\"" + String(bikeModel) + "\",";
   o += "\"owner\":\"" + String(bikeOwner) + "\",";
   o += "\"name\":\"" + String(cfgName) + "\",";
@@ -7137,6 +7421,8 @@ static void apiState() {
 }
 
 static void setupWeb() {
+  if (webUp) return;
+  webUp = true;
   web.on("/", HTTP_GET, []() {
     if (!webUiOn) {
       web.send(200, "text/html; charset=utf-8",
@@ -7350,6 +7636,7 @@ static void setupWeb() {
     bool any = false;
     struct { const char* k; char* dst; size_t n; const char* pref; } F[] = {
       { "plate", bikePlate, sizeof(bikePlate), "bplate" },
+      { "make",  bikeMake,  sizeof(bikeMake),  "bmake"  },
       { "model", bikeModel, sizeof(bikeModel), "bmodel" },
       { "owner", bikeOwner, sizeof(bikeOwner), "bowner" },
       { "name",  cfgName,   sizeof(cfgName),   "name"   },
@@ -7362,11 +7649,97 @@ static void setupWeb() {
       prefs.putString(f.pref, f.dst);
       any = true;
     }
-    char o[180];
+    // The template is a number rather than a string, so it is read
+    // here instead of in the table above.
+    if (web.hasArg("tpl")) {
+      cfgBikeTpl = constrain((int)web.arg("tpl").toInt(), 0, BIKE_TPL_N - 1);
+      prefs.putInt("btpl", cfgBikeTpl);
+      bikeEdit = false;
+      any = true;
+    }
+    if (web.hasArg("on")) {
+      cfgBike = web.arg("on") == "1" || web.arg("on") == "true";
+      prefs.putBool("bike", cfgBike);
+      if (!cfgBike && screen == S_BIKE) { screen = S_HOME; bikeEdit = false; }
+      any = true;
+    }
+    char o[240];
     snprintf(o, sizeof(o),
-             "{\"ok\":true,\"changed\":%s,\"plate\":\"%s\",\"model\":\"%s\",\"owner\":\"%s\",\"name\":\"%s\"}",
-             any ? "true" : "false", bikePlate, bikeModel, bikeOwner, cfgName);
+             "{\"ok\":true,\"changed\":%s,\"on\":%s,\"tpl\":%d,\"tpls\":%d,"
+             "\"plate\":\"%s\",\"make\":\"%s\",\"model\":\"%s\",\"owner\":\"%s\",\"name\":\"%s\"}",
+             any ? "true" : "false", cfgBike ? "true" : "false", cfgBikeTpl, BIKE_TPL_N,
+             bikePlate, bikeMake, bikeModel, bikeOwner, cfgName);
     web.send(200, "application/json", o);
+  });
+
+  // What the robot is actually holding, ids and all, so the app can
+  // show the real list rather than only the part of it the app itself
+  // sent. Reminders added by a plain URL show up here too.
+  web.on("/api/rem", HTTP_ANY, []() {
+    if (!guard()) return;
+
+    if (web.arg("list") == "1" || !web.args() ||
+        (!web.hasArg("id") && !web.hasArg("drop"))) {
+      String o = "{\"ok\":true,\"waiting\":" + String(remPending()) +
+                 ",\"clock\":" + String(timeOk ? "true" : "false") +
+                 ",\"rems\":[";
+      for (int i = 0; i < remCount; i++) {
+        if (i) o += ',';
+        o += "{\"id\":" + String(rems[i].id) +
+             ",\"at\":" + String(rems[i].at) +
+             ",\"first\":" + String(rems[i].first) +
+             ",\"tries\":" + String(rems[i].tries) +
+             ",\"done\":" + String(rems[i].done ? "true" : "false") +
+             ",\"text\":" + jstr(rems[i].text) + "}";
+      }
+      o += "]}";
+      web.send(200, "application/json", o);
+      return;
+    }
+
+    uint32_t id = (uint32_t)strtoul(web.arg("id").c_str(), nullptr, 10);
+    int i = remById(id);
+    if (i < 0) { web.send(404, "application/json", "{\"ok\":false,\"why\":\"no such id\"}"); return; }
+
+    if (web.arg("drop") == "1") {
+      for (int k = i; k < remCount - 1; k++) rems[k] = rems[k + 1];
+      remCount--;
+      if (remIdx > remCount) remIdx = remCount;
+      if (remShowing == i) { remShowing = -1; toastUntil = 0; }
+      else if (remShowing > i) remShowing--;
+      saveRems();
+      web.send(200, "application/json",
+               "{\"ok\":true,\"dropped\":" + String(id) +
+               ",\"waiting\":" + String(remPending()) + "}");
+      return;
+    }
+
+    if (web.hasArg("text")) {
+      String t = web.arg("text"); t.trim();
+      if (t.length()) {
+        snprintf(rems[i].text, REM_TEXT, "%s", t.c_str());
+        for (char* c = rems[i].text; *c; c++)
+          if (*c == '\x1e' || *c == '\x1f' || *c == '\n' || *c == '\r') *c = ' ';
+      }
+    }
+    if (web.hasArg("at")) {
+      uint32_t at = (uint32_t)strtoul(web.arg("at").c_str(), nullptr, 10);
+      if (at) {
+        // A new time is a fresh start: the ladder it had climbed was
+        // for the old one, and keeping the tries would have it give up
+        // after one nudge at a time you have only just set.
+        rems[i].at = at;
+        rems[i].first = at;
+        rems[i].tries = 0;
+        rems[i].done = false;
+      }
+    }
+    if (web.hasArg("done")) rems[i].done = web.arg("done") == "1";
+    sortRems();
+    saveRems();
+    web.send(200, "application/json",
+             "{\"ok\":true,\"id\":" + String(id) +
+             ",\"waiting\":" + String(remPending()) + "}");
   });
 
   web.on("/api/rems", HTTP_ANY, []() {
@@ -7566,7 +7939,8 @@ static void setupWeb() {
     else if (k == "btpl") { cfgBikeTpl  = constrain(v, 0, BIKE_TPL_N - 1); prefs.putInt("btpl", cfgBikeTpl); }
     else if (k == "offl") { cfgOffline  = (v != 0);                      prefs.putBool("offl", cfgOffline);
                             if (cfgOffline) { WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF); }
-                            else { netDown = false; netMisses = 0; netNextTry = 0; WiFi.mode(WIFI_STA); } }
+                            else { netDown = false; netMisses = 0; netNextTry = 0;
+                                   WiFi.mode(WIFI_STA); WiFi.setSleep(false); setupWeb(); } }
     else if (k == "hadj") { cfgHijriAdj = constrain(v, -2, 2);           prefs.putInt("hadj", cfgHijriAdj); }
     else if (k == "shake"){ cfgShake    = (v != 0);                      prefs.putBool("shake", cfgShake); }
     else if (k == "deepi"){ cfgDeepIdx  = constrain(v, 0, DEEP_N - 1);   prefs.putInt("deepi", cfgDeepIdx); }
@@ -8120,6 +8494,7 @@ void setup() {
   cfgBikeTpl  = constrain(prefs.getInt("btpl", 0), 0, BIKE_TPL_N - 1);
   { String s;
     s = prefs.getString("bplate", "KA 50 HJ 5683"); snprintf(bikePlate, sizeof(bikePlate), "%s", s.c_str());
+    s = prefs.getString("bmake", "Royal Enfield"); snprintf(bikeMake, sizeof(bikeMake), "%s", s.c_str());
     s = prefs.getString("bmodel", "Meteor 350");    snprintf(bikeModel, sizeof(bikeModel), "%s", s.c_str());
     s = prefs.getString("bowner", "Ahmed");         snprintf(bikeOwner, sizeof(bikeOwner), "%s", s.c_str());
     s = prefs.getString("name",   "Ahmed");         snprintf(cfgName,   sizeof(cfgName),   "%s", s.c_str()); }
@@ -8200,23 +8575,54 @@ void setup() {
   Serial.printf("INT1 %s\n", intWired ? "wired, it can switch off" : "not wired, screen off only");
   if (!fromDeep) animSenses(1500);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  loadNets();
-  // Work down the list. Whichever answers first is the one it stays on,
-  // so put the one you are usually near at the top.
-  for (int i = 0; i < netCount && !online(); i++) {
-    WiFi.begin(netSsid[i], netPass[i]);
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 7000) {
-      animWifiFrame();
-      delay(40);
+  // Off means off, from here and not from a few lines later. Setting
+  // the mode at all brings the radio up, so when you have said stay
+  // off, none of this runs: no mode, no scan, no join, no web server
+  // and no Mac. Previously the setting was read before this point and
+  // then ignored by it, so a board told to stay offline still woke up,
+  // powered the radio, worked down the whole list of networks and only
+  // then went quiet. That is not off, that is off afterwards.
+  // The clock runs through deep sleep and the system time comes back
+  // with it, so ask the board what time it thinks it is before
+  // deciding it does not know. Without this, waking offline meant a
+  // board with a perfectly good clock calling itself clockless, and
+  // everything downstream of timeOk went quiet with it: no reminders
+  // fired, no prayer alerts fired, and the home screen refused to say
+  // the time it was holding. A cold start reads 1970 and fails this
+  // on its own, which is the case where saying nothing is right.
+  {
+    struct tm t0;
+    if (getLocalTime(&t0, 0) && t0.tm_year > 123) {   // past 2023, so it is real
+      timeOk = true;
+      clockSrc = "kept through sleep";
+      Serial.println("clock survived: reminders and prayer times still stand");
     }
-    if (online()) { netUsing = i; cfgSsid = String(netSsid[i]); }
   }
-  netTrying = netUsing < 0 ? 0 : netUsing;
 
-  setupWeb();
+  loadNets();
+  if (cfgOffline) {
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_OFF);
+    btStop();                        // nothing uses it; make sure nothing can
+    netUsing = -1; netTrying = 0;
+    Serial.println("offline by choice: radio stays down");
+  } else {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    // Work down the list. Whichever answers first is the one it stays on,
+    // so put the one you are usually near at the top.
+    for (int i = 0; i < netCount && !online(); i++) {
+      WiFi.begin(netSsid[i], netPass[i]);
+      unsigned long t0 = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 7000) {
+        animWifiFrame();
+        delay(40);
+      }
+      if (online()) { netUsing = i; cfgSsid = String(netSsid[i]); }
+    }
+    netTrying = netUsing < 0 ? 0 : netUsing;
+    setupWeb();
+  }
 
   if (online()) {
     restingFace("Connected", 700);
@@ -8231,7 +8637,7 @@ void setup() {
       restingFace(timeOk ? "Clock set" : "Clock still coming", 700);
       nameCard();
     }
-  } else if (!fromDeep) {
+  } else if (!fromDeep && !cfgOffline) {
     offlineWelcome();
   }
 
@@ -8638,28 +9044,7 @@ void loop() {
     }
     // Only ever past five seconds, so it costs ordinary use nothing and
     // the one time it appears is the one time you want telling.
-    if (touchHold) {
-      char w[26]; const char* under = nullptr;
-      if (touchHold == 2) {
-        uint32_t held = now - touchPressAt;
-        uint32_t gone = held - TOUCH_SLEEP_MS;
-        int left = (int)((TOUCH_COUNT_MS - (gone > TOUCH_COUNT_MS ? TOUCH_COUNT_MS : gone)
-                          + 999) / 1000);
-        if (left < 1) left = 1;
-        snprintf(w, sizeof(w), "SLEEPING IN %d", left);
-        under = "let go to stop it";
-      } else {
-        snprintf(w, sizeof(w), "KEEP HOLDING: HOME");
-      }
-      int bw = (int)strlen(w) * 6 + 8;
-      int bx = (SCRW - bw) / 2;
-      int bh = under ? 24 : 13;
-      oled.fillRect(bx, 24, bw, bh, SSD1306_BLACK);
-      oled.drawRect(bx, 24, bw, bh, SSD1306_WHITE);
-      at(bx + 4, 27, w);
-      if (under) ctr(under, 38, 1);
-      oled.display();
-    }
+    if (touchHold) { drawHoldTier(now - touchPressAt); oled.display(); }
   }
   delay(2);
 }
