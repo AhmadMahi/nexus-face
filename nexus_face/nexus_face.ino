@@ -190,7 +190,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "4.2.0"
+#define FW_VERSION "4.3.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -289,17 +289,24 @@ const char* HIJRI_LATIN[12] = {
 //  first the day it was for, so a thing from Tuesday stops asking on
 //        Wednesday rather than following you around for ever
 //  done  you held the pad on it, and it is finished
-struct Rem { char text[REM_TEXT]; uint32_t at; uint32_t first; bool done; };
-// Ignored, it comes back in half an hour. Waved away with a press, it
-// comes back in fifteen minutes, because a press means "not now" and
-// saying nothing means you were not there to say anything.
-#define REM_IGNORED_MS 1800UL
-#define REM_WAVED_MS    900UL
+struct Rem { char text[REM_TEXT]; uint32_t at; uint32_t first; uint8_t tries; bool done; };
+
+// Ignoring it gets you asked again, and the gaps grow. Three quick
+// ones in case you were simply looking the other way, then it backs
+// off, and after the last of them it stops rather than following you
+// round the house all evening.
+const uint16_t REM_LADDER[] = { 5, 5, 5, 30, 30, 60, 60 };
+#define REM_STEPS (sizeof(REM_LADDER) / sizeof(REM_LADDER[0]))
+// A press is different. It means "I have seen it, not now", so it comes
+// back sooner and does not count against the ladder: you can keep
+// saying not now for as long as you like.
+#define REM_WAVED_MIN 15
 Rem  rems[REM_MAX];
 int  remCount = 0;
 int  remIdx = 0;                   // which one is being read
 uint32_t remCheck = 0;
 int  remShowing = -1;              // the one on screen, or none
+bool remWokeIt = false;            // it was asleep, and this is why it is not
 bool remConfirm = false;           // on the clear-them-all question
 bool remYes = false;
 
@@ -4784,6 +4791,7 @@ static void saveRems() {
   for (int i = 0; i < remCount; i++) {
     s += String(rems[i].at); s += '\x1f';
     s += String(rems[i].first); s += '\x1f';
+    s += String(rems[i].tries); s += '\x1f';
     s += (rems[i].done ? '1' : '0'); s += '\x1f';
     s += rems[i].text;
     if (i < remCount - 1) s += '\x1e';
@@ -4800,11 +4808,13 @@ static void loadRems() {
     int a = row.indexOf('\x1f');
     int b = a < 0 ? -1 : row.indexOf('\x1f', a + 1);
     int c = b < 0 ? -1 : row.indexOf('\x1f', b + 1);
-    if (a > 0 && b > a && c > b) {
+    int g = c < 0 ? -1 : row.indexOf('\x1f', c + 1);
+    if (a > 0 && b > a && c > b && g > c) {
       rems[remCount].at    = (uint32_t)strtoul(row.substring(0, a).c_str(), nullptr, 10);
       rems[remCount].first = (uint32_t)strtoul(row.substring(a + 1, b).c_str(), nullptr, 10);
-      rems[remCount].done  = row.substring(b + 1, c) == "1";
-      snprintf(rems[remCount].text, REM_TEXT, "%s", row.substring(c + 1).c_str());
+      rems[remCount].tries = (uint8_t)row.substring(b + 1, c).toInt();
+      rems[remCount].done  = row.substring(c + 1, g) == "1";
+      snprintf(rems[remCount].text, REM_TEXT, "%s", row.substring(g + 1).c_str());
       remCount++;
     }
     i = e + 1;
@@ -4833,6 +4843,7 @@ static bool addRem(const char* text, uint32_t when) {
   snprintf(rems[remCount].text, REM_TEXT, "%s", text);
   rems[remCount].at = when;
   rems[remCount].first = when;
+  rems[remCount].tries = 0;
   rems[remCount].done = false;
   remCount++;
   return true;
@@ -5603,14 +5614,22 @@ static void knockOne() {
   if (canvasUntil) { canvasUntil = 0;    return; }
   if (toastUntil)  {
     // Waved away. That is "not now" rather than "done", so it comes
-    // back, and sooner than if you had said nothing at all.
+    // back in a quarter of an hour, and it does not count against the
+    // ladder: you may keep saying not now for as long as you like.
+    //
+    // And if this is what woke it up, it goes straight back. You were
+    // asleep, it asked, you said later; there is nothing else here for
+    // it to be awake for.
     if (remShowing >= 0 && remShowing < remCount && !rems[remShowing].done) {
-      rems[remShowing].at = (uint32_t)time(nullptr) + REM_WAVED_MS;
+      rems[remShowing].at = (uint32_t)time(nullptr) + REM_WAVED_MIN * 60UL;
       saveRems();
       Serial.println("reminder waved away, back in fifteen minutes");
     }
-    remShowing = -1;
-    toastUntil = 0; toastText = ""; toastKind = ""; return;
+    bool back = remWokeIt && !macLinked;
+    remShowing = -1; remWokeIt = false;
+    toastUntil = 0; toastText = ""; toastKind = "";
+    if (back) wantDeep = true;
+    return;
   }
   if (depth == 0) {
     screen = (screen + 1) % S_COUNT;
@@ -6053,9 +6072,13 @@ static void touchGesture(uint8_t g) {
   if (toastUntil && toastKind == "remind" && remShowing >= 0) {
     if (g == TG_LONG) {
       if (remShowing < remCount) { rems[remShowing].done = true; saveRems(); }
-      remShowing = -1;
+      bool back = remWokeIt && !macLinked;
+      remShowing = -1; remWokeIt = false;
       toastUntil = 0; toastText = ""; toastKind = "";
       flash("DONE", 900);
+      // Same again: if this is the only reason it is awake, finishing
+      // it is the only reason it needed to be.
+      if (back) wantDeep = true;
       return;
     }
     // anything else falls through, and a single press waves it away
@@ -6871,7 +6894,13 @@ static void setupWeb() {
   //   POST or GET  /api/remind
   //     text  what to be reminded of          (required)
   //     at    "HH:MM", 24 hour                (optional)
+  //     in    minutes from now                (optional)
   //     d     "YYYY-MM-DD"                    (optional, today)
+  //     t     the pairing token               (when the lock is on)
+  //
+  //  GET as well as POST, and the token as a parameter, so the whole
+  //  thing fits in an address bar. Somebody wanting to be reminded in
+  //  forty minutes should be able to type it, not compose a request.
   //
   //  Deliberately not "t" for the text: authed() already reads "t" as
   //  the pairing token, so a reminder sent that way would be checked
@@ -6918,6 +6947,32 @@ static void setupWeb() {
 
     int added = 0;
     uint32_t firstAt = 0;
+
+    // "in" wins where both are given, because it is the more specific
+    // thing to have asked for.
+    String rel = web.hasArg("in") ? web.arg("in") : "";
+    if (rel.length()) {
+      long mins = rel.toInt();
+      if (mins < 0 || mins > 60 * 24 * 30) {
+        web.send(400, "application/json",
+                 "{\"ok\":false,\"err\":\"in must be minutes, up to a month\"}");
+        return;
+      }
+      firstAt = (uint32_t)time(nullptr) + (uint32_t)mins * 60UL;
+      if (addRem(txt.c_str(), firstAt)) added = 1;
+      if (!added) {
+        web.send(507, "application/json", "{\"ok\":false,\"err\":\"no room, clear some first\"}");
+        return;
+      }
+      sortRems(); saveRems();
+      char o[120];
+      snprintf(o, sizeof(o), "{\"ok\":true,\"added\":1,\"at\":%lu,\"waiting\":%d}",
+               (unsigned long)firstAt, remPending());
+      web.send(200, "application/json", o);
+      Serial.printf("reminder in %ld min: %s\n", mins, txt.c_str());
+      return;
+    }
+
     int colon = ts.indexOf(':');
     if (colon > 0) {
       int hh = ts.substring(0, colon).toInt();
@@ -6973,6 +7028,7 @@ static void setupWeb() {
       rems[remCount].at = at;
       rems[remCount].done = web.arg(kd) == "1";
       rems[remCount].first = at;
+      rems[remCount].tries = 0;
       snprintf(rems[remCount].text, REM_TEXT, "%s", web.arg(kt).c_str());
       remCount++;
     }
@@ -7358,6 +7414,11 @@ static void setupWeb() {
   web.on("/api/update", HTTP_POST, []() {
     if (!guard()) return;
     web.send(200, "application/json", "{\"ok\":true}");
+    // Wake the panel first. Asked from the Mac while the screen was
+    // off, this used to fetch and flash a whole firmware in the dark
+    // and come back on afterwards as though nothing had happened,
+    // which is an alarming way to find out your robot has restarted.
+    wake("update");
     delay(200); runUpdate();
   });
   web.on("/api/reboot", HTTP_POST, []() {
@@ -7926,6 +7987,7 @@ void loop() {
           rems[i].done = true; saveRems(); continue;
         }
       }
+      remWokeIt = asleep;            // so answering it can send it back
       wake("reminder");
       toastKind = "remind";
       toastText = rems[i].text;
@@ -8096,13 +8158,24 @@ void loop() {
   }
   if (toastUntil && now >= toastUntil) {
     toastUntil = 0; toastText = ""; toastKind = "";
-    // Nobody said anything, so nobody was there. Half an hour.
+    // Nobody said anything, so nobody was there. Ask again, a little
+    // further off each time, and give up after the last step rather
+    // than asking all evening.
     if (remShowing >= 0 && remShowing < remCount && !rems[remShowing].done) {
-      rems[remShowing].at = (uint32_t)time(nullptr) + REM_IGNORED_MS;
+      Rem& r = rems[remShowing];
+      if (r.tries >= REM_STEPS) {
+        r.done = true;
+        Serial.println("reminder asked all it is going to, letting it go");
+      } else {
+        uint16_t mins = REM_LADDER[r.tries++];
+        r.at = (uint32_t)time(nullptr) + (uint32_t)mins * 60UL;
+        Serial.printf("reminder ignored, back in %u min (%u of %u)\n",
+                      mins, r.tries, (unsigned)REM_STEPS);
+      }
       saveRems();
-      Serial.println("reminder ignored, back in half an hour");
     }
     remShowing = -1;
+    remWokeIt = false;
   }
   if (canvasUntil && now < canvasUntil) {
     lastActive = now;
