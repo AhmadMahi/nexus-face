@@ -259,7 +259,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.10.0"
+#define FW_VERSION "5.11.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -838,6 +838,40 @@ unsigned long relaxNext = 0;
 //  because another is a tenth of a second behind.
 WiFiUDP cursorUdp;
 #define CURSOR_PORT 4210
+
+// ---------------- gesture mode ----------------
+//
+//  Switched on from the Mac. While it is on the pad stops driving the
+//  robot and starts driving the Mac: one press and two presses are
+//  sent straight across and Rafiq decides what they mean, which may
+//  be different in every application you have in front of you.
+//
+//  It is not remembered anywhere. There is nothing it can usefully do
+//  without a Mac on the other end, so it comes up off, the app turns
+//  it on when it finds the robot, and it turns itself off the moment
+//  the Mac goes quiet. Quitting Rafiq is therefore enough to get your
+//  robot back, and so is holding the pad.
+bool      cfgGesture = false;
+bool      gestMuted  = false;        // what Rafiq says the mic is doing
+IPAddress macAddr;                   // learned from the app's own calls
+WiFiUDP   tapUdp;
+#define TAP_PORT 4211
+// Presses are sent, not polled for. The Mac asks the robot how it is
+// every ten seconds, which is fine for "are you there" and useless
+// for a press: you would tap and wait. This goes the other way and
+// arrives in the time it takes a packet to cross the room.
+static void sendTap(const char* what) {
+  if (!cfgGesture || !macLinked || !online() || macAddr == IPAddress()) return;
+  // The token goes with it. A packet that moves your pointer and
+  // presses your keys is a packet anyone on the network could send,
+  // so Rafiq checks both who it came from and that it knew the word.
+  tapUdp.beginPacket(macAddr, TAP_PORT);
+  tapUdp.print(cfgTok);
+  tapUdp.print(' ');
+  tapUdp.print(what);
+  tapUdp.endPacket();
+  Serial.printf("gesture %s -> %s\n", what, macAddr.toString().c_str());
+}
 float curX = 0, curY = 0;              // -1 to 1, where the pointer sits
 unsigned long curUntil = 0;            // tracking lapses if the Mac goes quiet
 bool cfgFollow = false;
@@ -2426,6 +2460,49 @@ static void drawHoldTier(uint32_t now) {
                                       WAKE_NAME[cfgWakeIdx]);
   else                       snprintf(back, sizeof(back), "touch to wake me");
   ctr(back, 55, 1);
+}
+
+// Gesture mode, on screen.
+//
+//  Almost nothing, on purpose. The robot is not the thing you are
+//  looking at while this is on, and a lit panel on a desk you are
+//  working at is a distraction and a drain. A line to say what it is
+//  and a line to say how to stop.
+//
+//  Except when you are on a call. Then the mic is the only thing
+//  worth saying and it is said as large as it will go, because the
+//  question "am I muted" is one you want answered from across the
+//  room without touching anything.
+static void drawGesture() {
+  oled.clearDisplay();
+
+  if (busyMic || busyCam) {
+    // A capsule on a stand, down the left, with the word beside it
+    // rather than under it. Centred, the word at double height and
+    // the line telling you what to press ran into each other.
+    const int cx = 30;
+    oled.fillRoundRect(cx - 7, 6, 15, 21, 7, SSD1306_WHITE);
+    // The cradle goes under the capsule, which means angles measured
+    // downwards: the first version swept the top and showed as two
+    // stubs poking out of its sides.
+    for (int a = 20; a <= 160; a += 3)
+      oled.drawPixel(cx + (int)(13 * cosf(a * 0.01745f)),
+                     24 + (int)(13 * sinf(a * 0.01745f)), SSD1306_WHITE);
+    oled.drawFastVLine(cx, 37, 6, SSD1306_WHITE);
+    oled.drawFastHLine(cx - 7, 43, 15, SSD1306_WHITE);
+    if (gestMuted)
+      for (int i = -1; i <= 1; i++)
+        oled.drawLine(cx - 16 + i, 2, cx + 16 + i, 46, SSD1306_WHITE);
+    at(54, 12, gestMuted ? "MUTED" : "LIVE", 2);
+    at(54, 34, gestMuted ? "2 unmutes" : "1 mutes", 1);
+    oled.display();
+    return;
+  }
+
+  ctr("gesture mode", 24, 1);
+  ctr("the pad is your Mac", 36, 1);
+  ctr("hold 4s to stop", 52, 1);
+  oled.display();
 }
 
 // A bell, drawn to the same weight as the gear so the carousel looks
@@ -6291,6 +6368,7 @@ static bool authed() {
 static void sawMac() {
   if (web.header("X-Rafiq-App") != "1") return;
   macSeen = millis();
+  macAddr = web.client().remoteIP();         // where to send presses back to
   if (!macLinked) {
     macLinked = true;
     linkCardJoin = true;
@@ -6961,6 +7039,17 @@ static void remAddedCard(int n, uint32_t when) {
 static void touchGesture(uint8_t g) {
   lastActive = millis();
 
+  // Gesture mode, before anything that navigates. One press and two
+  // are the Mac's now; three and a long press are ignored rather
+  // than falling through to the carousel, because the carousel is
+  // not what you are looking at. Holding for four seconds is the way
+  // out and is handled with the other long holds.
+  if (cfgGesture) {
+    if (g == TG_ONE) sendTap("1");
+    else if (g == TG_TWO) sendTap("2");
+    return;
+  }
+
   // The update screen, first, because while it is up it owns the
   // panel and returns from loop() before anything else draws.
   //
@@ -7231,7 +7320,16 @@ static void input() {
       // Four seconds. It goes home right now, not when you let go,
       // and the decision is made. Going home first means switching
       // off finds you there.
-      if (!sleepArmed && held >= TOUCH_HOME_MS) {
+      // In gesture mode the long hold is the way back to being a
+      // robot, not the way to switch one off. Switching off is still
+      // there once you have stopped.
+      if (cfgGesture && held >= TOUCH_HOME_MS) {
+        cfgGesture = false;
+        touchLongDone = true; touchTaps = 0;
+        flash("GESTURE OFF", 1100);
+        Serial.println("held to four in gesture mode: back to being a robot");
+      }
+      if (!cfgGesture && !sleepArmed && held >= TOUCH_HOME_MS) {
         sleepArmed = now;
         screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; faceMode = false;
         upState = U_OFF; swOn = false; swRun = false;
@@ -7713,6 +7811,7 @@ static void apiState() {
   o += "\"shake\":" + String(cfgShake ? "true" : "false") + ",";
   o += "\"back\":" + String(cfgBack) + ",";
   o += "\"wakeh\":" + String(cfgWakeIdx) + ",";
+  o += "\"gesture\":" + String(cfgGesture ? "true" : "false") + ",";
   o += "\"wakehName\":\"" + String(WAKE_NAME[cfgWakeIdx]) + "\",";
   o += "\"backName\":\"" + String(BACK_NAME[cfgBack]) + "\",";
   o += "\"hadj\":" + String(cfgHijriAdj) + ",";
@@ -7900,6 +7999,7 @@ static void setupWeb() {
     cfgTok = ""; cfgLock = false;
     prefs.remove("tok"); prefs.putBool("lock", false);
     macLinked = false; webUiOn = true;
+    cfgGesture = false;
     okJson();
   });
 
@@ -8282,6 +8382,9 @@ static void setupWeb() {
     bool c = web.arg("cam").toInt() != 0, m = web.arg("mic").toInt() != 0;
     if ((c || m) && !(busyCam || busyMic)) { busyAt = millis(); wake("live"); }
     busyCam = c; busyMic = m;
+    // Whether Rafiq has it muted, so the robot can say so across the
+    // desk. Knowing at a glance is worth more than the press.
+    if (web.hasArg("muted")) gestMuted = web.arg("muted").toInt() != 0;
     okJson();
   });
   // How hard a knock has to be. Set from the app or the page, so a
@@ -8372,6 +8475,8 @@ static void setupWeb() {
     else if (k == "shake"){ cfgBack = v ? BACK_BOTH : BACK_KNOCK;        prefs.putInt("back", cfgBack); }
     else if (k == "back") { cfgBack = constrain(v, 0, BACK_N - 1);       prefs.putInt("back", cfgBack); }
     else if (k == "wakeh"){ cfgWakeIdx = constrain(v, 0, WAKE_N - 1);    prefs.putInt("wakeh", cfgWakeIdx); }
+    // Not written to flash. See cfgGesture: it belongs to the Mac.
+    else if (k == "gest") { cfgGesture = (v != 0); if (cfgGesture) wake("gesture"); }
     else if (k == "deepi"){ cfgDeepIdx  = constrain(v, 0, DEEP_N - 1);   prefs.putInt("deepi", cfgDeepIdx); }
     // Sent in hundredths, because the form only carries whole numbers.
     else if (k == "bfull"){ battFull    = constrain(v / 100.0f, 3.90f, 4.30f); prefs.putFloat("bfull", battFull); }
@@ -8402,6 +8507,7 @@ static void setupWeb() {
   web.on("/api/bye", HTTP_POST, []() {
     if (!guard()) return;
     macLinked = false;
+    cfgGesture = false;                        // nothing to send presses to
     macSeen = 0;
     linkCardJoin = false;
     linkCardUntil = millis() + 1400;
@@ -9199,6 +9305,7 @@ void loop() {
   // carries on without it.
   if (macLinked && (now - macSeen) > MAC_GONE_MS) {
     macLinked = false;
+    cfgGesture = false;                        // nothing to send presses to
     linkCardJoin = false;
     linkCardUntil = now + 1400;
     relaxOn = false; curUntil = 0; canvasUntil = 0;
@@ -9532,6 +9639,15 @@ void loop() {
     lastActive = now;
     serviceGame();
     if (now - lastDraw >= 33) { lastDraw = now; drawGames(); }
+    delay(2);
+    return;
+  }
+
+  // Gesture mode takes the panel the way the update screen does.
+  // Nothing underneath it is being driven by the pad any more, so
+  // drawing it would only be showing you a menu you cannot use.
+  if (cfgGesture) {
+    if (now - lastDraw >= 150) { lastDraw = now; drawGesture(); }
     delay(2);
     return;
   }
