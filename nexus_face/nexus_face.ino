@@ -259,7 +259,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.11.0"
+#define FW_VERSION "5.12.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -856,6 +856,9 @@ bool      gestMuted  = false;        // what Rafiq says the mic is doing
 IPAddress macAddr;                   // learned from the app's own calls
 WiFiUDP   tapUdp;
 #define TAP_PORT 4211
+// How long the panel stays lit in gesture mode before it rests. The
+// sleep setting is about a robot you are looking at; this is not one.
+#define GESTURE_DARK_MS 10000UL
 // Presses are sent, not polled for. The Mac asks the robot how it is
 // every ten seconds, which is fine for "are you there" and useless
 // for a press: you would tap and wait. This goes the other way and
@@ -6298,7 +6301,12 @@ static void wake(const char* why) {
   screenPower(true);
   eyes.setAutoblinker(ON, 7, 5); eyes.setIdleMode(ON, 5, 4);
   applyEyes(cfgEyes); eyes.open();
-  for (int i = 0; i < 18; i++) { eyesFrame(); delay(16); }
+  // In gesture mode the eyes do not open for you. It is a knock
+  // sensor on a desk, and three hundred milliseconds of animation
+  // between your knock and your Mac is three hundred milliseconds
+  // of nothing useful.
+  if (!cfgGesture)
+    for (int i = 0; i < 18; i++) { eyesFrame(); delay(16); }
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
   navLatch = true;                     // the lean that woke it is not also a command
   upSince = 0; upConsumed = false;
@@ -7039,16 +7047,16 @@ static void remAddedCard(int n, uint32_t when) {
 static void touchGesture(uint8_t g) {
   lastActive = millis();
 
-  // Gesture mode, before anything that navigates. One press and two
-  // are the Mac's now; three and a long press are ignored rather
-  // than falling through to the carousel, because the carousel is
-  // not what you are looking at. Holding for four seconds is the way
-  // out and is handled with the other long holds.
-  if (cfgGesture) {
-    if (g == TG_ONE) sendTap("1");
-    else if (g == TG_TWO) sendTap("2");
-    return;
-  }
+  // Gesture mode is driven by knocking the desk, not by the pad, so
+  // the pad does nothing here at all beyond the four second hold
+  // that gets you out, which is handled with the other long holds.
+  //
+  // It used to send from here as well as from the knock, which is a
+  // double send waiting to happen: pressing a pad glued to a small
+  // light robot knocks the robot. The same jolt that the shake
+  // handler had to be taught to ignore would have arrived at your
+  // Mac as a second tap.
+  if (cfgGesture) return;
 
   // The update screen, first, because while it is up it owns the
   // panel and returns from loop() before anything else draws.
@@ -7214,10 +7222,20 @@ static void settleBurst() {
   // Knocking is off unless you switch it on. The burst is still counted
   // up to here so that turning it on takes effect at once, and so the
   // counters on the vitals face keep telling the truth.
-  if (!cfgKnock && !tapTesting) { burst = 0; return; }
+  // Knocking is off unless you switch it on, except in gesture mode,
+  // where knocking IS the mode: tapping the desk next to the robot is
+  // how you drive it.
+  if (!cfgKnock && !tapTesting && !cfgGesture) { burst = 0; return; }
   if (burst < 4 && millis() - burstStart < TAP_WINDOW_MS) return;   // four is all there is
   uint8_t n = burst;
   burst = 0;
+  // Gesture mode takes them before anything else and sends them on.
+  // One knock and two, which is all the Mac has anything to do with.
+  if (cfgGesture) {
+    if (n == 1) sendTap("1");
+    else if (n == 2) sendTap("2");
+    return;
+  }
   if (upState != U_OFF) {
     updateKnock(n);
     lastActive = millis();
@@ -7408,10 +7426,13 @@ static void input() {
     }
     if (s & INT_TAP1) {
       if (tapTesting) { tapSeen++; tapLastSeen = now; }
-      wake("knock");
+      // In gesture mode a knock is the whole point and waking is not.
+      // The robot sits dark on the desk and the knock goes straight
+      // to the Mac; opening its eyes first would cost the battery and
+      // put a lit panel next to you for no reason.
+      if (!cfgGesture) { wake("knock"); lastActive = now; }
       if (!burst) burstStart = now;
       if (burst < 4) burst++;
-      lastActive = now;
     }
   }
   settleBurst();
@@ -7494,7 +7515,15 @@ static void input() {
       now - lastActive > (fuse - 5) * 1000UL && screen != S_HOME) {
     screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
   }
-  if (fuse && now - lastActive > fuse * 1000UL) goSleep();   // 0 means never
+  // Gesture mode rests dark and quickly. There is nothing on that
+  // screen to look at, the knock does not need it, and a lit panel on
+  // a desk you are working at is a drain and a distraction. Ten
+  // seconds, whatever the sleep setting says, because the setting is
+  // about a robot you are using and this is not one.
+  if (cfgGesture) {
+    if (!asleep && now - lastActive > GESTURE_DARK_MS) goSleep();
+  }
+  else if (fuse && now - lastActive > fuse * 1000UL) goSleep();   // 0 means never
 }
 
 // ================================================================
@@ -9492,9 +9521,13 @@ void loop() {
   // switch off altogether. A Mac on the other end counts as somebody
   // listening: disconnect in Rafiq and the clock starts, reconnect and
   // it never goes past a dark screen.
+  // Switching off in gesture mode would take the mode with it and
+  // leave the Mac tapping at nothing, so it does not happen. Dark,
+  // yes. Off, no.
+  if (wantDeep && cfgGesture) wantDeep = false;
   if (wantDeep) {
     // Asked for, by holding the pad or by the Mac letting go. No
-    // conditions: if you held it for ten seconds you meant it.
+    // conditions: if you held it for four seconds you meant it.
     wantDeep = false;
     goDeep();
   }
@@ -9507,7 +9540,7 @@ void loop() {
   // On the network it keeps the two apart, because dropping the Mac
   // mid sentence to save a little current is a poor trade.
   uint32_t wait = offlineNow() ? 0 : deepAfterMs();
-  if (!deepOff && (offlineNow() || deepAfterMs()) && asleep && !sessionRunning() &&
+  if (!deepOff && !cfgGesture && (offlineNow() || deepAfterMs()) && asleep && !sessionRunning() &&
       !macLinked && (now - sleptAt) > wait && upState == U_OFF && !storyBusy) {
     goDeep();
   }
