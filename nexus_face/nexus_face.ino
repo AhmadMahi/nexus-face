@@ -259,7 +259,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.9.0"
+#define FW_VERSION "5.10.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -896,6 +896,9 @@ bool webUp = false;
 static void setupWeb();
 unsigned long lastActive = 0, lastDraw = 0, lastPoll = 0, reactUntil = 0, lastShake = 0;
 unsigned long nextTimeTry = 0, swStart = 0, inputMuteUntil = 0;
+// Zero, so the first pass through the loop that has a network asks.
+unsigned long nextResync = 0;
+#define TIME_RESYNC_MS (6UL * 3600000UL)
 unsigned long lastLowG = 0, lastFallAt = 0;
 float refAx = 0, refAy = 0, refAz = 1;
 unsigned long steadySince = 0;
@@ -2415,7 +2418,14 @@ static void drawHoldTier(uint32_t now) {
   ringArc(CX, CY, R, left);
   ctr(n, 21, 3);
 
-  ctr("let go to stay", 55, 1);
+  // Not "let go to stay": letting go does nothing now, and the pad
+  // may let go on its own anyway. What is worth saying is how to get
+  // it back, which depends on what the wake setting is.
+  char back[24];
+  if (WAKE_OPTS[cfgWakeIdx]) snprintf(back, sizeof(back), "hold %s to wake me",
+                                      WAKE_NAME[cfgWakeIdx]);
+  else                       snprintf(back, sizeof(back), "touch to wake me");
+  ctr(back, 55, 1);
 }
 
 // A bell, drawn to the same weight as the gear so the carousel looks
@@ -7218,25 +7228,35 @@ static void input() {
     if (touchOn && touchLongDone) {
       uint32_t held = now - touchPressAt;
       if (held > touchLongest) touchLongest = held;
-      // Five seconds. It goes home right now, not when you let go,
-      // and starts counting. Going home first means that letting go
-      // leaves you somewhere sensible and that switching off finds
-      // you there.
+      // Four seconds. It goes home right now, not when you let go,
+      // and the decision is made. Going home first means switching
+      // off finds you there.
       if (!sleepArmed && held >= TOUCH_HOME_MS) {
         sleepArmed = now;
         screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; faceMode = false;
         upState = U_OFF; swOn = false; swRun = false;
-        Serial.println("held to five: home, and counting down to off");
+        Serial.println("held to four: home, and switching off");
       }
-      if (sleepArmed) {
-        lastActive = now;
-        if (now - sleepArmed >= TOUCH_COUNT_MS) { sleepArmed = 0; wantDeep = true; }
-      }
-    } else if (!touchOn && sleepArmed) {
-      // Let go while it was counting. It stays, and it is at home.
-      sleepArmed = 0;
-      flash("STAYING UP", 800);
-      Serial.println("let go during the countdown: staying up, at home");
+    }
+
+    // The count, once it has started, belongs to the clock and not to
+    // your finger.
+    //
+    // It used to stop if you let go, which read well and did not
+    // work. A TTP223 lets go of its own accord if a pad stays
+    // covered, around five seconds on this board. So the count began
+    // at four, the chip released itself at five with two still
+    // showing, and the robot announced it was staying up. Holding on
+    // could never switch it off, because the pad let go before you
+    // did.
+    //
+    // Four seconds is the whole of the decision now. Nothing after it
+    // can take it back, which is the only arrangement the pad cannot
+    // beat, and the three that follow are an announcement rather than
+    // a question.
+    if (sleepArmed) {
+      lastActive = now;
+      if (now - sleepArmed >= TOUCH_COUNT_MS) { sleepArmed = 0; wantDeep = true; }
     }
     // Quiet long enough that nothing more is coming.
     //
@@ -9194,8 +9214,21 @@ void loop() {
   // simply go when they are due and the screen carries on regardless.
   if (online()) {
     // keep trying for a clock until one lands, then leave it alone
-    if (!timeOk && (long)(now - nextTimeTry) >= 0) {
+    // The clock comes back from deep sleep still running but no
+    // longer right. The RTC drifts, and a board that wakes and sleeps
+    // a dozen times a day accumulates that drift until a reminder set
+    // for nine goes off at some other time. Nothing used to ask
+    // again: timeOk was already true by then, and only a missing
+    // clock counted as a reason to look.
+    //
+    // So it asks on every wake that finds a network, and again every
+    // few hours if it stays up. One short request, and what it buys
+    // is that the number every alarm is worked out from is the right
+    // one when the robot next lies down.
+    if ((long)(now - nextResync) >= 0 ||
+        (!timeOk && (long)(now - nextTimeTry) >= 0)) {
       nextTimeTry = now + 20000;
+      nextResync  = now + TIME_RESYNC_MS;
       wantTime = true;
     }
     if ((long)(now - nextWx) >= 0) { nextWx = now + 900000UL; wantWx = true; }
