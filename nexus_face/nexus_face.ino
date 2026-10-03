@@ -259,7 +259,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.12.0"
+#define FW_VERSION "5.13.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -852,6 +852,18 @@ WiFiUDP cursorUdp;
 //  the Mac goes quiet. Quitting Rafiq is therefore enough to get your
 //  robot back, and so is holding the pad.
 bool      cfgGesture = false;
+// What drives it: a knock on the desk, the pad, or either.
+//
+// Either is the awkward one and the reason this guard exists at all.
+// Pressing a pad glued to a small light robot knocks the small light
+// robot, and the knock lands first, on the press, while the press
+// itself is not resolved until you lift. So with both switched on a
+// single press would reach the Mac twice. A knock that arrives with a
+// finger on the pad, or just after one left it, is that finger.
+enum { GSRC_KNOCK = 0, GSRC_TOUCH, GSRC_BOTH, GSRC_N };
+int       cfgGestSrc = GSRC_KNOCK;
+static bool gestByKnock() { return cfgGestSrc != GSRC_TOUCH; }
+static bool gestByTouch() { return cfgGestSrc != GSRC_KNOCK; }
 bool      gestMuted  = false;        // what Rafiq says the mic is doing
 IPAddress macAddr;                   // learned from the app's own calls
 WiFiUDP   tapUdp;
@@ -2502,8 +2514,9 @@ static void drawGesture() {
     return;
   }
 
-  ctr("gesture mode", 24, 1);
-  ctr("the pad is your Mac", 36, 1);
+  ctr("gesture mode", 22, 1);
+  ctr(cfgGestSrc == GSRC_KNOCK ? "knock the desk"
+    : cfgGestSrc == GSRC_TOUCH ? "touch the pad" : "knock or touch", 34, 1);
   ctr("hold 4s to stop", 52, 1);
   oled.display();
 }
@@ -7056,7 +7069,13 @@ static void touchGesture(uint8_t g) {
   // light robot knocks the robot. The same jolt that the shake
   // handler had to be taught to ignore would have arrived at your
   // Mac as a second tap.
-  if (cfgGesture) return;
+  if (cfgGesture) {
+    if (gestByTouch()) {
+      if (g == TG_ONE) sendTap("1");
+      else if (g == TG_TWO) sendTap("2");
+    }
+    return;
+  }
 
   // The update screen, first, because while it is up it owns the
   // panel and returns from loop() before anything else draws.
@@ -7232,8 +7251,13 @@ static void settleBurst() {
   // Gesture mode takes them before anything else and sends them on.
   // One knock and two, which is all the Mac has anything to do with.
   if (cfgGesture) {
-    if (n == 1) sendTap("1");
-    else if (n == 2) sendTap("2");
+    uint32_t now = millis();
+    bool byPad = touchOn || (now - touchLiftAt) < SHAKE_AFTER_MS
+                         || (now - touchPressAt) < SHAKE_AFTER_MS;
+    if (gestByKnock() && !byPad) {
+      if (n == 1) sendTap("1");
+      else if (n == 2) sendTap("2");
+    }
     return;
   }
   if (upState != U_OFF) {
@@ -7841,6 +7865,7 @@ static void apiState() {
   o += "\"back\":" + String(cfgBack) + ",";
   o += "\"wakeh\":" + String(cfgWakeIdx) + ",";
   o += "\"gesture\":" + String(cfgGesture ? "true" : "false") + ",";
+  o += "\"gsrc\":" + String(cfgGestSrc) + ",";
   o += "\"wakehName\":\"" + String(WAKE_NAME[cfgWakeIdx]) + "\",";
   o += "\"backName\":\"" + String(BACK_NAME[cfgBack]) + "\",";
   o += "\"hadj\":" + String(cfgHijriAdj) + ",";
@@ -8506,6 +8531,7 @@ static void setupWeb() {
     else if (k == "wakeh"){ cfgWakeIdx = constrain(v, 0, WAKE_N - 1);    prefs.putInt("wakeh", cfgWakeIdx); }
     // Not written to flash. See cfgGesture: it belongs to the Mac.
     else if (k == "gest") { cfgGesture = (v != 0); if (cfgGesture) wake("gesture"); }
+    else if (k == "gsrc") { cfgGestSrc = constrain(v, 0, GSRC_N - 1); }
     else if (k == "deepi"){ cfgDeepIdx  = constrain(v, 0, DEEP_N - 1);   prefs.putInt("deepi", cfgDeepIdx); }
     // Sent in hundredths, because the form only carries whole numbers.
     else if (k == "bfull"){ battFull    = constrain(v / 100.0f, 3.90f, 4.30f); prefs.putFloat("bfull", battFull); }
