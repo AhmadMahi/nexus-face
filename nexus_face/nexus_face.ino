@@ -30,11 +30,33 @@
 // Up here with the rest, not beside the code that uses them. Put them
 // halfway down and the prototypes Arduino generates land above them,
 // naming types nothing has heard of yet.
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLESecurity.h>
-#include <BLEHIDDevice.h>
+// NimBLE, not the core's bundled BLE wrapper. See the note on the
+// Bluetooth module: Apple's notification service needs a GATT client
+// over an INBOUND connection, and only this library will give you one.
+#include <NimBLEDevice.h>
+#include <NimBLEHIDDevice.h>
+
+//  Arduino hoists its generated prototypes to just below the
+//  includes, above everything the sketch declares. Anything that
+//  appears in a function signature therefore has to be a type by
+//  this point or the prototype will not parse, which is why a
+//  notification is defined here rather than beside the rest of the
+//  Bluetooth code where it belongs. Apple hands over an id, a
+//  category, and then, only if you ask, the app, the title and the
+//  body. The id is what you quote back to dismiss it or take a call.
+struct Note {
+  uint32_t uid;
+  uint8_t  cat;
+  bool     unread;
+  uint32_t at;                         // millis when it landed
+  // Long enough for a real bundle identifier. Eighteen was not:
+  // com.apple.MobileSMS is nineteen characters, so it arrived as
+  // com.apple.MobileS, and appShort took the tail of that and showed
+  // you "MobileS". Every friendly name silently missed.
+  char     app[40];
+  char     title[34];
+  char     msg[100];
+};
 #include <WiFiUdp.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
@@ -267,7 +289,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.19.0"
+#define FW_VERSION "5.20.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -316,7 +338,7 @@ float ax, ay, az, amag = 1, mx, my, mz, gxr, gyr, gzr, mtemp;
 enum { S_HOME = 0, S_BIKE, S_REMIND, S_FOCUS, S_WEATHER, S_MSG, S_PRAYER,
        S_FAITH, S_READS, S_GAMES, S_SETTINGS, S_SYSTEM, S_COUNT };
 const char* S_NAME[S_COUNT] =
-  { "HOME", "VEHICLE", "REMINDERS", "FOCUS", "WEATHER", "MESSAGES", "PRAYER",
+  { "HOME", "VEHICLE", "REMINDERS", "FOCUS", "WEATHER", "NOTICES", "PRAYER",
     "FAITH", "SHORT READS", "GAMES", "SETTINGS", "SYSTEM" };
 
 // ---------------- online, or not ----------------
@@ -389,7 +411,8 @@ int  bikeTry  = 0;
 // fails the build if a screen sets a depth without being in it.
 static bool screenHasDepth(int s) {
   return s == S_FAITH || s == S_READS || s == S_GAMES ||
-         s == S_FOCUS || s == S_SETTINGS || s == S_REMIND;
+         s == S_FOCUS || s == S_SETTINGS || s == S_REMIND ||
+         s == S_MSG;
 }
 
 // Which screens are worth offering at all. Weather needs the network
@@ -910,19 +933,18 @@ WiFiUDP cursorUdp;
 //  The phone instead of the network.
 //
 //  The robot advertises, you pair it once from Settings on the
-//  iPhone, and iOS reconnects on its own after that. The pairing has
-//  to be a real bond with encryption, because the two things worth
-//  having from a phone, the clock and the notifications, are both
-//  behind one and iOS hands neither to an unbonded peer.
+//  iPhone, and from then on it borrows the phone's clock and the
+//  phone's notifications. WiFi stays off the whole time.
 //
-//  A note for whoever reads this next, because it cost me a rewrite:
-//  the C3 Arduino build uses NimBLE, not Bluedroid. CONFIG_NIMBLE_ENABLED
-//  is set and CONFIG_BLUEDROID_ENABLED is not, so none of the
-//  esp_ble_gattc_* and esp_ble_gap_* calls that most ESP32 Bluetooth
-//  writing uses exist here at all. The callbacks take
-//  ble_gap_conn_desc, security goes through the static BLESecurity
-//  calls, and anything lower is NimBLE's own ble_gattc_*. I wrote the
-//  Bluedroid version first and the compiler told me.
+//  This is NimBLE-Arduino, not the BLE library bundled with the
+//  core, and the swap was forced. Apple's notification service
+//  requires running a GATT client over the connection the PHONE
+//  made to us, and the bundled wrapper cannot: its client only
+//  dials out, and its server drops BLE_GAP_EVENT_NOTIFY_RX on the
+//  floor because only its client class has a case for it. Every
+//  notification would have arrived and been thrown away. NimBLE
+//  hands out a client for an inbound connection, which is the
+//  whole ballgame.
 //
 //  btStage is the reason the screen says what it says. None of this
 //  can be tried from a desk, so instead of a light that is on or
@@ -933,28 +955,21 @@ bool     btUp    = false;             // the stack is running
 uint32_t btSince = 0;                 // when the rung last changed
 uint16_t btConn  = 0xFFFF;            // the live connection, or none
 
-// Kept for the notification work. It is no longer advertised: a
-// 128 bit UUID is 18 of the 31 bytes a packet has, which pushed the
-// name out into the scan response, and soliciting it never made iOS
-// show the robot anyway. See the note on HID_MAP for why not.
-#define ANCS_UUID "7905F431-B5CE-4E99-A40F-4B1E122D00D0"
+static NimBLEUUID ANCS_SVC("7905F431-B5CE-4E99-A40F-4B1E122D00D0");
+static NimBLEUUID ANCS_NS ("9FBF120D-6301-42D9-8C58-25E699A21DBD");
+static NimBLEUUID ANCS_CP ("69D1D8F3-45E1-49A8-9821-9BBDFDAAD9D9");
+static NimBLEUUID ANCS_DS ("22EAC6E9-24D6-4BB5-BE44-B36ACE7C7BFB");
+static NimBLEUUID CTS_SVC((uint16_t)0x1805);
+static NimBLEUUID CTS_CHR((uint16_t)0x2A2B);
 
-//  Why the robot now claims to be a mouse.
-//
-//  iOS Settings does not list plain Bluetooth Low Energy peripherals
-//  at all. That page is for classic radios and for the few standard
-//  profiles the system itself consumes, HID chief among them.
-//  Everything else is reachable only from an app holding
-//  CoreBluetooth. So the first build advertised correctly, and an
-//  iPhone was never going to show it, no matter how long you looked.
-//
-//  Speaking HID puts it on that page. A keyboard was the obvious
-//  choice and is the wrong one: iOS hides the on screen keyboard
-//  whenever a hardware one is attached, so a paired Rafiq would have
-//  taken the keyboard off your phone. A mouse costs nothing. iOS only
-//  draws a pointer when AssistiveTouch is on, and we never send a
-//  report, so it sits there bonded and silent, which is all we need:
-//  the bond is what ANCS runs over later.
+//  A mouse, so iOS Settings lists it at all. That page only shows
+//  classic radios and the few standard profiles the system consumes
+//  itself; a plain peripheral is invisible there however long you
+//  look, which is what made 5.15.0 unfindable. A keyboard would be
+//  listed too and is the wrong pick: iOS hides the on screen
+//  keyboard while a hardware one is attached. No report is ever
+//  sent, and iOS only draws a pointer when AssistiveTouch is on,
+//  so it sits there bonded and silent.
 static const uint8_t HID_MAP[] = {
   0x05, 0x01,        // usage page: generic desktop
   0x09, 0x02,        // usage: mouse
@@ -977,8 +992,22 @@ static const uint8_t HID_MAP[] = {
   0xC0,              //   end collection
   0xC0               // end collection
 };
-BLEHIDDevice*      btHid  = nullptr;
-BLECharacteristic* btKeys = nullptr;   // never written, and that is fine
+
+//  Soliciting Apple's notification service, as raw advertising data
+//  because there is no setter for it. 0x15 is the solicitation list
+//  for 128 bit UUIDs, and the sixteen bytes are the ANCS UUID
+//  backwards, which is how they go on the air. This is the byte that
+//  makes the iPhone offer to share its notifications; without it
+//  there is no prompt and no access, whatever else you advertise.
+static const uint8_t ANCS_SOLICIT[18] = {
+  0x11, 0x15,
+  0xD0, 0x00, 0x2D, 0x12, 0x1E, 0x4B, 0x0F, 0xA4,
+  0x99, 0x4E, 0xCE, 0xB5, 0x31, 0xF4, 0x05, 0x79
+};
+
+NimBLEHIDDevice*   btHid  = nullptr;
+NimBLECharacteristic* btKeys = nullptr;    // never written, and that is fine
+NimBLERemoteCharacteristic* ancsCP = nullptr;
 
 static void btSet(int stage) {
   if (btStage == stage) return;
@@ -1000,21 +1029,6 @@ static const char* btShort() {
   }
 }
 
-// Pairing takes as long as it takes you to find the Settings page,
-// and the radio only runs while the robot is awake: nodding off part
-// way through takes the thing you are hunting for off the air. So the
-// panel stays up while it is advertising or mid handshake, and lets
-// go once the bond is made or the window has gone by.
-// A setting must never be able to put the robot beyond reach. The
-// mode is written to NVS the moment you choose it, so anything that
-// panics while the radio comes up panics again on the next boot, and
-// on every boot after that. That is exactly what 5.16.0 did: one
-// uninitialised pointer, and the only way back in was a cable.
-//
-// So Bluetooth leaves a note before it tries anything, and tears it
-// up once the robot has plainly survived. A note still lying there at
-// boot means the last attempt never came back, and the robot drops to
-// WiFi and says so rather than walking into it again.
 // A count rather than a flag, and a longer window, because the first
 // version only guarded the twelve seconds around startup. The GATT
 // work below only begins when a phone connects, which on a bonded
@@ -1043,6 +1057,11 @@ uint32_t btNoteAt  = 0;
 int      btTries   = 0;
 bool     btFellBack = false;      // say so once, on the first screen
 
+// Pairing takes as long as it takes you to find the Settings page,
+// and the radio only runs while the robot is awake: nodding off part
+// way through takes the thing you are hunting for off the air. So the
+// panel stays up while it is advertising or mid handshake, and lets
+// go once the bond is made or the window has gone by.
 #define BT_PAIR_HOLD_MS 90000UL
 static bool btPairing() {
   if (cfgNet != NET_BT || !btUp) return false;
@@ -1050,54 +1069,147 @@ static bool btPairing() {
   return btStage == BT_ADVERTISING && millis() - btSince < BT_PAIR_HOLD_MS;
 }
 
-// ---- the clock from the phone: state ----
+// ---- the clock from the phone, and the notifications: state ----
 //
-//  Up here only because onDisconnect below has to be able to throw it
-//  all away. The working parts are further down, past the point where
-//  timeOk and clockSrc exist.
-enum { CTS_IDLE = 0, CTS_LOOKING, CTS_GOT, CTS_NONE };
-volatile int      ctsState = CTS_IDLE;
-volatile uint16_t ctsSvcS = 0, ctsSvcE = 0, ctsHandle = 0;
-volatile time_t   ctsEpoch = 0;
+//  Up here only because the callbacks below have to be able to throw
+//  it all away. The working parts are further down, past the point
+//  where timeOk and clockSrc exist.
+enum { CTS_IDLE = 0, CTS_DONE, CTS_NONE };
+int      ctsState = CTS_IDLE;
 uint32_t ctsAskedAt = 0, ctsSyncedAt = 0;
 int      ctsFails = 0;
 
-class BtServerCb : public BLEServerCallbacks {
-  void onConnect(BLEServer* sv, ble_gap_conn_desc* d) override {
-    btConn = d ? d->conn_handle : 0xFFFF;
-    btSet(BT_CONNECTED);
-    wake("phone");
+enum { ANCS_NONE = 0, ANCS_WAIT, ANCS_READY, ANCS_FAIL };
+int      ancsState = ANCS_NONE;
+int      ancsTries = 0;
+uint32_t ancsLastTry = 0, ancsAskedAt = 0, btSecAskedAt = 0;
+bool     ancsBusy = false;             // one attribute request at a time
+
+//  What a notification is, once the phone has told us.
+//
+//  Twenty of them, newest first. Apple hands over an id, a category
+//  and then, only if you ask, the app, the title and the body. The
+//  id is what you quote back to dismiss it or answer a call.
+#define NOTE_MAX 20
+// How many attributes ancsAsk requests and onDataSource expects back.
+#define ANCS_ATTRS 3
+Note notes[NOTE_MAX];
+int  noteN = 0;                        // in use, notes[0] is the newest
+int  noteIdx = 0;                      // which one is being read
+bool noteConfirm = false, noteYes = false;
+uint32_t noteTotal = 0;
+
+//  Apple's categories. Only the ones worth saying out loud are
+//  named; the rest show the app, which is more use than "other".
+#define CAT_CALL    1
+#define CAT_MISSED  2
+#define CAT_VOICE   3
+
+//  The host task produces, loop() consumes. One writer and one
+//  reader each side on a single core, so byte indices need no lock.
+#define UIDQ_N 12
+volatile uint32_t uidQ[UIDQ_N];
+volatile uint8_t  uidQCat[UIDQ_N];
+volatile uint8_t  uidHead = 0, uidTail = 0;
+
+//  The data source answer is assembled on the host task and handed
+//  over whole, so the screen never sees half a notification.
+Note     noteStage;
+volatile bool noteReady = false;
+volatile bool btWokeReq = false;       // a connection wants the screen
+uint8_t  dsBuf[512];
+size_t   dsLen = 0;
+uint8_t  dsCat = 0;
+
+class BtServerCb : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* sv, NimBLEConnInfo& ci) override {
+    btConn = ci.getConnHandle();
+    btSet(ci.isEncrypted() ? BT_BONDED : BT_CONNECTED);
+    ancsState = ANCS_WAIT; ancsTries = 0;
+    btWokeReq = true;
+    // Ask for the encryption ourselves rather than waiting to be
+    // asked. The bundled library only did this when something
+    // demanded an encrypted read, so with nothing demanding one the
+    // bond never completed, the rung never left "linked", and the
+    // clock was never fetched. That was the whole of that bug.
+    btSecAskedAt = millis();
+    NimBLEDevice::startSecurity(btConn);
   }
-  void onDisconnect(BLEServer* sv, ble_gap_conn_desc* d) override {
+  void onDisconnect(NimBLEServer* sv, NimBLEConnInfo& ci, int reason) override {
     btConn = 0xFFFF;
     // Whatever was found on the last connection was found on handles
     // belonging to that connection. None of it carries over.
     ctsState = CTS_IDLE; ctsSyncedAt = 0; ctsFails = 0;
-    ctsSvcS = ctsSvcE = ctsHandle = 0;
+    ancsState = ANCS_NONE; ancsCP = nullptr; ancsBusy = false;
+    uidHead = uidTail = 0; dsLen = 0;
     btSet(BT_ADVERTISING);
     // Straight back to advertising, or the phone has nothing to come
     // back to and you would be pairing it by hand every time.
-    BLEDevice::startAdvertising();
+    NimBLEDevice::startAdvertising();
   }
-};
-
-class BtSecurityCb : public BLESecurityCallbacks {
-  // No keyboard, and no screen worth typing a number into, so this
-  // is a just-works bond.
-  uint32_t onPassKeyRequest() override { return 0; }
-  void onPassKeyNotify(uint32_t pass) override {}
-  bool onConfirmPIN(uint32_t pin) override { return true; }
-  bool onSecurityRequest() override { return true; }
-  void onAuthenticationComplete(ble_gap_conn_desc* d) override {
-    if (!d || !d->sec_state.encrypted) {
+  void onAuthenticationComplete(NimBLEConnInfo& ci) override {
+    if (!ci.isEncrypted()) {
       Serial.println("bluetooth: pairing did not take");
       btSet(BT_CONNECTED);
       return;
     }
-    btConn = d->conn_handle;
+    btConn = ci.getConnHandle();
     btSet(BT_BONDED);
   }
 };
+
+//  Both of these run on the NimBLE host task, so they do nothing but
+//  write down what arrived. Drawing or sleeping from here is how you
+//  get a crash that only happens when a phone is nearby.
+static void onNotifSource(NimBLERemoteCharacteristic* c, uint8_t* d,
+                          size_t len, bool isNotify) {
+  if (len < 8) return;
+  uint8_t evt = d[0], flags = d[1], cat = d[2];
+  uint32_t uid = d[4] | (d[5] << 8) | (d[6] << 16) | ((uint32_t)d[7] << 24);
+  if (evt == 0 && !(flags & 0x04)) {           // added, and not pre existing
+    uint8_t nx = (uidHead + 1) % UIDQ_N;
+    if (nx == uidTail) return;                 // full; drop the oldest ask
+    uidQ[uidHead] = uid; uidQCat[uidHead] = cat;
+    uidHead = nx;
+  }
+}
+
+static void onDataSource(NimBLERemoteCharacteristic* c, uint8_t* d,
+                         size_t len, bool isNotify) {
+  if (dsLen + len > sizeof(dsBuf)) dsLen = 0;
+  memcpy(dsBuf + dsLen, d, len); dsLen += len;
+  if (dsLen < 5 || dsBuf[0] != 0) return;
+  Note n = {};
+  n.uid = dsBuf[1] | (dsBuf[2] << 8) | (dsBuf[3] << 16) | ((uint32_t)dsBuf[4] << 24);
+  n.cat = dsCat;
+  size_t p = 5;
+  // Exactly as many as ancsAsk asked for. The number has to match or
+  // nothing ever arrives: loop one too many and the last turn runs
+  // off the end of a complete answer and returns as though more were
+  // coming, so the notification is parsed and then thrown away.
+  for (int a = 0; a < ANCS_ATTRS; a++) {
+    if (p + 3 > dsLen) return;                 // more is still coming
+    uint8_t id = dsBuf[p];
+    uint16_t L = dsBuf[p + 1] | (dsBuf[p + 2] << 8);
+    if (p + 3 + L > dsLen) return;
+    char*  dst = nullptr; size_t cap = 0;
+    if      (id == 0) { dst = n.app;   cap = sizeof(n.app); }
+    else if (id == 1) { dst = n.title; cap = sizeof(n.title); }
+    else if (id == 3) { dst = n.msg;   cap = sizeof(n.msg); }
+    if (dst) { size_t k = L < cap - 1 ? L : cap - 1; memcpy(dst, dsBuf + p + 3, k); dst[k] = 0; }
+    p += 3 + L;
+  }
+  n.unread = true;
+  noteStage = n;
+  noteReady = true;
+  dsLen = 0;
+  ancsBusy = false;
+}
+
+static NimBLEClient* btPeer() {
+  NimBLEServer* sv = NimBLEDevice::getServer();
+  return (sv && btConn != 0xFFFF) ? sv->getClient(btConn) : nullptr;
+}
 
 static void bleOn() {
   if (btUp) return;
@@ -1105,46 +1217,47 @@ static void bleOn() {
   btTries = prefs.getInt("btry2", 0) + 1;
   prefs.putInt("btry2", btTries);      // zeroed once it has plainly held
   btNoteOut = true; btNoteAt = millis();
+
   char nm[24];
   snprintf(nm, sizeof(nm), "Rafiq %s", cfgName);
-  BLEDevice::init(nm);
-  BLEDevice::setSecurityCallbacks(new BtSecurityCb());
-  BLESecurity::setAuthenticationMode(true, false, true);   // bond, no MITM, secure
-  BLESecurity::setCapability(BLE_HS_IO_NO_INPUT_OUTPUT);
+  NimBLEDevice::init(nm);
+  NimBLEDevice::setSecurityAuth(true, false, true);   // bond, no MITM, secure
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
-  BLEServer* sv = BLEDevice::createServer();
+  NimBLEServer* sv = NimBLEDevice::createServer();
   sv->setCallbacks(new BtServerCb());
 
-  btHid = new BLEHIDDevice(sv);
-  // manufacturer() with no argument is the one that CREATES the
-  // characteristic; manufacturer(String) only writes to it, and the
-  // pointer it writes through is never initialised by the
-  // constructor. Calling the second without the first stores through
-  // whatever was on the heap, which is what panicked 5.16.0 on the
-  // first boot into Bluetooth, every boot after it, and left no way
-  // in but a cable. The core's own example does it this way round.
-  btHid->manufacturer()->setValue("Rafiq");
-  btHid->pnp(0x02, 0xE502, 0xA111, 0x0210);
-  btHid->hidInfo(0x00, 0x02);          // not localised, remote wakeable
-  btHid->reportMap((uint8_t*)HID_MAP, sizeof(HID_MAP));
-  btKeys = btHid->inputReport(1);
-  // Before the services start, so this is a plain write and not a
-  // notify to a connection that does not exist yet.
+  btHid = new NimBLEHIDDevice(sv);
+  btHid->setManufacturer("Rafiq");
+  btHid->setPnp(0x02, 0xE502, 0xA111, 0x0210);
+  btHid->setHidInfo(0x00, 0x02);       // not localised, remote wakeable
+  btHid->setReportMap((uint8_t*)HID_MAP, sizeof(HID_MAP));
+  btKeys = btHid->getInputReport(1);
   if (!isnan(battV)) btHid->setBatteryLevel(battPct(battV));
-  btHid->startServices();
+  sv->start();                         // starts the services too
 
-  BLEAdvertising* ad = BLEDevice::getAdvertising();
-  ad->setAppearance(0x03C2);           // a mouse, so Settings lists it
-  ad->addServiceUUID(BLEUUID((uint16_t)0x1812));
-  ad->setScanResponse(true);
+  // 3 flags + 18 solicitation + 4 appearance + 4 HID = 29 of 31. The
+  // name will not fit beside them and goes in the scan response,
+  // which iOS asks for anyway because it scans actively.
+  NimBLEAdvertisementData ad;
+  ad.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+  ad.addData(ANCS_SOLICIT, sizeof(ANCS_SOLICIT));
+  ad.setAppearance(0x03C2);            // a mouse, so Settings lists it
+  ad.addServiceUUID(NimBLEUUID((uint16_t)0x1812));
+  NimBLEAdvertisementData sr;
+  sr.setName(nm);
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->setAdvertisementData(ad);
+  adv->setScanResponseData(sr);
 
   btUp = true;
-  // start() says whether the controller took it. The first build
-  // called startAdvertising(), which returns nothing, and then put
-  // "pair me" on the screen whatever had happened. A screen that
-  // cannot be wrong about this is the whole point of the rungs.
-  if (ad->start()) btSet(BT_ADVERTISING);
-  else             btSet(BT_FAIL);
+  // start() says whether the controller took it. An earlier build
+  // called a function that returns nothing and then put "pair me" on
+  // the screen whatever had happened. A screen that cannot be wrong
+  // about this is the whole point of the rungs.
+  if (adv->start()) btSet(BT_ADVERTISING);
+  else              btSet(BT_FAIL);
 }
 
 // bleOn and bleOff, not btStart and btStop: the core already owns
@@ -1152,10 +1265,12 @@ static void bleOn() {
 static void bleOff() {
   if (!btUp) return;
   Serial.println("bluetooth: stopping");
-  BLEDevice::deinit(true);
+  NimBLEDevice::deinit(true);
   btUp = false;
   btConn = 0xFFFF;
-  btHid = nullptr; btKeys = nullptr;   // deinit already took them
+  btHid = nullptr; btKeys = nullptr; ancsCP = nullptr;
+  ancsState = ANCS_NONE; ctsState = CTS_IDLE;
+  uidHead = uidTail = 0; dsLen = 0; noteReady = false;
   prefs.putInt("btry2", 0);            // stopped on purpose, not a crash
   btNoteOut = false;
   btSet(BT_OFF);
@@ -1307,32 +1422,25 @@ int    relCount = 0, relSel = 0;
 const char* clockSrc = "not set";
 
 // ================================================================
-//  THE CLOCK, FROM THE PHONE
+//  THE CLOCK AND THE NOTIFICATIONS, FROM THE PHONE
 //
-//  iOS serves the Current Time Service to anything it has bonded
-//  with, so once the pairing is real the robot can just ask what time
-//  it is and stop minding that there is no WiFi.
+//  iOS serves the Current Time Service, and Apple's Notification
+//  Centre Service, to anything it has bonded with. Both run as GATT
+//  client work over the connection the PHONE made to us, which is
+//  the reason this file uses NimBLE: its server will hand out a
+//  client for an inbound connection, and nothing else here would.
 //
-//  This cannot go through BLEClient. That class only dials out, and
-//  this connection was made by the phone, inbound, so there is
-//  nothing for it to attach to. It is NimBLE's own ble_gattc_* over
-//  the connection handle the server callback already handed us.
-//
-//  All three callbacks run on the NimBLE host task rather than on
-//  loop(), so they do nothing but write down what they found. The
-//  clock is set in ctsTick, on the main task, where everything else
-//  that touches time already lives.
+//  Everything in here runs on the main task. The two callbacks that
+//  do not are above, and they only ever write something down.
 // ================================================================
 #define CTS_SETTLE_MS   2000UL         // let the bond finish first
-#define CTS_ANSWER_MS   8000UL         // asked, heard nothing back
-#define CTS_RETRY_MS   30000UL
+#define CTS_RETRY_MS   15000UL
 #define CTS_REFRESH_MS 21600000UL      // six hours
 #define CTS_GIVE_UP         5          // tries before it stops pestering
-
-// Named, because BLE_UUID16_DECLARE builds a temporary and C++ will
-// not let you take its address.
-static const ble_uuid16_t CTS_SVC_U = BLE_UUID16_INIT(0x1805);
-static const ble_uuid16_t CTS_CHR_U = BLE_UUID16_INIT(0x2A2B);
+#define ANCS_SETTLE_MS  1500UL
+#define ANCS_GIVE_UP        8
+#define ANCS_ANSWER_MS  3000UL
+#define BT_SEC_NUDGE_MS 6000UL
 
 // newlib here has no timegm, and mktime would read the timezone,
 // which is the one thing this must not do. Days from the civil
@@ -1349,14 +1457,8 @@ static time_t utcFromTm(const struct tm* t) {
   return (time_t)days * 86400L + t->tm_hour * 3600L + t->tm_min * 60L + t->tm_sec;
 }
 
-static int ctsOnRead(uint16_t conn, const struct ble_gatt_error* err,
-                     struct ble_gatt_attr* attr, void* arg) {
-  if (!err || err->status != 0 || !attr || !attr->om) { ctsState = CTS_NONE; return 0; }
-  uint8_t  b[10];
-  uint16_t n = 0;
-  if (ble_hs_mbuf_to_flat(attr->om, b, sizeof(b), &n) != 0 || n < 7) {
-    ctsState = CTS_NONE; return 0;
-  }
+static bool applyCts(const uint8_t* b, size_t n) {
+  if (!b || n < 7) return false;
   struct tm t = {};
   t.tm_year = (b[0] | (b[1] << 8)) - 1900;
   t.tm_mon  = b[2] - 1;
@@ -1368,84 +1470,148 @@ static int ctsOnRead(uint16_t conn, const struct ble_gatt_error* err,
   // not answer at all, because the reminders would believe it.
   if (t.tm_year < 120 || t.tm_mon < 0 || t.tm_mon > 11 ||
       t.tm_mday < 1 || t.tm_mday > 31 || t.tm_hour > 23 ||
-      t.tm_min > 59 || t.tm_sec > 60) { ctsState = CTS_NONE; return 0; }
-  ctsEpoch = utcFromTm(&t);
-  ctsState = CTS_GOT;
-  return 0;
+      t.tm_min > 59 || t.tm_sec > 60) return false;
+  struct timeval tv = { .tv_sec = utcFromTm(&t), .tv_usec = 0 };
+  settimeofday(&tv, nullptr);
+  // What CTS hands over is already the phone's own wall clock, so the
+  // zone stays at UTC and what comes back out of localtime is what
+  // the phone is showing. The http date path does the same.
+  setenv("TZ", "UTC0", 1); tzset();
+  timeOk   = true;
+  clockSrc = "your phone";
+  Serial.println("clock: set from the phone");
+  return true;
 }
 
-static int ctsOnChr(uint16_t conn, const struct ble_gatt_error* err,
-                    const struct ble_gatt_chr* chr, void* arg) {
-  if (err && err->status == 0 && chr) { ctsHandle = chr->val_handle; return 0; }
-  if (err && err->status == BLE_HS_EDONE && ctsHandle) {
-    if (ble_gattc_read(conn, ctsHandle, ctsOnRead, NULL) != 0) ctsState = CTS_NONE;
-    return 0;
+static bool readCts() {
+  NimBLEClient* cl = btPeer();
+  if (!cl) return false;
+  NimBLERemoteService* svc = cl->getService(CTS_SVC);
+  if (!svc) return false;
+  NimBLERemoteCharacteristic* ch = svc->getCharacteristic(CTS_CHR);
+  if (!ch) return false;
+  NimBLEAttValue v = ch->readValue();
+  return applyCts(v.data(), v.size());
+}
+
+static bool setupAncs() {
+  NimBLEClient* cl = btPeer();
+  if (!cl) return false;
+  NimBLERemoteService* svc = cl->getService(ANCS_SVC);
+  if (!svc) return false;               // the prompt has not been answered yet
+  NimBLERemoteCharacteristic* ns = svc->getCharacteristic(ANCS_NS);
+  NimBLERemoteCharacteristic* ds = svc->getCharacteristic(ANCS_DS);
+  ancsCP = svc->getCharacteristic(ANCS_CP);
+  if (!ns || !ds || !ancsCP) return false;
+  if (!ds->subscribe(true, onDataSource))   return false;
+  if (!ns->subscribe(true, onNotifSource))  return false;
+  return true;
+}
+
+//  Ask for the parts worth showing. The caps are the buffers these
+//  land in, so the phone truncates rather than us.
+static void ancsAsk(uint32_t uid) {
+  if (!ancsCP) return;
+  uint8_t cmd[] = { 0x00,
+    (uint8_t)uid, (uint8_t)(uid >> 8), (uint8_t)(uid >> 16), (uint8_t)(uid >> 24),
+    0x00,                               // app identifier   )
+    0x01, (uint8_t)(sizeof(((Note*)0)->title) - 2), 0,   //  ) ANCS_ATTRS
+    0x03, (uint8_t)(sizeof(((Note*)0)->msg) - 4), 0 };   //  ) of them
+  dsLen = 0; ancsBusy = true; ancsAskedAt = millis();
+  if (!ancsCP->writeValue(cmd, sizeof(cmd), true)) ancsBusy = false;
+}
+
+//  0 is the positive action, 1 the negative one. On a call that is
+//  answer and decline; on anything else it is usually open and clear.
+static void ancsAction(uint32_t uid, uint8_t action) {
+  if (ancsState != ANCS_READY || !ancsCP) return;
+  uint8_t cmd[] = { 0x02,
+    (uint8_t)uid, (uint8_t)(uid >> 8), (uint8_t)(uid >> 16), (uint8_t)(uid >> 24),
+    action };
+  ancsCP->writeValue(cmd, sizeof(cmd), true);
+}
+
+//  Newest first, and never the same one twice: iOS re-announces a
+//  notification when its badge changes, and a list that grew every
+//  time would be nothing but duplicates.
+static void addNote(const Note& n) {
+  for (int i = 0; i < noteN; i++) {
+    if (notes[i].uid == n.uid) { notes[i] = n; notes[i].at = millis(); return; }
   }
-  ctsState = CTS_NONE;
-  return 0;
+  if (noteN < NOTE_MAX) noteN++;
+  for (int i = noteN - 1; i > 0; i--) notes[i] = notes[i - 1];
+  notes[0] = n;
+  notes[0].at = millis();
+  noteTotal++;
 }
 
-static int ctsOnSvc(uint16_t conn, const struct ble_gatt_error* err,
-                    const struct ble_gatt_svc* svc, void* arg) {
-  if (err && err->status == 0 && svc) {
-    ctsSvcS = svc->start_handle; ctsSvcE = svc->end_handle; return 0;
-  }
-  if (err && err->status == BLE_HS_EDONE && ctsSvcS) {
-    if (ble_gattc_disc_chrs_by_uuid(conn, ctsSvcS, ctsSvcE,
-          &CTS_CHR_U.u, ctsOnChr, NULL) != 0) ctsState = CTS_NONE;
-    return 0;
-  }
-  ctsState = CTS_NONE;
-  return 0;
+static int noteUnread() {
+  int k = 0;
+  for (int i = 0; i < noteN; i++) if (notes[i].unread) k++;
+  return k;
 }
 
-static void ctsAsk() {
-  if (btStage != BT_BONDED || btConn == 0xFFFF) return;
-  // Counted here rather than at the retry, so CTS_GIVE_UP is the
-  // number of times it asks, which is what the name says. Counting
-  // at the retry made the first ask free and the real total six.
-  // A sync that works puts this back to zero, so only failures in a
-  // row ever add up.
-  ctsFails++;
-  ctsSvcS = ctsSvcE = ctsHandle = 0;
-  ctsState   = CTS_LOOKING;
-  ctsAskedAt = millis();
-  if (ble_gattc_disc_svc_by_uuid(btConn, &CTS_SVC_U.u, ctsOnSvc, NULL) != 0)
-    ctsState = CTS_NONE;
-}
-
-static void ctsTick() {
+static void btTick() {
   if (cfgNet != NET_BT) return;
+  uint32_t now = millis();
 
-  if (ctsState == CTS_GOT) {
-    struct timeval tv = { .tv_sec = (time_t)ctsEpoch, .tv_usec = 0 };
-    settimeofday(&tv, nullptr);
-    // What CTS hands over is already the phone's own wall clock, so
-    // the zone stays at UTC and what comes back out of localtime is
-    // what the phone is showing. The http date path does the same.
-    setenv("TZ", "UTC0", 1); tzset();
-    timeOk      = true;
-    clockSrc    = "your phone";
-    ctsSyncedAt = millis();
-    ctsFails    = 0;
-    ctsState    = CTS_IDLE;
-    Serial.println("clock: set from the phone");
-    return;
-  }
-  if (btStage != BT_BONDED || btConn == 0xFFFF) return;
-  if (millis() - btSince < CTS_SETTLE_MS) return;
+  if (btWokeReq) { btWokeReq = false; wake("phone"); }
 
-  if (ctsState == CTS_LOOKING) {
-    if (millis() - ctsAskedAt > CTS_ANSWER_MS) ctsState = CTS_NONE;
-    return;
+  // Handed over whole, so the screen never sees half a notification.
+  if (noteReady) {
+    noteReady = false;
+    addNote(noteStage);
+    wake("notification");
+    if (popupSecs()) {
+      screen = S_MSG; depth = 0;
+      popupUntil = millis() + popupSecs() * 1000UL;
+    }
   }
-  if (ctsState == CTS_NONE) {
-    if (ctsFails >= CTS_GIVE_UP) return;        // it has not got one
-    if (millis() - ctsAskedAt < CTS_RETRY_MS) return;
-    ctsAsk();
-    return;
+
+  if (!btUp || btConn == 0xFFFF) return;
+
+  // Nudge the pairing along if iOS has not got round to it. Without
+  // this the rung sits on "linked" for ever and nothing below runs.
+  if (btStage == BT_CONNECTED && now - btSecAskedAt > BT_SEC_NUDGE_MS) {
+    btSecAskedAt = now;
+    NimBLEDevice::startSecurity(btConn);
   }
-  if (ctsSyncedAt == 0 || millis() - ctsSyncedAt > CTS_REFRESH_MS) ctsAsk();
+  if (btStage != BT_BONDED) return;
+  if (now - btSince < CTS_SETTLE_MS) return;
+
+  // The notification service only appears once you have said yes to
+  // the prompt on the phone, so not finding it is not a failure yet.
+  if (ancsState == ANCS_WAIT && now - ancsLastTry > ANCS_SETTLE_MS) {
+    ancsLastTry = now;
+    if (setupAncs()) {
+      ancsState = ANCS_READY;
+      Serial.println("ancs: ready");
+    } else if (++ancsTries >= ANCS_GIVE_UP) {
+      ancsState = ANCS_FAIL;
+      Serial.println("ancs: no access; say yes to the prompt on the phone");
+    }
+  }
+
+  if (ctsState != CTS_DONE && ctsFails < CTS_GIVE_UP &&
+      now - ctsAskedAt > CTS_RETRY_MS) {
+    ctsAskedAt = now; ctsFails++;
+    if (readCts()) { ctsState = CTS_DONE; ctsSyncedAt = now; ctsFails = 0; }
+  }
+  if (ctsState == CTS_DONE && now - ctsSyncedAt > CTS_REFRESH_MS) {
+    ctsState = CTS_IDLE; ctsFails = 0; ctsAskedAt = 0;
+  }
+
+  // One attribute request at a time: the data source answers in
+  // pieces and two overlapping replies cannot be told apart.
+  if (ancsState == ANCS_READY) {
+    if (ancsBusy && now - ancsAskedAt > ANCS_ANSWER_MS) ancsBusy = false;
+    if (!ancsBusy && uidTail != uidHead) {
+      uint32_t uid = uidQ[uidTail];
+      dsCat = uidQCat[uidTail];
+      uidTail = (uidTail + 1) % UIDQ_N;
+      ancsAsk(uid);
+    }
+  }
 }
 
 String   wokeBy = "boot";
@@ -2692,27 +2858,94 @@ static void drawPrayerAlert() {
   oled.display();
 }
 
+// The bell is the reminders' bell, further down. One bell.
+//  What Apple sends as the app is a bundle identifier, which is not
+//  a thing to put on a screen. The tail of it usually is, and the
+//  handful that are not are worth spelling out.
+static const char* appShort(const Note& n) {
+  if (!n.app[0]) return "Phone";
+  const char* p = strrchr(n.app, '.');
+  const char* t = (p && p[1]) ? p + 1 : n.app;
+  if (!strcasecmp(t, "MobileSMS"))   return "Messages";
+  if (!strcasecmp(t, "mobilemail"))  return "Mail";
+  if (!strcasecmp(t, "MobilePhone")) return "Phone";
+  if (!strcasecmp(t, "facetime"))    return "FaceTime";
+  if (!strcasecmp(t, "mobilecal"))   return "Calendar";
+  if (!strcasecmp(t, "whatsapp"))    return "WhatsApp";
+  return t;
+}
+
+static bool noteIsCall(const Note& n) {
+  return n.cat == CAT_CALL || n.cat == CAT_MISSED || n.cat == CAT_VOICE;
+}
+
 static void drawMessage() {
   oled.clearDisplay();
-  bar("MESSAGE");
-  if (!message.length()) {
-    ctr("Nothing yet", 28, 1);
-    ctr("Send one on the page", 44, 1);
+
+  // The corner: how many, and nothing else. Reading is a hold away.
+  if (depth == 0) {
+    bar("NOTICES");
+    bellIcon(SCRW / 2, 31, 11);
+    char l[26];
+    int un = noteUnread();
+    if (!noteN)  snprintf(l, sizeof(l), "Nothing yet");
+    else if (un) snprintf(l, sizeof(l), "%d new of %d", un, noteN);
+    else         snprintf(l, sizeof(l), "%d kept", noteN);
+    ctr(l, 45, 1);
+    ctr(noteN ? "hold to read"
+              : cfgNet != NET_BT        ? "needs bluetooth"
+              : ancsState == ANCS_READY ? "from your phone"
+              : ancsState == ANCS_FAIL  ? "allow it on the phone"
+                                        : "linking up", 56, 1);
     oled.display();
     return;
   }
-  const int PER = 21, MAXL = 4;
-  String line[MAXL];
-  int n = 0;
-  for (int i = 0; n < MAXL && i < (int)message.length(); ) {
-    int take = min(PER, (int)message.length() - i);
-    if (take == PER) { int sp = message.lastIndexOf(' ', i + take); if (sp > i + 5) take = sp - i; }
-    line[n++] = message.substring(i, i + take);
-    i += take;
-    while (i < (int)message.length() && message.charAt(i) == ' ') i++;
+
+  if (noteConfirm) {
+    bar("NOTICES");
+    ctr("Clear them all?", 26, 1);
+    ctr(noteYes ? "> YES    no" : "  yes  > NO", 44, 1);
+    oled.display();
+    return;
   }
-  int top = 16 + (48 - n * 11) / 2;
-  for (int k = 0; k < n; k++) ctr(line[k].c_str(), top + k * 11, 1);
+
+  // Past the last one is the offer, the same way the reminders do it.
+  if (noteIdx >= noteN) {
+    bar("NOTICES");
+    ctr("That is all", 26, 1);
+    ctr("hold to clear them", 44, 1);
+    oled.display();
+    return;
+  }
+
+  Note& n = notes[noteIdx];
+  // The ribbon: who it is from on the left, when it came on the right.
+  char when[8];
+  if (timeOk) {
+    uint32_t ago = (millis() - n.at) / 1000UL;
+    time_t   at  = time(nullptr) - (time_t)ago;
+    struct tm* lt = localtime(&at);
+    if (lt) snprintf(when, sizeof(when), "%02d:%02d", lt->tm_hour, lt->tm_min);
+    else    snprintf(when, sizeof(when), "--:--");
+  } else {
+    snprintf(when, sizeof(when), "--:--");
+  }
+  titleBar(appShort(n), when);
+
+  if (noteIsCall(n)) {
+    // A call is a number, and the number is the whole of what you
+    // want to see. No body, nothing to scroll, just who it was.
+    ctr(n.cat == CAT_MISSED ? "Missed call"
+      : n.cat == CAT_VOICE  ? "Voicemail" : "Calling", 20, 1);
+    marquee(n.title[0] ? n.title : "unknown", 34, 1);
+  } else {
+    if (n.title[0]) marquee(n.title, 15, 1);
+    fitText(n.msg[0] ? n.msg : "(no text)", 27, 50, n.at);
+  }
+
+  char foot[24];
+  snprintf(foot, sizeof(foot), "%d/%d  hold clears", noteIdx + 1, noteN);
+  ctr(foot, 56, 1);
   oled.display();
 }
 
@@ -7703,6 +7936,43 @@ static void touchGesture(uint8_t g) {
       default: depth = 0; return;
     }
   }
+  // Notices read the way the reminders do: one goes on, two comes
+  // back, holding clears. A call is only ever cleared here and never
+  // on the phone, because a knock that declines a call by accident
+  // is not a feature.
+  if (screen == S_MSG && depth > 0) {
+    if (noteConfirm) {
+      if (g == TG_ONE) { noteYes = !noteYes; return; }
+      if (g == TG_LONG) {
+        if (noteYes) { noteN = 0; noteIdx = 0; flash("CLEARED", 1100); }
+        noteConfirm = false; depth = 0;
+        return;
+      }
+      if (g == TG_TWO) { noteConfirm = false; return; }
+      return;
+    }
+    switch (g) {
+      case TG_ONE:  if (noteIdx < noteN) noteIdx++; return;
+      case TG_TWO:  if (noteIdx > 0) noteIdx--; else depth = 0; return;
+      case TG_LONG:
+        if (noteIdx >= noteN && noteN) { noteConfirm = true; noteYes = false; }
+        else if (noteIdx < noteN) {
+          Note& n = notes[noteIdx];
+          n.unread = false;
+          if (!noteIsCall(n)) ancsAction(n.uid, 1);   // clear it on the phone too
+          for (int i = noteIdx; i < noteN - 1; i++) notes[i] = notes[i + 1];
+          noteN--;
+          if (noteIdx > noteN) noteIdx = noteN;
+        }
+        return;
+      default: depth = 0; return;
+    }
+  }
+  if (g == TG_LONG && screen == S_MSG && depth == 0 && noteN) {
+    depth = 1; noteIdx = 0; noteConfirm = false;
+    clickShrink();
+    return;
+  }
   if (g == TG_LONG && screen == S_REMIND && depth == 0 && remCount) {
     depth = 1; remIdx = 0; remConfirm = false;
     clickShrink();
@@ -9135,6 +9405,18 @@ static void setupWeb() {
     if (m.length()) {
       message = m.substring(0, 84);
       prefs.putString("msg", message);
+      // One list, whatever it came from. The page has always been
+      // able to put a line on the robot; now it lands beside the
+      // phone's notifications instead of in a screen of its own.
+      {
+        Note pn = {};
+        pn.uid = (uint32_t)millis() | 0x80000000UL;   // never an ANCS id
+        pn.cat = 0; pn.unread = true;
+        strncpy(pn.app,   "Rafiq.page", sizeof(pn.app) - 1);
+        strncpy(pn.title, "From the page", sizeof(pn.title) - 1);
+        strncpy(pn.msg,   message.c_str(), sizeof(pn.msg) - 1);
+        addNote(pn);
+      }
       wake("message");
       if (popupSecs()) { screen = S_MSG; depth = 0; popupUntil = millis() + popupSecs() * 1000UL; }
     }
@@ -9956,7 +10238,7 @@ void loop() {
     prefs.putInt("btry2", 0); btNoteOut = false;
     Serial.println("bluetooth: held, the count is clear");
   }
-  ctsTick();                           // the clock, if the phone has one
+  btTick();                            // the phone's clock and notifications
   if (now - lastPoll >= 45) { lastPoll = now; input(); }
   readBattery();                       // every twenty seconds, it decides
   serviceSession();

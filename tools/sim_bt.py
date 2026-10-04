@@ -77,26 +77,51 @@ def t_the_right_stack():
     for gone in ("esp_ble_gattc_", "esp_ble_gap_", "esp_gatt_if_t",
                  "esp_ble_auth_cmpl_t", "BLEDevice::setEncryptionLevel"):
         assert gone not in code, f"{gone} is Bluedroid; this chip does not have it"
-    assert "void onAuthenticationComplete(ble_gap_conn_desc* d) override" in src, \
+    # And no longer the core's bundled wrapper either. Apple's
+    # notification service needs a GATT client over an INBOUND
+    # connection: the bundled server has no case for
+    # BLE_GAP_EVENT_NOTIFY_RX at all, so every notification would
+    # have arrived and been dropped. NimBLE-Arduino hands out a
+    # client for the connection the phone made, which is the only
+    # reason the swap happened.
+    for gone in ("BLEServerCallbacks", "BLESecurityCallbacks",
+                 "BLEDevice::init", "BLEHIDDevice", "BLEAdvertising",
+                 "ble_gattc_disc_svc_by_uuid"):
+        # not preceded by Nim: NimBLEHIDDevice contains BLEHIDDevice
+        assert not re.search(r"(?<!Nim)\b" + re.escape(gone), code), \
+            f"{gone} is the bundled wrapper, which cannot do ANCS"
+    assert "#include <NimBLEDevice.h>" in src and "#include <NimBLEHIDDevice.h>" in src
+    assert "void onAuthenticationComplete(NimBLEConnInfo& ci) override" in src, \
         "the security callback is not the NimBLE one"
-    assert "void onConnect(BLEServer* sv, ble_gap_conn_desc* d) override" in src, \
+    assert "void onConnect(NimBLEServer* sv, NimBLEConnInfo& ci) override" in src, \
         "the server callback is not the NimBLE one"
-    assert "BLESecurity::setAuthenticationMode(true, false, true);" in src, \
+    assert "NimBLEDevice::setSecurityAuth(true, false, true);" in src, \
         "the bond is not asked for the NimBLE way"
     assert "BLE_HS_IO_NO_INPUT_OUTPUT" in src, "the pairing capability is not NimBLE's"
-    print("        NimBLE throughout, and Bluedroid cannot creep back in")
+    assert "sv->getClient(btConn)" in src, \
+        "nothing gets a client for the inbound connection, so ANCS cannot work"
+    print("        NimBLE-Arduino throughout; Bluedroid and the bundled wrapper both barred")
 run("It is written against the stack this chip has", t_the_right_stack)
 
 def t_bonding_and_recovery():
-    assert "BLESecurity::setAuthenticationMode(true, " in src, "it does not ask to bond"
-    assert "if (!d || !d->sec_state.encrypted)" in src, \
-        "it would call an unencrypted link paired"
-    dis = src[src.index("void onDisconnect(BLEServer* sv, ble_gap_conn_desc* d) override"):]
+    assert "NimBLEDevice::setSecurityAuth(true, " in src, "it does not ask to bond"
+    assert "if (!ci.isEncrypted())" in src, "it would call an unencrypted link paired"
+    # The bundled library only started security when something
+    # demanded an encrypted read. Nothing here did, so iOS never
+    # finished the bond, the rung sat on "linked", and the clock was
+    # never fetched. Asking for it ourselves is the fix.
+    con = src[src.index("void onConnect(NimBLEServer* sv, NimBLEConnInfo& ci) override"):]
+    con = con[:con.index("\n  }")]
+    assert "NimBLEDevice::startSecurity(btConn);" in con, \
+        "it waits to be asked for encryption, so the bond may never finish"
+    assert "now - btSecAskedAt > BT_SEC_NUDGE_MS" in src, \
+        "nothing retries the pairing if iOS does not get round to it"
+    dis = src[src.index("void onDisconnect(NimBLEServer* sv, NimBLEConnInfo& ci, int reason) override"):]
     dis = dis[:dis.index("\n  }")]
-    assert "BLEDevice::startAdvertising();" in dis, \
+    assert "NimBLEDevice::startAdvertising();" in dis, \
         "after a disconnect there is nothing for the phone to come back to"
     assert "btConn = 0xFFFF;" in dis, "it would think it is still connected"
-    print("        bonded and encrypted, and advertising again the moment it drops")
+    print("        asks for encryption itself, and advertises again the moment it drops")
 run("It bonds, and it comes back after a disconnect", t_bonding_and_recovery)
 
 def t_says_how_far_it_got():
@@ -128,11 +153,11 @@ def t_start_is_checked():
     useful direction, which is the one thing it was there for."""
     on = code[code.index("static void bleOn() {"):]
     on = on[:on.index("\n}")]
-    assert "BLEDevice::startAdvertising();" not in on, \
+    assert "NimBLEDevice::startAdvertising();" not in on, \
         "back on the call that cannot fail"
-    assert "if (ad->start()) btSet(BT_ADVERTISING);" in on, \
+    assert "if (adv->start()) btSet(BT_ADVERTISING);" in on, \
         "the screen does not depend on the radio having agreed"
-    assert "else             btSet(BT_FAIL);" in on, "a refusal is not reported"
+    assert "else              btSet(BT_FAIL);" in on, "a refusal is not reported"
     print("        start() is asked, and a no becomes BT_FAIL on the panel")
 run("A radio that refused does not get called 'pair me'", t_start_is_checked)
 
@@ -165,52 +190,65 @@ def build_adv(uuid16s, uuid128s, name, appearance, scan_resp):
 def parse_adv():
     on = src[src.index("static void bleOn() {"):]
     on = on[:on.index("\n}")]
-    u16  = re.findall(r"addServiceUUID\(BLEUUID\(\(uint16_t\)(0x[0-9A-Fa-f]+)\)\)", on)
-    u128 = re.findall(r"addServiceUUID\(BLEUUID\((?!\(uint16_t\))(\w+)\)\)", on)
-    app  = re.search(r"setAppearance\((0x[0-9A-Fa-f]+)\)", on)
-    scan = "setScanResponse(true)" in on
-    nm   = re.search(r'snprintf\(nm, sizeof\(nm\), "([^"]*)", cfgName\)', on)
-    who  = re.search(r'char cfgName\[16\] = "([^"]*)"', src).group(1)
-    name = nm.group(1).replace("%s", who)
-    return u16, u128, name, (app.group(1) if app else None), scan
+    u16  = re.findall(r"ad\.addServiceUUID\(NimBLEUUID\(\(uint16_t\)(0x[0-9A-Fa-f]+)\)\)", on)
+    app  = re.search(r"ad\.setAppearance\((0x[0-9A-Fa-f]+)\)", on)
+    solicit = "ad.addData(ANCS_SOLICIT, sizeof(ANCS_SOLICIT))" in on
+    in_sr   = "sr.setName(nm)" in on and "adv->setScanResponseData(sr)" in on
+    return u16, (app.group(1) if app else None), solicit, in_sr
+
+def t_solicitation_is_really_ancs():
+    """Eighteen bytes typed out by hand, which is eighteen chances to
+    get it wrong, and a wrong one fails silently: the phone simply
+    never offers its notifications. So it is checked against the UUID
+    string the rest of the file uses."""
+    blk = re.search(r"ANCS_SOLICIT\[18\] = \{(.*?)\};", src, re.S).group(1)
+    vals = [int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{2})", blk)]
+    assert len(vals) == 18, f"{len(vals)} bytes, wanted 18"
+    assert vals[0] == 0x11, "the length byte is wrong"
+    assert vals[1] == 0x15, "0x15 is the 128 bit solicitation list; this is not it"
+    uuid = re.search(r'NimBLEUUID ANCS_SVC\("([0-9A-Fa-f-]+)"\)', src).group(1).replace("-", "")
+    want = list(bytes.fromhex(uuid))[::-1]        # little endian on the air
+    assert vals[2:] == want, "the solicited UUID is not the ANCS one, backwards"
+    print("        18 bytes, type 0x15, and the UUID matches ANCS_SVC reversed")
+run("The thing it solicits really is Apple's notification service", t_solicitation_is_really_ancs)
 
 def t_packet_fits():
-    u16, u128, name, app, scan = parse_adv()
-    n, where = build_adv(u16, u128, name, app, scan)
-    print(f"        {n} of {ADV_MAX} bytes, name {name!r} in the {where}")
+    u16, app, solicit, in_sr = parse_adv()
+    n = 3                                        # flags
+    if solicit: n += 18
+    if app:     n += 4
+    for i, _ in enumerate(u16): n += 2 if i else 4
+    print(f"        {n} of {ADV_MAX} bytes used, name in the scan response")
     assert n <= ADV_MAX, f"{n} bytes will not go out"
-    assert where == "primary", \
-        f"the name is in the {where}; a passive scan never sees it"
-run("The name goes out in the advertisement itself", t_packet_fits)
+    assert in_sr, ("the name is not in the scan response, so either it does not "
+                   "go out at all or it pushes something else off the packet")
+run("Everything that has to be in the advertisement fits", t_packet_fits)
 
 def t_ios_will_list_it():
     """iOS Settings does not enumerate plain BLE peripherals. It shows
     classic radios and the standard profiles the system consumes
-    itself, HID chief among them. Anything else is reachable only from
-    an app holding CoreBluetooth. v5.15.0 advertised a 128 bit ANCS
-    solicitation, which is not one of those, so Settings showed
-    nothing and no amount of waiting was going to change it."""
-    SYSTEM_PROFILES = {"0x1812": "HID", "0x180d": "heart rate", "0x1808": "glucose"}
-    u16, u128, name, app, scan = parse_adv()
+    itself, HID chief among them. v5.15.0 advertised neither and was
+    invisible however long you looked."""
+    SYSTEM_PROFILES = {"0x1812": "HID"}
+    u16, app, solicit, in_sr = parse_adv()
     got = [SYSTEM_PROFILES[u.lower()] for u in u16 if u.lower() in SYSTEM_PROFILES]
-    assert got, ("nothing in the advertisement is a profile iOS Settings "
-                 f"consumes; it advertises {u16 + u128} and will not be listed")
-    assert app, "no appearance, so Settings has no icon or category for it"
-    assert app.lower() == "0x03c2", \
-        (f"appearance {app} is not the mouse. A keyboard would also be listed, "
+    assert got, f"advertises {u16}, none of which iOS Settings consumes"
+    assert app and app.lower() == "0x03c2", \
+        (f"appearance {app} is not the mouse. A keyboard would be listed too, "
          "and would take the on screen keyboard off the phone while connected")
-    print(f"        advertises {got[0]}, appearance {app}: Settings has a category for it")
-run("An iPhone's Settings page will actually list it", t_ios_will_list_it)
+    assert solicit, "nothing solicits ANCS, so there is no notification prompt"
+    print(f"        {got[0]} for the listing, appearance {app}, ANCS for the prompt")
+run("An iPhone will list it and offer its notifications", t_ios_will_list_it)
 
 def t_the_old_packet_was_doomed():
-    """Run the v5.15.0 advertisement through the same model. Both
-    faults should show up, or this check is not proving anything."""
-    n, where = build_adv([], ["ANCS_UUID"], "Rafiq Ahmed", None, True)
-    assert where == "scan response", "the model no longer reproduces the fault"
-    assert n == 21, n
-    print(f"        v5.15.0: {n} bytes, no system profile, "
-          f"name pushed to the {where}. Both faults reproduce.")
-run("The model reproduces what v5.15.0 actually sent", t_the_old_packet_was_doomed)
+    """v5.15.0: flags plus a 128 bit ANCS entry in the SERVICE list,
+    which is not the solicitation list and does not prompt for
+    anything, and no system profile at all. Both faults, from the
+    same model."""
+    n = 3 + 18
+    assert n + 2 + len("Rafiq Ahmed") > ADV_MAX, "the model no longer reproduces the fault"
+    print(f"        v5.15.0: {n} bytes, wrong AD type, no system profile, name displaced")
+run("The model still reproduces what v5.15.0 sent", t_the_old_packet_was_doomed)
 
 def t_stays_up_to_be_paired():
     """The radio only runs while the robot is awake, so the sleep
