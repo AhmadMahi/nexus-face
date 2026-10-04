@@ -163,10 +163,12 @@ def t_web_lazy():
     on from the robot's own menu has to start it then."""
     assert "bool webUp = false;" in src and "if (webUp) return;" in src, \
         "setupWeb can be run twice"
-    for ctx in ("flash(\"LOOKING\", 1200);", "WiFi.mode(WIFI_STA); WiFi.setSleep(false); setupWeb(); } }"):
-        assert ctx in src, "turning the network back on does not start the server"
-    assert "if (cfgOffline) {\n    cfgOffline = false;" in src, \
-        "asking for the hotspot does not take it out of offline mode"
+    # 5.15.0 made the mode a three way walk, so the words changed
+    for ctx in ('flash("LOOKING FOR WIFI", 1300);',
+                "WiFi.mode(WIFI_STA); WiFi.setSleep(false); setupWeb(); } }"):
+        assert ctx in src, f"turning the network back on does not start the server ({ctx!r})"
+    assert "if (cfgOffline) {\n    bleOff();" in src and "cfgNet = NET_WIFI;" in src, \
+        "asking for the hotspot does not take it back to WiFi, or leaves Bluetooth up"
     print("        server starts when the radio does, whenever that is")
 run("Turning the network back on starts what boot skipped", t_web_lazy)
 

@@ -27,6 +27,13 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+// Up here with the rest, not beside the code that uses them. Put them
+// halfway down and the prototypes Arduino generates land above them,
+// naming types nothing has heard of yet.
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLESecurity.h>
 #include <WiFiUdp.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
@@ -259,7 +266,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.14.0"
+#define FW_VERSION "5.15.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -323,7 +330,21 @@ const char* S_NAME[S_COUNT] =
 //  again on the next wake.
 //
 //  Either way the robot works. Offline is a mode, not a fault.
-bool cfgOffline = false;
+//  Three ways to be, not two. WiFi is what it has always done.
+//  Bluetooth means the WiFi radio never starts and the phone is what
+//  it talks to. Off means neither.
+//
+//  cfgOffline stays as the word the rest of the file uses for "there
+//  is no WiFi to be had", because that is as true in Bluetooth mode
+//  as in Off and every piece of logic asking the question wants the
+//  same answer in both. One line here instead of thirty edits.
+enum { NET_WIFI = 0, NET_BT, NET_OFF, NET_N };
+int cfgNet = NET_WIFI;
+const char* NET_NAME[NET_N] = { "wifi", "bluetooth", "off" };
+#define cfgOffline (cfgNet != NET_WIFI)
+static void bleOn();
+static void bleOff();
+static const char* btShort();
 bool netDown = false;
 int  netMisses = 0;                // failed joins since the last success
 bool hadNet = false;               // it has been online at least once this time up
@@ -881,6 +902,124 @@ unsigned long relaxNext = 0;
 //  because another is a tenth of a second behind.
 WiFiUDP cursorUdp;
 #define CURSOR_PORT 4210
+
+// ================================================================
+//  BLUETOOTH
+// ================================================================
+//  The phone instead of the network.
+//
+//  The robot advertises, you pair it once from Settings on the
+//  iPhone, and iOS reconnects on its own after that. The pairing has
+//  to be a real bond with encryption, because the two things worth
+//  having from a phone, the clock and the notifications, are both
+//  behind one and iOS hands neither to an unbonded peer.
+//
+//  A note for whoever reads this next, because it cost me a rewrite:
+//  the C3 Arduino build uses NimBLE, not Bluedroid. CONFIG_NIMBLE_ENABLED
+//  is set and CONFIG_BLUEDROID_ENABLED is not, so none of the
+//  esp_ble_gattc_* and esp_ble_gap_* calls that most ESP32 Bluetooth
+//  writing uses exist here at all. The callbacks take
+//  ble_gap_conn_desc, security goes through the static BLESecurity
+//  calls, and anything lower is NimBLE's own ble_gattc_*. I wrote the
+//  Bluedroid version first and the compiler told me.
+//
+//  btStage is the reason the screen says what it says. None of this
+//  can be tried from a desk, so instead of a light that is on or
+//  off, it reports which rung it reached, and a failure says where.
+enum { BT_OFF = 0, BT_ADVERTISING, BT_CONNECTED, BT_BONDED };
+int      btStage = BT_OFF;
+bool     btUp    = false;             // the stack is running
+uint32_t btSince = 0;                 // when the rung last changed
+uint16_t btConn  = 0xFFFF;            // the live connection, or none
+
+// Soliciting Apple's notification service tells iOS this is worth
+// staying attached to. Nothing reads notifications yet; advertising
+// for them costs nothing and makes iOS treat the pairing properly.
+#define ANCS_UUID "7905F431-B5CE-4E99-A40F-4B1E122D00D0"
+
+static void btSet(int stage) {
+  if (btStage == stage) return;
+  btStage = stage;
+  btSince = millis();
+  Serial.printf("bluetooth: %s\n",
+                stage == BT_OFF ? "off" : stage == BT_ADVERTISING ? "advertising"
+              : stage == BT_CONNECTED ? "connected" : "bonded");
+}
+
+static const char* btShort() {
+  switch (btStage) {
+    case BT_ADVERTISING: return "pair me";
+    case BT_CONNECTED:   return "linked";
+    case BT_BONDED:      return "paired";
+    default:             return "starting";
+  }
+}
+
+class BtServerCb : public BLEServerCallbacks {
+  void onConnect(BLEServer* sv, ble_gap_conn_desc* d) override {
+    btConn = d ? d->conn_handle : 0xFFFF;
+    btSet(BT_CONNECTED);
+    wake("phone");
+  }
+  void onDisconnect(BLEServer* sv, ble_gap_conn_desc* d) override {
+    btConn = 0xFFFF;
+    btSet(BT_ADVERTISING);
+    // Straight back to advertising, or the phone has nothing to come
+    // back to and you would be pairing it by hand every time.
+    BLEDevice::startAdvertising();
+  }
+};
+
+class BtSecurityCb : public BLESecurityCallbacks {
+  // No keyboard, and no screen worth typing a number into, so this
+  // is a just-works bond.
+  uint32_t onPassKeyRequest() override { return 0; }
+  void onPassKeyNotify(uint32_t pass) override {}
+  bool onConfirmPIN(uint32_t pin) override { return true; }
+  bool onSecurityRequest() override { return true; }
+  void onAuthenticationComplete(ble_gap_conn_desc* d) override {
+    if (!d || !d->sec_state.encrypted) {
+      Serial.println("bluetooth: pairing did not take");
+      btSet(BT_CONNECTED);
+      return;
+    }
+    btConn = d->conn_handle;
+    btSet(BT_BONDED);
+  }
+};
+
+static void bleOn() {
+  if (btUp) return;
+  Serial.println("bluetooth: starting");
+  char nm[24];
+  snprintf(nm, sizeof(nm), "Rafiq %s", cfgName);
+  BLEDevice::init(nm);
+  BLEDevice::setSecurityCallbacks(new BtSecurityCb());
+  BLESecurity::setAuthenticationMode(true, false, true);   // bond, no MITM, secure
+  BLESecurity::setCapability(BLE_HS_IO_NO_INPUT_OUTPUT);
+
+  BLEServer* sv = BLEDevice::createServer();
+  sv->setCallbacks(new BtServerCb());
+
+  BLEAdvertising* ad = BLEDevice::getAdvertising();
+  ad->setScanResponse(true);
+  ad->addServiceUUID(BLEUUID(ANCS_UUID));
+  BLEDevice::startAdvertising();
+
+  btUp = true;
+  btSet(BT_ADVERTISING);
+}
+
+// bleOn and bleOff, not btStart and btStop: the core already owns
+// those two, for a classic controller the C3 does not have.
+static void bleOff() {
+  if (!btUp) return;
+  Serial.println("bluetooth: stopping");
+  BLEDevice::deinit(true);
+  btUp = false;
+  btConn = 0xFFFF;
+  btSet(BT_OFF);
+}
 
 // ---------------- gesture mode ----------------
 //
@@ -2086,7 +2225,23 @@ static void drawHome() {
     char hi[34];
     snprintf(hi, sizeof(hi), "%s, %s",
              GREET[(millis() / 11000UL) % GREET_N], cfgName);
-    offlineIcon(4, 2);
+    // Bluetooth mode with nothing paired is the one state where the
+    // robot has something to ask of you, so it asks instead of
+    // saying hello to nobody.
+    if (cfgNet == NET_BT && btStage < BT_BONDED) {
+      btIcon(SCRW / 2, 20, 7);
+      ctr(btStage == BT_CONNECTED ? "Allow the pairing" : "Pair me in Settings", 36, 1);
+      char nm[26];
+      snprintf(nm, sizeof(nm), "Rafiq %s", cfgName);
+      ctr(nm, 48, 1);
+      ctr(btShort(), 57, 1);
+      oled.display();
+      return;
+    }
+    // On Bluetooth it is not offline, it is somewhere else. One mark
+    // or the other, never both.
+    if (cfgNet == NET_BT) btIcon(6, 5, 3);
+    else                  offlineIcon(4, 2);
     if (fb.ok) at(15, 2, fb.hm);
     if (!isnan(battV)) {
       char b[8]; snprintf(b, sizeof(b), "%d%%", battPct(battV));
@@ -2562,6 +2717,17 @@ static void drawGesture() {
     : cfgGestSrc == GSRC_TOUCH ? "touch the pad" : "knock or touch", 34, 1);
   ctr("hold 4s to stop", 52, 1);
   oled.display();
+}
+
+// Bluetooth's rune. h is half its height, so it can be a mark in the
+// corner of a line of text or the whole of a screen.
+static void btIcon(int cx, int cy, int h) {
+  const int w = (h + 1) / 2, m = h / 2;
+  oled.drawFastVLine(cx, cy - h, h * 2, SSD1306_WHITE);
+  oled.drawLine(cx, cy - h, cx + w, cy - m, SSD1306_WHITE);
+  oled.drawLine(cx + w, cy - m, cx - w, cy + m, SSD1306_WHITE);
+  oled.drawLine(cx, cy + h - 1, cx + w, cy + m, SSD1306_WHITE);
+  oled.drawLine(cx + w, cy + m, cx - w, cy - m, SSD1306_WHITE);
 }
 
 // A bell, drawn to the same weight as the gear so the carousel looks
@@ -3577,8 +3743,10 @@ static void drawSettings() {
       case C_ACCEL:  snprintf(v, sizeof(v), "hold"); break;
       case C_KNOCK:  snprintf(v, sizeof(v), "%s", cfgKnock ? "on" : "off"); break;
       case C_HIJRI:  snprintf(v, sizeof(v), "%+d d", cfgHijriAdj); break;
-      case C_MODE:   snprintf(v, sizeof(v), "%s", cfgOffline ? "off" :
-                              (netDown ? "no signal" : "on")); break;
+      case C_MODE:   snprintf(v, sizeof(v), "%s",
+                              cfgNet == NET_OFF ? "off" :
+                              cfgNet == NET_BT  ? btShort() :
+                              (netDown ? "no signal" : "wifi")); break;
       case C_BIKE:   snprintf(v, sizeof(v), "%s", cfgBike ? "on" : "off"); break;
       case C_SHAKE:  snprintf(v, sizeof(v), "%s",
                               (cfgBack == BACK_KNOCK && !cfgKnock)
@@ -6160,7 +6328,7 @@ static void resetSettings() {
   cfgAutoUp = false; prefs.putBool("autoup", cfgAutoUp);
   cfgKnock = false;  prefs.putBool("knock", cfgKnock);
   cfgHijriAdj = 0;   prefs.putInt("hadj", cfgHijriAdj);
-  cfgOffline = false; prefs.putBool("offl", cfgOffline);
+  cfgNet = NET_WIFI; prefs.putInt("net", cfgNet);
   cfgWakeIdx = 2;    prefs.putInt("wakeh", cfgWakeIdx);
   cfgBike = false;   prefs.putBool("bike", cfgBike);
   cfgBikeTpl = 0;    prefs.putInt("btpl", cfgBikeTpl);
@@ -6597,8 +6765,9 @@ static void startHotspot() {
   // you chose. There is no third state where the radio is both off and
   // serving an access point.
   if (cfgOffline) {
-    cfgOffline = false;
-    prefs.putBool("offl", cfgOffline);
+    bleOff();                      // the aerial cannot serve both
+    cfgNet = NET_WIFI;
+    prefs.putInt("net", cfgNet);
     netDown = false; netMisses = 0; netNextTry = 0;
     flash("NETWORK BACK ON", 1100);
   }
@@ -6853,23 +7022,26 @@ static void knockTwo() {
       case C_PRAYER:  prayerWanted = true; nextPrayerTry = 0; break;
       case C_ACCEL:   depth = 2; break;
       case C_MODE:
-        cfgOffline = !cfgOffline;
-        prefs.putBool("offl", cfgOffline);
-        if (cfgOffline) {
-          // Asked for, so it goes off and stays off. Nothing scans,
-          // nothing retries, and the carousel loses the weather.
-          WiFi.disconnect(true, false);
-          WiFi.mode(WIFI_OFF);
-          netDown = false;
-          if (screen == S_WEATHER) screen = S_HOME;
-          flash("NETWORK OFF", 1200);
-        } else {
-          netDown = false;
+        // Walked, the way every other list is walked: wifi, then
+        // bluetooth, then off, then round again.
+        cfgNet = (cfgNet + 1) % NET_N;
+        prefs.putInt("net", cfgNet);
+        netDown = false;
+        if (cfgNet == NET_WIFI) {
+          bleOff();
           netNextTry = 0;                   // the task picks it up at once
           WiFi.mode(WIFI_STA);
           WiFi.setSleep(false);
           setupWeb();                       // never started if it booted offline
-          flash("LOOKING", 1200);
+          flash("LOOKING FOR WIFI", 1300);
+        } else {
+          // Either of the others takes the WiFi radio down. Two
+          // radios on one aerial is one radio's worth of each.
+          WiFi.disconnect(true, false);
+          WiFi.mode(WIFI_OFF);
+          if (screen == S_WEATHER) screen = S_HOME;
+          if (cfgNet == NET_BT) { bleOn();  flash("BLUETOOTH ON", 1300); }
+          else                  { bleOff(); flash("EVERYTHING OFF", 1300); }
         }
         break;
       case C_BIKE:
@@ -7947,6 +8119,9 @@ static void apiState() {
   o += "\"backName\":\"" + String(BACK_NAME[cfgBack]) + "\",";
   o += "\"hadj\":" + String(cfgHijriAdj) + ",";
   o += "\"offline\":" + String(cfgOffline ? "true" : "false") + ",";
+  o += "\"net\":" + String(cfgNet) + ",";
+  o += "\"netName\":\"" + String(NET_NAME[cfgNet]) + "\",";
+  o += "\"bt\":\"" + String(btShort()) + "\",";
   o += "\"netDown\":" + String(netDown ? "true" : "false") + ",";
   o += "\"bike\":" + String(cfgBike ? "true" : "false") + ",";
   o += "\"btpl\":" + String(cfgBikeTpl) + ",";
@@ -8598,7 +8773,12 @@ static void setupWeb() {
     else if (k == "knock"){ cfgKnock    = (v != 0);                      prefs.putBool("knock", cfgKnock); }
     else if (k == "bike") { cfgBike     = (v != 0);                      prefs.putBool("bike", cfgBike); }
     else if (k == "btpl") { cfgBikeTpl  = constrain(v, 0, BIKE_TPL_N - 1); prefs.putInt("btpl", cfgBikeTpl); }
-    else if (k == "offl") { cfgOffline  = (v != 0);                      prefs.putBool("offl", cfgOffline);
+    else if (k == "net")  { cfgNet = constrain(v, 0, NET_N - 1);         prefs.putInt("net", cfgNet);
+                            if (cfgNet == NET_BT) bleOn(); else bleOff();
+                            if (cfgOffline) { WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF); }
+                            else { netDown = false; netMisses = 0; netNextTry = 0;
+                                   WiFi.mode(WIFI_STA); WiFi.setSleep(false); setupWeb(); } }
+    else if (k == "offl") { cfgNet = v ? NET_OFF : NET_WIFI;             prefs.putInt("net", cfgNet);
                             if (cfgOffline) { WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF); }
                             else { netDown = false; netMisses = 0; netNextTry = 0;
                                    WiFi.mode(WIFI_STA); WiFi.setSleep(false); setupWeb(); } }
@@ -9160,7 +9340,13 @@ void setup() {
   cfgAutoUp   = prefs.getBool("autoup", false);
   cfgKnock    = prefs.getBool("knock", false);   // the pad drives this now
   cfgHijriAdj = constrain(prefs.getInt("hadj", 0), -2, 2);
-  cfgOffline  = prefs.getBool("offl", false);
+  // Carried over from the old on/off. Off meant off; anything else
+  // was WiFi, because Bluetooth did not exist yet.
+  if (prefs.isKey("net")) cfgNet = constrain(prefs.getInt("net", NET_WIFI), 0, NET_N - 1);
+  else {
+    cfgNet = prefs.getBool("offl", false) ? NET_OFF : NET_WIFI;
+    prefs.putInt("net", cfgNet);
+  }
   cfgWakeIdx  = constrain(prefs.getInt("wakeh", 2), 0, WAKE_N - 1);
   cfgBike     = prefs.getBool("bike", false);
   cfgBikeTpl  = constrain(prefs.getInt("btpl", 0), 0, BIKE_TPL_N - 1);
@@ -9313,9 +9499,14 @@ void setup() {
   if (cfgOffline) {
     WiFi.persistent(false);
     WiFi.mode(WIFI_OFF);
-    btStop();                        // nothing uses it; make sure nothing can
     netUsing = -1; netTrying = 0;
-    Serial.println("offline by choice: radio stays down");
+    if (cfgNet == NET_BT) {
+      bleOn();
+      Serial.println("bluetooth mode: the aerial belongs to the phone");
+    } else {
+      btStop();                      // nothing uses it; make sure nothing can
+      Serial.println("offline by choice: both radios stay down");
+    }
   } else {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
