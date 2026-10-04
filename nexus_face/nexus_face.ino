@@ -267,7 +267,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.16.0"
+#define FW_VERSION "5.17.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -1005,6 +1005,21 @@ static const char* btShort() {
 // way through takes the thing you are hunting for off the air. So the
 // panel stays up while it is advertising or mid handshake, and lets
 // go once the bond is made or the window has gone by.
+// A setting must never be able to put the robot beyond reach. The
+// mode is written to NVS the moment you choose it, so anything that
+// panics while the radio comes up panics again on the next boot, and
+// on every boot after that. That is exactly what 5.16.0 did: one
+// uninitialised pointer, and the only way back in was a cable.
+//
+// So Bluetooth leaves a note before it tries anything, and tears it
+// up once the robot has plainly survived. A note still lying there at
+// boot means the last attempt never came back, and the robot drops to
+// WiFi and says so rather than walking into it again.
+#define BT_PROVEN_MS 12000UL
+bool     btNoteOut = false;
+uint32_t btNoteAt  = 0;
+bool     btFellBack = false;      // say so once, on the first screen
+
 #define BT_PAIR_HOLD_MS 90000UL
 static bool btPairing() {
   if (cfgNet != NET_BT || !btUp) return false;
@@ -1048,6 +1063,8 @@ class BtSecurityCb : public BLESecurityCallbacks {
 static void bleOn() {
   if (btUp) return;
   Serial.println("bluetooth: starting");
+  prefs.putBool("bttry", true);        // torn up in loop() once it holds
+  btNoteOut = true; btNoteAt = millis();
   char nm[24];
   snprintf(nm, sizeof(nm), "Rafiq %s", cfgName);
   BLEDevice::init(nm);
@@ -1059,13 +1076,22 @@ static void bleOn() {
   sv->setCallbacks(new BtServerCb());
 
   btHid = new BLEHIDDevice(sv);
-  btHid->manufacturer("Rafiq");
+  // manufacturer() with no argument is the one that CREATES the
+  // characteristic; manufacturer(String) only writes to it, and the
+  // pointer it writes through is never initialised by the
+  // constructor. Calling the second without the first stores through
+  // whatever was on the heap, which is what panicked 5.16.0 on the
+  // first boot into Bluetooth, every boot after it, and left no way
+  // in but a cable. The core's own example does it this way round.
+  btHid->manufacturer()->setValue("Rafiq");
   btHid->pnp(0x02, 0xE502, 0xA111, 0x0210);
   btHid->hidInfo(0x00, 0x02);          // not localised, remote wakeable
   btHid->reportMap((uint8_t*)HID_MAP, sizeof(HID_MAP));
   btKeys = btHid->inputReport(1);
-  btHid->startServices();
+  // Before the services start, so this is a plain write and not a
+  // notify to a connection that does not exist yet.
   if (!isnan(battV)) btHid->setBatteryLevel(battPct(battV));
+  btHid->startServices();
 
   BLEAdvertising* ad = BLEDevice::getAdvertising();
   ad->setAppearance(0x03C2);           // a mouse, so Settings lists it
@@ -1090,6 +1116,8 @@ static void bleOff() {
   btUp = false;
   btConn = 0xFFFF;
   btHid = nullptr; btKeys = nullptr;   // deinit already took them
+  prefs.putBool("bttry", false);       // stopped on purpose, not a crash
+  btNoteOut = false;
   btSet(BT_OFF);
 }
 
@@ -9574,6 +9602,18 @@ void setup() {
   }
 
   loadNets();
+  // Did the last attempt at Bluetooth come back? If the note is still
+  // there, it did not, and the robot is not going to try it again on
+  // its own. WiFi, and a word on the screen about why.
+  if (cfgNet == NET_BT && prefs.getBool("bttry", false)) {
+    prefs.putBool("bttry", false);
+    cfgNet = NET_WIFI;
+    prefs.putInt("net", cfgNet);
+    btFellBack = true;
+    Serial.println("bluetooth did not survive its last start: back on WiFi");
+    flash("BLUETOOTH FAILED", 1400);
+    flash("BACK ON WIFI", 1200);
+  }
   if (cfgOffline) {
     WiFi.persistent(false);
     WiFi.mode(WIFI_OFF);
@@ -9694,6 +9734,12 @@ void loop() {
   web.handleClient();
   unsigned long now = millis();
 
+  // Up this long with the radio running is survival. Tear the note up
+  // so a later unplug is not read as a crash.
+  if (btNoteOut && now - btNoteAt > BT_PROVEN_MS) {
+    prefs.putBool("bttry", false); btNoteOut = false;
+    Serial.println("bluetooth: held, note cleared");
+  }
   if (now - lastPoll >= 45) { lastPoll = now; input(); }
   readBattery();                       // every twenty seconds, it decides
   serviceSession();
