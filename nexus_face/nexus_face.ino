@@ -259,7 +259,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.13.0"
+#define FW_VERSION "5.14.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -504,6 +504,49 @@ const char* C_NAME[C_COUNT] =
     "Go back by", "Power down", "Wake on hold", "Battery full",
     "Pair a Mac", "Check update", "Auto update",
     "Reset settings", "Reboot", "About" };
+
+// ---------------- settings, in groups ----------------
+//
+//  Twenty four rows in one list is a list you scroll through hunting
+//  for the thing you came for, and the thing you came for is usually
+//  the network or the brightness, which were eight apart. Four groups
+//  of five to eight is four words to read and then a short list.
+//
+//  itemIdx stays what it always was, a C_ index, so every case below
+//  is untouched. What is new is which of them this group contains and
+//  where you are in the group.
+// SG_, not G_: the games already own G_.
+//  Display first, and in the order the flat list had, because that is
+//  what makes this strictly better rather than a trade. Grouping adds
+//  one press to reach a group, so anything that was near the top of
+//  the old list would have moved further away. Five of them did, until
+//  the check said so. Like this, every single setting is the same
+//  number of presses away or fewer, and the worst case goes from
+//  twenty three to seven.
+enum { SG_DISPLAY = 0, SG_WIRELESS, SG_CONTROLS, SG_SYSTEM, SG_COUNT };
+const char* SG_NAME[SG_COUNT] = { "Display", "Wireless", "Controls", "System" };
+#define SG_MAX 8
+#define SG_END 0xFF
+const uint8_t SG_ROWS[SG_COUNT][SG_MAX] = {
+  { C_BRIGHT, C_FACE,    C_SLEEP, C_TURN,   C_POPUP,  C_EYES,   C_HIJRI, C_BIKE },
+  { C_MODE,   C_HOTSPOT, C_PAIR,  C_PRAYER, C_UPDATE, C_AUTOUP, SG_END,  SG_END },
+  { C_KNOCK,  C_TAP,     C_SHAKE, C_WAKEH,  C_ACCEL,  SG_END,   SG_END,  SG_END },
+  { C_DEEP,   C_BATT,    C_RESET, C_REBOOT, C_ABOUT,  SG_END,   SG_END,  SG_END },
+};
+static int sgLen(int g) {
+  int n = 0; while (n < SG_MAX && SG_ROWS[g][n] != SG_END) n++; return n;
+}
+static int sgPos(int g, int item) {
+  for (int i = 0; i < sgLen(g); i++) if (SG_ROWS[g][i] == item) return i;
+  return 0;
+}
+static int sgNext(int g, int item) {
+  return SG_ROWS[g][(sgPos(g, item) + 1) % sgLen(g)];
+}
+// Which list is on screen: -1 is the four groups, otherwise the rows
+// of that one. Depth is left alone; it has been got wrong here before
+// and the settings are the one screen that already uses three of it.
+int setGrp = -1, grpSel = 0;
 
 // Zero is the dimmest the panel goes, not off: the SSD1306 still shows
 // faintly at contrast zero. After that, quarters.
@@ -3492,14 +3535,35 @@ static void drawSettings() {
     if (tapChosen)  { drawTapTest(); return; }
     drawTapTry(); return;
   }
-  bar(depth == 2 ? "CHANGE" : "SETTINGS");
+  // The four groups. They all fit on one screen, which is the point.
+  if (depth == 1 && setGrp < 0) {
+    bar("SETTINGS");
+    for (int g = 0; g < SG_COUNT; g++) {
+      int y = 14 + g * 12;
+      bool on = (g == grpSel);
+      if (on) { oled.fillRect(0, y - 2, SCRW, 12, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
+      else      oled.setTextColor(SSD1306_WHITE);
+      at(3, y, SG_NAME[g]);
+      char n[4];
+      snprintf(n, sizeof(n), "%d", sgLen(g));
+      at(SCRW - 3 - (int)strlen(n) * 6, y, n);
+    }
+    oled.setTextColor(SSD1306_WHITE);
+    oled.display();
+    return;
+  }
+
+  const int grp = setGrp < 0 ? SG_DISPLAY : setGrp;
+  const int rows = sgLen(grp);
+  bar(depth == 2 ? "CHANGE" : SG_NAME[grp]);
 
   char v[18];
-  int first = itemIdx > 3 ? itemIdx - 3 : 0;
-  if (first > C_COUNT - 4) first = C_COUNT - 4;
+  int here = sgPos(grp, itemIdx);
+  int first = here > 3 ? here - 3 : 0;
+  if (first > rows - 4) first = rows - 4;
   if (first < 0) first = 0;
-  for (int r = 0; r < 4 && first + r < C_COUNT; r++) {
-    int i = first + r, y = 14 + r * 12;
+  for (int r = 0; r < 4 && first + r < rows; r++) {
+    int i = SG_ROWS[grp][first + r], y = 14 + r * 12;
     bool on = (i == itemIdx);
     if (on) { oled.fillRect(0, y - 2, SCRW, 12, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
     else      oled.setTextColor(SSD1306_WHITE);
@@ -6614,7 +6678,11 @@ static void knockOne() {
     return;
   }
   if (screen == S_SETTINGS) {
-    if (depth == 1) { itemIdx = (itemIdx + 1) % C_COUNT; return; }
+    if (depth == 1) {
+      if (setGrp < 0) grpSel = (grpSel + 1) % SG_COUNT;   // the four
+      else            itemIdx = sgNext(setGrp, itemIdx);  // within one
+      return;
+    }
     switch (itemIdx) {
       case C_BRIGHT: { int i = 0;
                        for (int k = 0; k < BRIGHT_N; k++) if (BRIGHT_OPTS[k] == cfgBright) i = k;
@@ -6652,7 +6720,7 @@ static void knockTwo() {
       case S_FAITH:    depth = 1; itemIdx = 0; subIdx = 0; break;
       case S_READS:    if (readCount) { depth = 1; itemIdx = 0; } else refillShelf(); break;
       case S_GAMES:    depth = 1; itemIdx = 0; navCalBegin(false); break;
-      case S_SETTINGS: depth = 1; itemIdx = 0; break;
+      case S_SETTINGS: depth = 1; setGrp = -1; grpSel = 0; itemIdx = 0; break;
       case S_REMIND:   if (remCount) { depth = 1; remIdx = 0; remConfirm = false; } break;
       case S_HOME:
         // With no clock this screen is a stopwatch, and restarting it is
@@ -6761,6 +6829,11 @@ static void knockTwo() {
     return;
   }
   if (screen == S_SETTINGS && depth == 1) {
+    if (setGrp < 0) {                     // open the group you are on
+      setGrp = grpSel;
+      itemIdx = SG_ROWS[setGrp][0];
+      return;
+    }
     switch (itemIdx) {
       case C_REBOOT:  delay(150); ESP.restart(); break;
       case C_UPDATE:
@@ -6858,6 +6931,10 @@ static void knockThree() {
     depth = 0; itemIdx = 0;
     return;
   }
+  // Back out of a group to the four, rather than out of the settings
+  // altogether. Leaving takes one more press, which is what you want
+  // when the thing you were looking for is in the group next door.
+  if (screen == S_SETTINGS && depth == 1 && setGrp >= 0) { setGrp = -1; return; }
   if (screen == S_SETTINGS && itemIdx == C_RESET && depth == 2) { depth = 1; return; }
   if (screen == S_SETTINGS && itemIdx == C_TAP && depth >= 2) {
     if (depth == 3) {

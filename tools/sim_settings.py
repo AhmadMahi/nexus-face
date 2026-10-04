@@ -38,7 +38,9 @@ def block(after, opener="switch (itemIdx) {"):
 
 VAL  = block("at(3, y, C_NAME[i]);", "switch (i) {")
 # a single press at depth two walks the value; a long press opens or acts
-CYCLE = block("if (screen == S_SETTINGS) {\n    if (depth == 1) { itemIdx = (itemIdx + 1) % C_COUNT; return; }")
+# 5.14.0 put the settings into groups, so a press at depth one walks
+# the groups or the rows of one rather than the whole flat list.
+CYCLE = block("else            itemIdx = sgNext(setGrp, itemIdx);  // within one")
 def blockContaining(marker, opener="switch (itemIdx) {"):
     """The switch that actually holds this case. knockTwo has several
     switches on itemIdx and taking the first one silently measured the

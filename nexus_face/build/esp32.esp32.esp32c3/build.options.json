@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "../..,../..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32c3:PartitionScheme=min_spiffs,CDCOnBoot=cdc",
+  "hardwareFolders": "/Users/shukranaahmed/Library/Arduino15/packages/esp32/hardware/esp32/3.3.10,/Users/shukranaahmed/Library/Arduino15/packages/esp32/hardware/esp32/3.3.10",
+  "otherLibrariesFolders": "/Users/shukranaahmed/Documents/Arduino/libraries",
+  "sketchLocation": "/private/tmp/claude-501/-Users-shukranaahmed-Documents-Arduino-salah-clock/cb77d77e-56fb-4e77-ae7a-90f4e68d5da0/scratchpad/nexus-repo/nexus_face"
+}
