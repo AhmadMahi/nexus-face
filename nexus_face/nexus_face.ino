@@ -267,7 +267,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.18.0"
+#define FW_VERSION "5.19.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -1026,6 +1026,18 @@ static const char* btShort() {
 // pattern; one is a Tuesday.
 #define BT_PROVEN_MS 60000UL
 #define BT_GIVE_UP        3
+
+// And the general case, because the robot is a sealed box now and
+// the cable is not an option any more.
+//
+// The Bluetooth count above only knows about Bluetooth. Anything else
+// that panics on its way up would loop the same way and leave nothing
+// to update over. A panic reboots the chip and sets the reset reason,
+// so consecutive panics can be counted without writing to NVS on
+// every ordinary boot: a clean start clears the count, and three
+// panics in a row bring it up somewhere known to be reachable.
+#define SAFE_AFTER 3
+bool safeMode = false;
 bool     btNoteOut = false;
 uint32_t btNoteAt  = 0;
 int      btTries   = 0;
@@ -8403,6 +8415,7 @@ static void apiState() {
   o += "\"net\":" + String(cfgNet) + ",";
   o += "\"netName\":\"" + String(NET_NAME[cfgNet]) + "\",";
   o += "\"bt\":\"" + String(btShort()) + "\",";
+  o += "\"safe\":" + String(safeMode ? "true" : "false") + ",";
   o += "\"netDown\":" + String(netDown ? "true" : "false") + ",";
   o += "\"bike\":" + String(cfgBike ? "true" : "false") + ",";
   o += "\"btpl\":" + String(cfgBikeTpl) + ",";
@@ -9601,6 +9614,24 @@ void setup() {
   prefs.begin("nexus", false);
   cBoot = prefs.getUInt("boots", 0) + 1;
   prefs.putUInt("boots", cBoot);
+
+  // Three panics in a row and the robot stops trying to be clever.
+  // A deep sleep wake reports ESP_RST_DEEPSLEEP and a power up
+  // reports ESP_RST_POWERON, so neither of those is counted, and
+  // neither writes to NVS unless there was something to clear.
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    bool crashed = (rr == ESP_RST_PANIC   || rr == ESP_RST_INT_WDT ||
+                    rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT);
+    int crashes = prefs.getInt("panics", 0);
+    if (crashed) { crashes++; prefs.putInt("panics", crashes); }
+    else if (crashes)         prefs.putInt("panics", 0);
+    if (crashed && crashes >= SAFE_AFTER) {
+      safeMode = true;
+      prefs.putInt("panics", 0);
+      Serial.printf("safe mode: %d panics running\n", crashes);
+    }
+  }
   cfgBright   = constrain(prefs.getInt("bri", 160), 0, 255);
   cfgSleepIdx = constrain(prefs.getInt("slpi", 1), 0, SLEEP_N - 1);
   cfgPopupIdx = constrain(prefs.getInt("popi", 2), 0, POPUP_N - 1);
@@ -9777,6 +9808,16 @@ void setup() {
   }
 
   loadNets();
+  // Safe mode is WiFi and nothing else. Gesture mode is already off
+  // at boot and only the Mac turns it on, so the radio is the whole
+  // of it: whatever was wrong can be fixed over the air from here.
+  if (safeMode) {
+    cfgNet = NET_WIFI;
+    prefs.putInt("net", cfgNet);
+    prefs.putInt("btry2", 0);
+    flash("SAFE MODE", 1500);
+    flash("ON WIFI, UPDATE ME", 1800);
+  }
   // Did the last attempt at Bluetooth come back? If the note is still
   // there, it did not, and the robot is not going to try it again on
   // its own. WiFi, and a word on the screen about why.

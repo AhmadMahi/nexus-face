@@ -133,7 +133,7 @@ def t_a_note_is_left():
 run("Bluetooth says it is about to try", t_a_note_is_left)
 
 def t_a_note_still_there_means_no():
-    boot = src[src.index("  loadNets();\n  // Did the last attempt"):]
+    boot = src[src.index("  // Did the last attempt at Bluetooth come back?"):]
     boot = boot[:boot.index("if (cfgOffline)")]
     assert 'prefs.getInt("btry2", 0) >= BT_GIVE_UP' in boot, "boot does not look at the count"
     assert "cfgNet = NET_WIFI;" in boot and 'prefs.putInt("net", cfgNet);' in boot, \
@@ -141,8 +141,10 @@ def t_a_note_still_there_means_no():
     assert 'prefs.putInt("btry2", 0);' in boot, \
         "the count is not cleared, so WiFi is now stuck too"
     assert "flash(" in boot, "it recovers silently, so the robot looks broken"
-    assert src.index("  loadNets();\n  // Did the last attempt") < src.index("if (cfgOffline) {\n    WiFi.persistent"), \
+    assert src.index("  // Did the last attempt at Bluetooth come back?") < src.index("if (cfgOffline) {\n    WiFi.persistent"), \
         "the check runs after the branch that would start the radio"
+    assert src.index("if (safeMode) {") < src.index("  // Did the last attempt at Bluetooth come back?"), \
+        "safe mode lands after the Bluetooth fallback, so it could be overridden"
     print("        one bad boot and it is back on WiFi, saying so")
 run("A note still lying there at boot means do not try again", t_a_note_still_there_means_no)
 
@@ -171,6 +173,83 @@ def t_no_setting_can_brick_it():
     assert "bleOn();" in blk
     print("        the mode still commits first, but the note makes that survivable")
 run("No setting leaves the robot reachable only by cable", t_no_setting_can_brick_it)
+
+# ---------------- the general safety net ----------------
+#
+#  The Bluetooth count only knows about Bluetooth. This is the one
+#  that matters now the case is sealed: anything at all that panics
+#  on the way up must still end somewhere an update can reach.
+SAFE_AFTER = int(re.search(r"#define SAFE_AFTER (\d+)", src).group(1))
+
+class Boot:
+    """The block at the top of setup, as something you can run."""
+    def __init__(self): self.panics = 0; self.writes = 0; self.net = "bluetooth"
+    def boot(self, reason):
+        crashed = reason in ("PANIC", "INT_WDT", "TASK_WDT", "WDT")
+        safe = False
+        if crashed:
+            self.panics += 1; self.writes += 1
+        elif self.panics:
+            self.panics = 0; self.writes += 1
+        if crashed and self.panics >= SAFE_AFTER:
+            safe = True; self.panics = 0; self.writes += 1
+        if safe: self.net = "wifi"
+        return safe
+
+def t_three_panics_then_safe():
+    b = Boot()
+    assert not b.boot("PANIC"), "safe mode on the first panic"
+    assert not b.boot("PANIC"), "safe mode on the second panic"
+    assert b.boot("PANIC"), f"{SAFE_AFTER} panics running and still not safe mode"
+    assert b.net == "wifi", "safe mode did not move it somewhere reachable"
+    print(f"        {SAFE_AFTER} panics running, then WiFi")
+run("Panics in a row end in a state an update can reach", t_three_panics_then_safe)
+
+def t_one_bad_day_is_not_a_pattern():
+    b = Boot()
+    b.boot("PANIC"); b.boot("PANIC")
+    assert not b.boot("POWERON"), "a clean boot tripped it"
+    assert b.panics == 0, "a clean boot did not clear the count"
+    assert not b.boot("PANIC") and not b.boot("PANIC"), "the count did not really reset"
+    print("        a clean boot in between clears the count")
+run("A clean boot resets the count", t_one_bad_day_is_not_a_pattern)
+
+def t_sleeping_is_not_crashing():
+    """A deep wake is a boot. If those counted, a robot that naps
+    often would put itself in safe mode having never failed."""
+    b = Boot()
+    for _ in range(50): b.boot("DEEPSLEEP")
+    assert b.panics == 0 and b.net == "bluetooth", "napping tripped safe mode"
+    print("        50 deep sleep wakes, no count, no safe mode")
+run("Waking from sleep is not a crash", t_sleeping_is_not_crashing)
+
+def t_no_flash_wear():
+    """Counting by writing on every boot would be thousands of NVS
+    writes a day on a robot that sleeps. The reset reason is free."""
+    b = Boot()
+    for _ in range(500): b.boot("DEEPSLEEP")
+    assert b.writes == 0, f"{b.writes} NVS writes across 500 ordinary wakes"
+    b.boot("PANIC"); b.boot("POWERON")
+    assert b.writes == 2, b.writes
+    print("        500 ordinary wakes, zero NVS writes")
+run("Ordinary boots do not wear the flash", t_no_flash_wear)
+
+def t_it_is_read_from_the_chip():
+    blk = src[src.index("esp_reset_reason_t rr = esp_reset_reason();"):]
+    blk = blk[:blk.index("\n  }")]
+    for r in ("ESP_RST_PANIC", "ESP_RST_INT_WDT", "ESP_RST_TASK_WDT", "ESP_RST_WDT"):
+        assert r in blk, f"{r} is not counted as a crash"
+    for r in ("ESP_RST_DEEPSLEEP", "ESP_RST_POWERON"):
+        assert r not in blk, f"{r} is being treated as a crash"
+    assert 'prefs.getUInt("boots"' in src and '"panics"' in src, \
+        "the panic count is sharing the lifetime boot counter's key"
+    sm = src[src.index("if (safeMode) {"):]
+    sm = sm[:sm.index("\n  }")]
+    assert "cfgNet = NET_WIFI;" in sm and 'prefs.putInt("net", cfgNet);' in sm, \
+        "safe mode does not actually land on WiFi"
+    assert "flash(" in sm, "it recovers silently, so the robot looks broken"
+    print("        counted from the chip's own reset reason, on its own key")
+run("The crash is the chip's word, not a guess", t_it_is_read_from_the_chip)
 
 print()
 if fails:
