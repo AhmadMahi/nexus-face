@@ -267,7 +267,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.17.0"
+#define FW_VERSION "5.18.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -1015,9 +1015,20 @@ static const char* btShort() {
 // up once the robot has plainly survived. A note still lying there at
 // boot means the last attempt never came back, and the robot drops to
 // WiFi and says so rather than walking into it again.
-#define BT_PROVEN_MS 12000UL
+// A count rather than a flag, and a longer window, because the first
+// version only guarded the twelve seconds around startup. The GATT
+// work below only begins when a phone connects, which on a bonded
+// pair is seconds after boot but can be minutes: a crash there would
+// loop just as tightly and the note would already have been torn up.
+//
+// Counting also means an ordinary power cut in the first minute is
+// not mistaken for a crash. Three unproven starts in a row is a
+// pattern; one is a Tuesday.
+#define BT_PROVEN_MS 60000UL
+#define BT_GIVE_UP        3
 bool     btNoteOut = false;
 uint32_t btNoteAt  = 0;
+int      btTries   = 0;
 bool     btFellBack = false;      // say so once, on the first screen
 
 #define BT_PAIR_HOLD_MS 90000UL
@@ -1027,6 +1038,18 @@ static bool btPairing() {
   return btStage == BT_ADVERTISING && millis() - btSince < BT_PAIR_HOLD_MS;
 }
 
+// ---- the clock from the phone: state ----
+//
+//  Up here only because onDisconnect below has to be able to throw it
+//  all away. The working parts are further down, past the point where
+//  timeOk and clockSrc exist.
+enum { CTS_IDLE = 0, CTS_LOOKING, CTS_GOT, CTS_NONE };
+volatile int      ctsState = CTS_IDLE;
+volatile uint16_t ctsSvcS = 0, ctsSvcE = 0, ctsHandle = 0;
+volatile time_t   ctsEpoch = 0;
+uint32_t ctsAskedAt = 0, ctsSyncedAt = 0;
+int      ctsFails = 0;
+
 class BtServerCb : public BLEServerCallbacks {
   void onConnect(BLEServer* sv, ble_gap_conn_desc* d) override {
     btConn = d ? d->conn_handle : 0xFFFF;
@@ -1035,6 +1058,10 @@ class BtServerCb : public BLEServerCallbacks {
   }
   void onDisconnect(BLEServer* sv, ble_gap_conn_desc* d) override {
     btConn = 0xFFFF;
+    // Whatever was found on the last connection was found on handles
+    // belonging to that connection. None of it carries over.
+    ctsState = CTS_IDLE; ctsSyncedAt = 0; ctsFails = 0;
+    ctsSvcS = ctsSvcE = ctsHandle = 0;
     btSet(BT_ADVERTISING);
     // Straight back to advertising, or the phone has nothing to come
     // back to and you would be pairing it by hand every time.
@@ -1063,7 +1090,8 @@ class BtSecurityCb : public BLESecurityCallbacks {
 static void bleOn() {
   if (btUp) return;
   Serial.println("bluetooth: starting");
-  prefs.putBool("bttry", true);        // torn up in loop() once it holds
+  btTries = prefs.getInt("btry2", 0) + 1;
+  prefs.putInt("btry2", btTries);      // zeroed once it has plainly held
   btNoteOut = true; btNoteAt = millis();
   char nm[24];
   snprintf(nm, sizeof(nm), "Rafiq %s", cfgName);
@@ -1116,7 +1144,7 @@ static void bleOff() {
   btUp = false;
   btConn = 0xFFFF;
   btHid = nullptr; btKeys = nullptr;   // deinit already took them
-  prefs.putBool("bttry", false);       // stopped on purpose, not a crash
+  prefs.putInt("btry2", 0);            // stopped on purpose, not a crash
   btNoteOut = false;
   btSet(BT_OFF);
 }
@@ -1265,6 +1293,149 @@ int    relCount = 0, relSel = 0;
 // this and the page reads it, and swapping a pointer is one instruction
 // that cannot be caught half done. The literals never move.
 const char* clockSrc = "not set";
+
+// ================================================================
+//  THE CLOCK, FROM THE PHONE
+//
+//  iOS serves the Current Time Service to anything it has bonded
+//  with, so once the pairing is real the robot can just ask what time
+//  it is and stop minding that there is no WiFi.
+//
+//  This cannot go through BLEClient. That class only dials out, and
+//  this connection was made by the phone, inbound, so there is
+//  nothing for it to attach to. It is NimBLE's own ble_gattc_* over
+//  the connection handle the server callback already handed us.
+//
+//  All three callbacks run on the NimBLE host task rather than on
+//  loop(), so they do nothing but write down what they found. The
+//  clock is set in ctsTick, on the main task, where everything else
+//  that touches time already lives.
+// ================================================================
+#define CTS_SETTLE_MS   2000UL         // let the bond finish first
+#define CTS_ANSWER_MS   8000UL         // asked, heard nothing back
+#define CTS_RETRY_MS   30000UL
+#define CTS_REFRESH_MS 21600000UL      // six hours
+#define CTS_GIVE_UP         5          // tries before it stops pestering
+
+// Named, because BLE_UUID16_DECLARE builds a temporary and C++ will
+// not let you take its address.
+static const ble_uuid16_t CTS_SVC_U = BLE_UUID16_INIT(0x1805);
+static const ble_uuid16_t CTS_CHR_U = BLE_UUID16_INIT(0x2A2B);
+
+// newlib here has no timegm, and mktime would read the timezone,
+// which is the one thing this must not do. Days from the civil
+// epoch, which is what every timegm is underneath.
+static time_t utcFromTm(const struct tm* t) {
+  int y = t->tm_year + 1900;
+  unsigned m = (unsigned)t->tm_mon + 1, d = (unsigned)t->tm_mday;
+  y -= (m <= 2);
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  long days = (long)era * 146097 + (long)doe - 719468;
+  return (time_t)days * 86400L + t->tm_hour * 3600L + t->tm_min * 60L + t->tm_sec;
+}
+
+static int ctsOnRead(uint16_t conn, const struct ble_gatt_error* err,
+                     struct ble_gatt_attr* attr, void* arg) {
+  if (!err || err->status != 0 || !attr || !attr->om) { ctsState = CTS_NONE; return 0; }
+  uint8_t  b[10];
+  uint16_t n = 0;
+  if (ble_hs_mbuf_to_flat(attr->om, b, sizeof(b), &n) != 0 || n < 7) {
+    ctsState = CTS_NONE; return 0;
+  }
+  struct tm t = {};
+  t.tm_year = (b[0] | (b[1] << 8)) - 1900;
+  t.tm_mon  = b[2] - 1;
+  t.tm_mday = b[3];
+  t.tm_hour = b[4];
+  t.tm_min  = b[5];
+  t.tm_sec  = b[6];
+  // A phone that answers with nonsense is worse than one that does
+  // not answer at all, because the reminders would believe it.
+  if (t.tm_year < 120 || t.tm_mon < 0 || t.tm_mon > 11 ||
+      t.tm_mday < 1 || t.tm_mday > 31 || t.tm_hour > 23 ||
+      t.tm_min > 59 || t.tm_sec > 60) { ctsState = CTS_NONE; return 0; }
+  ctsEpoch = utcFromTm(&t);
+  ctsState = CTS_GOT;
+  return 0;
+}
+
+static int ctsOnChr(uint16_t conn, const struct ble_gatt_error* err,
+                    const struct ble_gatt_chr* chr, void* arg) {
+  if (err && err->status == 0 && chr) { ctsHandle = chr->val_handle; return 0; }
+  if (err && err->status == BLE_HS_EDONE && ctsHandle) {
+    if (ble_gattc_read(conn, ctsHandle, ctsOnRead, NULL) != 0) ctsState = CTS_NONE;
+    return 0;
+  }
+  ctsState = CTS_NONE;
+  return 0;
+}
+
+static int ctsOnSvc(uint16_t conn, const struct ble_gatt_error* err,
+                    const struct ble_gatt_svc* svc, void* arg) {
+  if (err && err->status == 0 && svc) {
+    ctsSvcS = svc->start_handle; ctsSvcE = svc->end_handle; return 0;
+  }
+  if (err && err->status == BLE_HS_EDONE && ctsSvcS) {
+    if (ble_gattc_disc_chrs_by_uuid(conn, ctsSvcS, ctsSvcE,
+          &CTS_CHR_U.u, ctsOnChr, NULL) != 0) ctsState = CTS_NONE;
+    return 0;
+  }
+  ctsState = CTS_NONE;
+  return 0;
+}
+
+static void ctsAsk() {
+  if (btStage != BT_BONDED || btConn == 0xFFFF) return;
+  // Counted here rather than at the retry, so CTS_GIVE_UP is the
+  // number of times it asks, which is what the name says. Counting
+  // at the retry made the first ask free and the real total six.
+  // A sync that works puts this back to zero, so only failures in a
+  // row ever add up.
+  ctsFails++;
+  ctsSvcS = ctsSvcE = ctsHandle = 0;
+  ctsState   = CTS_LOOKING;
+  ctsAskedAt = millis();
+  if (ble_gattc_disc_svc_by_uuid(btConn, &CTS_SVC_U.u, ctsOnSvc, NULL) != 0)
+    ctsState = CTS_NONE;
+}
+
+static void ctsTick() {
+  if (cfgNet != NET_BT) return;
+
+  if (ctsState == CTS_GOT) {
+    struct timeval tv = { .tv_sec = (time_t)ctsEpoch, .tv_usec = 0 };
+    settimeofday(&tv, nullptr);
+    // What CTS hands over is already the phone's own wall clock, so
+    // the zone stays at UTC and what comes back out of localtime is
+    // what the phone is showing. The http date path does the same.
+    setenv("TZ", "UTC0", 1); tzset();
+    timeOk      = true;
+    clockSrc    = "your phone";
+    ctsSyncedAt = millis();
+    ctsFails    = 0;
+    ctsState    = CTS_IDLE;
+    Serial.println("clock: set from the phone");
+    return;
+  }
+  if (btStage != BT_BONDED || btConn == 0xFFFF) return;
+  if (millis() - btSince < CTS_SETTLE_MS) return;
+
+  if (ctsState == CTS_LOOKING) {
+    if (millis() - ctsAskedAt > CTS_ANSWER_MS) ctsState = CTS_NONE;
+    return;
+  }
+  if (ctsState == CTS_NONE) {
+    if (ctsFails >= CTS_GIVE_UP) return;        // it has not got one
+    if (millis() - ctsAskedAt < CTS_RETRY_MS) return;
+    ctsAsk();
+    return;
+  }
+  if (ctsSyncedAt == 0 || millis() - ctsSyncedAt > CTS_REFRESH_MS) ctsAsk();
+}
+
 String   wokeBy = "boot";
 float    lastDirD = 0;
 uint32_t nSlept = 0;
@@ -6492,6 +6663,10 @@ static void sleepCard() {
 #define SLEEP_RELEASE_MS 20000UL     // long enough for a hand, not for a bag
 #define SLEEP_RETRY_S    60          // and then look again this often
 static void sleepNow(long secs) {
+  // Lying down deliberately is not a crash, and a deep wake is a
+  // boot, so without this a robot that sleeps often in Bluetooth mode
+  // would count its way to the fallback having never once failed.
+  if (btNoteOut) { prefs.putInt("btry2", 0); btNoteOut = false; }
   uint32_t t0 = millis();
   bool held = (digitalRead(TOUCH_PIN) != touchRest);
   while (held && millis() - t0 < SLEEP_RELEASE_MS) {
@@ -9605,12 +9780,12 @@ void setup() {
   // Did the last attempt at Bluetooth come back? If the note is still
   // there, it did not, and the robot is not going to try it again on
   // its own. WiFi, and a word on the screen about why.
-  if (cfgNet == NET_BT && prefs.getBool("bttry", false)) {
-    prefs.putBool("bttry", false);
+  if (cfgNet == NET_BT && prefs.getInt("btry2", 0) >= BT_GIVE_UP) {
+    prefs.putInt("btry2", 0);
     cfgNet = NET_WIFI;
     prefs.putInt("net", cfgNet);
     btFellBack = true;
-    Serial.println("bluetooth did not survive its last start: back on WiFi");
+    Serial.printf("bluetooth failed %d starts running: back on WiFi\n", BT_GIVE_UP);
     flash("BLUETOOTH FAILED", 1400);
     flash("BACK ON WIFI", 1200);
   }
@@ -9737,9 +9912,10 @@ void loop() {
   // Up this long with the radio running is survival. Tear the note up
   // so a later unplug is not read as a crash.
   if (btNoteOut && now - btNoteAt > BT_PROVEN_MS) {
-    prefs.putBool("bttry", false); btNoteOut = false;
-    Serial.println("bluetooth: held, note cleared");
+    prefs.putInt("btry2", 0); btNoteOut = false;
+    Serial.println("bluetooth: held, the count is clear");
   }
+  ctsTick();                           // the clock, if the phone has one
   if (now - lastPoll >= 45) { lastPoll = now; input(); }
   readBattery();                       // every twenty seconds, it decides
   serviceSession();

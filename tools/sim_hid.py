@@ -126,20 +126,20 @@ run("The battery level is a write, not a notify into nothing", t_battery_before_
 def t_a_note_is_left():
     on = src[src.index("static void bleOn() {"):]
     on = on[:on.index("\n}")]
-    assert 'prefs.putBool("bttry", true);' in on, "nothing records that it is trying"
-    assert on.index('prefs.putBool("bttry", true);') < on.index("BLEDevice::init"), \
-        "the note is written after the part that can panic"
-    print("        the note goes down before anything that can panic")
+    assert 'prefs.putInt("btry2", btTries);' in on, "nothing records that it is trying"
+    assert on.index('prefs.putInt("btry2", btTries);') < on.index("BLEDevice::init"), \
+        "the count is written after the part that can panic"
+    print("        the count goes up before anything that can panic")
 run("Bluetooth says it is about to try", t_a_note_is_left)
 
 def t_a_note_still_there_means_no():
     boot = src[src.index("  loadNets();\n  // Did the last attempt"):]
     boot = boot[:boot.index("if (cfgOffline)")]
-    assert 'prefs.getBool("bttry", false)' in boot, "boot does not look for the note"
+    assert 'prefs.getInt("btry2", 0) >= BT_GIVE_UP' in boot, "boot does not look at the count"
     assert "cfgNet = NET_WIFI;" in boot and 'prefs.putInt("net", cfgNet);' in boot, \
         "it does not actually move off Bluetooth, so it loops again"
-    assert 'prefs.putBool("bttry", false);' in boot, \
-        "the note is not torn up, so WiFi is now stuck too"
+    assert 'prefs.putInt("btry2", 0);' in boot, \
+        "the count is not cleared, so WiFi is now stuck too"
     assert "flash(" in boot, "it recovers silently, so the robot looks broken"
     assert src.index("  loadNets();\n  // Did the last attempt") < src.index("if (cfgOffline) {\n    WiFi.persistent"), \
         "the check runs after the branch that would start the radio"
@@ -147,14 +147,20 @@ def t_a_note_still_there_means_no():
 run("A note still lying there at boot means do not try again", t_a_note_still_there_means_no)
 
 def t_the_note_is_torn_up():
-    assert "#define BT_PROVEN_MS 12000UL" in src, "nothing says how long counts as survived"
+    assert "#define BT_PROVEN_MS 60000UL" in src, "nothing says how long counts as survived"
+    assert "#define BT_GIVE_UP        3" in src, "there is no limit on consecutive failures"
     assert "if (btNoteOut && now - btNoteAt > BT_PROVEN_MS)" in src, \
-        "the note is never torn up, so every clean boot looks like a crash"
+        "the count is never cleared, so every clean boot looks like a crash"
     off = src[src.index("static void bleOff() {"):]
     off = off[:off.index("\n}")]
-    assert 'prefs.putBool("bttry", false);' in off, \
-        "turning Bluetooth off on purpose still leaves the note, and WiFi inherits the blame"
-    print("        12s up tears it up; so does switching Bluetooth off on purpose")
+    assert 'prefs.putInt("btry2", 0);' in off, \
+        "turning Bluetooth off on purpose still counts against it"
+    sleep = src[src.index("static void sleepNow(long secs) {"):]
+    sleep = sleep[:sleep.index("uint32_t t0 = millis();")]
+    assert 'prefs.putInt("btry2", 0);' in sleep, \
+        "a deep wake is a boot, so a robot that sleeps often would count its " \
+        "way to the fallback having never once failed"
+    print("        60s up clears it; so does switching off, and so does lying down")
 run("Surviving tears the note up", t_the_note_is_torn_up)
 
 def t_no_setting_can_brick_it():
