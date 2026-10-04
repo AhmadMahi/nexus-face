@@ -41,8 +41,13 @@ def robot(d,cx,cy):
 
 def pairing(stage):
     im,d=new(); btIcon(d,W//2,20,7)
-    ctr(d,"Allow the pairing" if stage=="linked" else "Pair me in Settings",36,1,255,"p")
-    ctr(d,"Rafiq Ahmed",48,1,255,"p"); ctr(d,stage,57,1,255,"p")
+    if stage=="no radio":
+        ctr(d,"Radio did not start",36,1,255,"p")
+        ctr(d,"Turn it off and on",48,1,255,"p")
+    else:
+        ctr(d,"Allow the pairing" if stage=="linked" else "Pair me in Settings",36,1,255,"p")
+        ctr(d,"Rafiq Ahmed",48,1,255,"p")
+    ctr(d,stage,57,1,255,"p")
     return im
 def paired():
     im,d=new(); btIcon(d,6,5,3); at(d,15,2,"09:41",1,255,"h")
@@ -60,9 +65,9 @@ def setting(v):
     return im
 
 shots=[(pairing("pair me"),"not paired yet"),(pairing("linked"),"phone connecting"),
-       (paired(),"paired, at home"),(setting("bluetooth"),"walking the modes"),
-       (setting("pair me"),"the row while waiting")]
-PAD=10;LBL=16;COLS=5
+       (paired(),"paired, at home"),(pairing("no radio"),"the radio refused"),
+       (setting("bluetooth"),"walking the modes"),(setting("pair me"),"the row while waiting")]
+PAD=10;LBL=16;COLS=6
 sheet=Image.new("L",(W*S*COLS+PAD*(COLS+1),H*S+LBL+PAD*2),40)
 dd=ImageDraw.Draw(sheet);lf=ImageFont.truetype("/System/Library/Fonts/Menlo.ttc",19)
 for i,(im,lab) in enumerate(shots):

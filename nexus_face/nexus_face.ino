@@ -34,6 +34,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLESecurity.h>
+#include <BLEHIDDevice.h>
 #include <WiFiUdp.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
@@ -266,7 +267,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.15.0"
+#define FW_VERSION "5.16.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -926,16 +927,58 @@ WiFiUDP cursorUdp;
 //  btStage is the reason the screen says what it says. None of this
 //  can be tried from a desk, so instead of a light that is on or
 //  off, it reports which rung it reached, and a failure says where.
-enum { BT_OFF = 0, BT_ADVERTISING, BT_CONNECTED, BT_BONDED };
+enum { BT_OFF = 0, BT_ADVERTISING, BT_CONNECTED, BT_BONDED, BT_FAIL };
 int      btStage = BT_OFF;
 bool     btUp    = false;             // the stack is running
 uint32_t btSince = 0;                 // when the rung last changed
 uint16_t btConn  = 0xFFFF;            // the live connection, or none
 
-// Soliciting Apple's notification service tells iOS this is worth
-// staying attached to. Nothing reads notifications yet; advertising
-// for them costs nothing and makes iOS treat the pairing properly.
+// Kept for the notification work. It is no longer advertised: a
+// 128 bit UUID is 18 of the 31 bytes a packet has, which pushed the
+// name out into the scan response, and soliciting it never made iOS
+// show the robot anyway. See the note on HID_MAP for why not.
 #define ANCS_UUID "7905F431-B5CE-4E99-A40F-4B1E122D00D0"
+
+//  Why the robot now claims to be a mouse.
+//
+//  iOS Settings does not list plain Bluetooth Low Energy peripherals
+//  at all. That page is for classic radios and for the few standard
+//  profiles the system itself consumes, HID chief among them.
+//  Everything else is reachable only from an app holding
+//  CoreBluetooth. So the first build advertised correctly, and an
+//  iPhone was never going to show it, no matter how long you looked.
+//
+//  Speaking HID puts it on that page. A keyboard was the obvious
+//  choice and is the wrong one: iOS hides the on screen keyboard
+//  whenever a hardware one is attached, so a paired Rafiq would have
+//  taken the keyboard off your phone. A mouse costs nothing. iOS only
+//  draws a pointer when AssistiveTouch is on, and we never send a
+//  report, so it sits there bonded and silent, which is all we need:
+//  the bond is what ANCS runs over later.
+static const uint8_t HID_MAP[] = {
+  0x05, 0x01,        // usage page: generic desktop
+  0x09, 0x02,        // usage: mouse
+  0xA1, 0x01,        // collection: application
+  0x85, 0x01,        //   report id 1
+  0x09, 0x01,        //   usage: pointer
+  0xA1, 0x00,        //   collection: physical
+  0x05, 0x09,        //     usage page: buttons
+  0x19, 0x01, 0x29, 0x03,
+  0x15, 0x00, 0x25, 0x01,
+  0x95, 0x03, 0x75, 0x01,
+  0x81, 0x02,        //     three buttons
+  0x95, 0x01, 0x75, 0x05,
+  0x81, 0x01,        //     padding to a byte
+  0x05, 0x01,        //     usage page: generic desktop
+  0x09, 0x30, 0x09, 0x31,
+  0x15, 0x81, 0x25, 0x7F,
+  0x75, 0x08, 0x95, 0x02,
+  0x81, 0x06,        //     x and y, relative
+  0xC0,              //   end collection
+  0xC0               // end collection
+};
+BLEHIDDevice*      btHid  = nullptr;
+BLECharacteristic* btKeys = nullptr;   // never written, and that is fine
 
 static void btSet(int stage) {
   if (btStage == stage) return;
@@ -943,7 +986,8 @@ static void btSet(int stage) {
   btSince = millis();
   Serial.printf("bluetooth: %s\n",
                 stage == BT_OFF ? "off" : stage == BT_ADVERTISING ? "advertising"
-              : stage == BT_CONNECTED ? "connected" : "bonded");
+              : stage == BT_CONNECTED ? "connected"
+              : stage == BT_BONDED ? "bonded" : "would not start");
 }
 
 static const char* btShort() {
@@ -951,8 +995,21 @@ static const char* btShort() {
     case BT_ADVERTISING: return "pair me";
     case BT_CONNECTED:   return "linked";
     case BT_BONDED:      return "paired";
+    case BT_FAIL:        return "no radio";
     default:             return "starting";
   }
+}
+
+// Pairing takes as long as it takes you to find the Settings page,
+// and the radio only runs while the robot is awake: nodding off part
+// way through takes the thing you are hunting for off the air. So the
+// panel stays up while it is advertising or mid handshake, and lets
+// go once the bond is made or the window has gone by.
+#define BT_PAIR_HOLD_MS 90000UL
+static bool btPairing() {
+  if (cfgNet != NET_BT || !btUp) return false;
+  if (btStage == BT_CONNECTED) return true;      // a handshake in progress
+  return btStage == BT_ADVERTISING && millis() - btSince < BT_PAIR_HOLD_MS;
 }
 
 class BtServerCb : public BLEServerCallbacks {
@@ -1001,13 +1058,27 @@ static void bleOn() {
   BLEServer* sv = BLEDevice::createServer();
   sv->setCallbacks(new BtServerCb());
 
+  btHid = new BLEHIDDevice(sv);
+  btHid->manufacturer("Rafiq");
+  btHid->pnp(0x02, 0xE502, 0xA111, 0x0210);
+  btHid->hidInfo(0x00, 0x02);          // not localised, remote wakeable
+  btHid->reportMap((uint8_t*)HID_MAP, sizeof(HID_MAP));
+  btKeys = btHid->inputReport(1);
+  btHid->startServices();
+  if (!isnan(battV)) btHid->setBatteryLevel(battPct(battV));
+
   BLEAdvertising* ad = BLEDevice::getAdvertising();
+  ad->setAppearance(0x03C2);           // a mouse, so Settings lists it
+  ad->addServiceUUID(BLEUUID((uint16_t)0x1812));
   ad->setScanResponse(true);
-  ad->addServiceUUID(BLEUUID(ANCS_UUID));
-  BLEDevice::startAdvertising();
 
   btUp = true;
-  btSet(BT_ADVERTISING);
+  // start() says whether the controller took it. The first build
+  // called startAdvertising(), which returns nothing, and then put
+  // "pair me" on the screen whatever had happened. A screen that
+  // cannot be wrong about this is the whole point of the rungs.
+  if (ad->start()) btSet(BT_ADVERTISING);
+  else             btSet(BT_FAIL);
 }
 
 // bleOn and bleOff, not btStart and btStop: the core already owns
@@ -1018,6 +1089,7 @@ static void bleOff() {
   BLEDevice::deinit(true);
   btUp = false;
   btConn = 0xFFFF;
+  btHid = nullptr; btKeys = nullptr;   // deinit already took them
   btSet(BT_OFF);
 }
 
@@ -2228,12 +2300,17 @@ static void drawHome() {
     // Bluetooth mode with nothing paired is the one state where the
     // robot has something to ask of you, so it asks instead of
     // saying hello to nobody.
-    if (cfgNet == NET_BT && btStage < BT_BONDED) {
+    if (cfgNet == NET_BT && btStage != BT_BONDED) {
       btIcon(SCRW / 2, 20, 7);
-      ctr(btStage == BT_CONNECTED ? "Allow the pairing" : "Pair me in Settings", 36, 1);
-      char nm[26];
-      snprintf(nm, sizeof(nm), "Rafiq %s", cfgName);
-      ctr(nm, 48, 1);
+      if (btStage == BT_FAIL) {
+        ctr("Radio did not start", 36, 1);
+        ctr("Turn it off and on", 48, 1);
+      } else {
+        ctr(btStage == BT_CONNECTED ? "Allow the pairing" : "Pair me in Settings", 36, 1);
+        char nm[26];
+        snprintf(nm, sizeof(nm), "Rafiq %s", cfgName);
+        ctr(nm, 48, 1);
+      }
       ctr(btShort(), 57, 1);
       oled.display();
       return;
@@ -7793,6 +7870,7 @@ static void input() {
   // a desk you are working at is a drain and a distraction. Ten
   // seconds, whatever the sleep setting says, because the setting is
   // about a robot you are using and this is not one.
+  if (btPairing()) return;                       // not while it is being paired
   if (cfgGesture) {
     if (!asleep && now - lastActive > GESTURE_DARK_MS) goSleep();
   }
