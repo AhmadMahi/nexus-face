@@ -164,11 +164,13 @@ def t_back_cannot_strand():
     # 5.10.0: four seconds goes home and decides it. The count after
     # that is an announcement, not a question, because the pad cannot
     # be relied on to still be reporting a finger by then.
-    assert "if (!cfgGesture && !sleepArmed && held >= TOUCH_HOME_MS) {" in src, \
+    # touchSeenFree: nothing that can switch the robot off fires
+    # until the pad has been seen settled at rest. See sim_pad.
+    assert "if (!cfgGesture && touchSeenFree && !sleepArmed && held >= TOUCH_HOME_MS) {" in src, \
         "a four second hold no longer goes home"
     # and in gesture mode the same hold leaves the mode rather than
     # switching the robot off underneath you
-    assert "if (cfgGesture && held >= TOUCH_HOME_MS) {" in src, \
+    assert "if (cfgGesture && touchSeenFree && held >= TOUCH_HOME_MS) {" in src, \
         "a four second hold in gesture mode does not leave it"
     assert "STAYING UP" not in src, "letting go can still take the decision back"
     assert src.count("upState = U_OFF; swOn = false; swRun = false;") >= 1, \

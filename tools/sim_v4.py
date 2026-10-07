@@ -22,7 +22,9 @@ def t_tiers():
     # nothing on screen until past home, which is the whole point
     loop = src.split("void loop()")[-1]
     assert "if (sleepArmed) {" in loop, "nothing is shown past five seconds"
-    assert "if (!cfgGesture && !sleepArmed && held >= TOUCH_HOME_MS) {" in src, \
+    # touchSeenFree: nothing that can switch the robot off fires
+    # until the pad has been seen settled at rest. See sim_pad.
+    assert "if (!cfgGesture && touchSeenFree && !sleepArmed && held >= TOUCH_HOME_MS) {" in src, \
         "nothing happens at the four second mark"
     print(f"        silent for the first {HOME/1000:.0f}s, then it says what is happening")
 run("In, then home, and silent until the fourth second", t_tiers)

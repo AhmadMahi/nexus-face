@@ -38,9 +38,11 @@ def t_never_stuck():
 run("A robot can never be left in gesture mode with nothing listening", t_never_stuck)
 
 def t_hold_leaves_rather_than_sleeps():
-    assert "if (cfgGesture && held >= TOUCH_HOME_MS) {" in src, \
+    # touchSeenFree: nothing that can switch the robot off fires
+    # until the pad has been seen settled at rest. See sim_pad.
+    assert "if (cfgGesture && touchSeenFree && held >= TOUCH_HOME_MS) {" in src, \
         "a long hold in gesture mode does not leave it"
-    assert "if (!cfgGesture && !sleepArmed && held >= TOUCH_HOME_MS) {" in src, \
+    assert "if (!cfgGesture && touchSeenFree && !sleepArmed && held >= TOUCH_HOME_MS) {" in src, \
         "a long hold in gesture mode would also switch the robot off"
     print("        four seconds leaves the mode instead of switching the robot off")
 run("The long hold is the way back, not the way off", t_hold_leaves_rather_than_sleeps)

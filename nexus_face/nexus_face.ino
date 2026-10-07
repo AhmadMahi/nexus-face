@@ -144,12 +144,32 @@ float    battFull = 4.10f;
 
 #define TOUCH_PIN 5
 bool     touchRest  = false;     // the level it sits at with nobody near
+// Has the pad been seen at rest since we started believing this level?
+// Nothing that can switch the robot off is allowed to fire until it
+// has. A press is the far side of a release, so on a pad that is
+// behaving this is true within one poll; on a pad we are reading
+// upside down it never becomes true, which is exactly when the four
+// second hold must not be able to put the robot to sleep.
+bool     touchSeenFree = false;
 bool     touchOn    = false;     // a finger is on it right now
 uint32_t touchCount = 0;
 uint32_t touchEdge  = 0;         // when the level last disagreed with us
 bool     touchLvl   = false;     // what the pin read last time
 uint32_t touchLvlAt = 0;         // when it last changed
-#define TOUCH_REST_MS 60000UL    // held this long and it is the resting level
+// Held this long at one level and that level is resting, whatever we
+// thought before.
+//
+// It was a minute, and a minute was unreachable. If the resting level
+// is learned wrong the pad reads as permanently pressed: a long press
+// fires at 0.7s, the switch off arms at four seconds and the robot is
+// in deep sleep at seven. A deep wake reloads the same remembered
+// wrong level and does it again. The correction sat sixty seconds
+// away and the robot never stayed awake long enough to reach it.
+//
+// Ten seconds instead, which no real press can reach: a TTP223
+// releases its own output after about five seconds on this board, so
+// anything still asserted at ten is not a finger.
+#define TOUCH_REST_MS 10000UL
 
 // ---------------- what a touch means ----------------
 //  The pad is the way this is driven now, and knocking is the thing you
@@ -289,7 +309,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.20.0"
+#define FW_VERSION "5.21.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -1375,6 +1395,16 @@ unsigned long sleptAt = 0;           // when the screen went dark
 
 // ---------------- runtime ----------------
 bool asleep = false, screenOn = true, timeOk = false, rescueAP = false, fsOk = false;
+// The hotspot takes the robot over.
+//
+// It is the screen you go to when something is wrong with the
+// network, and the one thing you need from it is a name and a
+// password you can type into a phone without the robot wandering off
+// a menu or going dark halfway through. So while it is up the panel
+// shows that and nothing else, every gesture is ignored, and it does
+// not sleep. Rebooting is the way out, from the page it just told
+// you how to reach.
+bool apLock = false;
 // The web server is not started at boot when the radio is meant to be
 // down, so whether it has been started is a separate question from
 // whether the board has booted.
@@ -2877,6 +2907,19 @@ static const char* appShort(const Note& n) {
 
 static bool noteIsCall(const Note& n) {
   return n.cat == CAT_CALL || n.cat == CAT_MISSED || n.cat == CAT_VOICE;
+}
+
+static void drawHotspot() {
+  oled.clearDisplay();
+  titleBar("HOTSPOT", "on");
+  ctr(RESCUE_SSID, 16, 1);
+  char pw[26];
+  snprintf(pw, sizeof(pw), "pass  %s", RESCUE_PASS);
+  ctr(pw, 28, 1);
+  String ip = WiFi.softAPIP().toString();
+  ctr(ip.c_str(), 40, 1);
+  ctr("restart from the page", 54, 1);
+  oled.display();
 }
 
 static void drawMessage() {
@@ -7299,10 +7342,15 @@ static void startHotspot() {
   WiFi.mode(online() ? WIFI_AP_STA : WIFI_AP);
   WiFi.softAP(RESCUE_SSID, RESCUE_PASS);
   rescueAP = true;
+  apLock   = true;
+  screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
+  sleepArmed = 0; wantDeep = false;
+  if (asleep) wake("hotspot");
   Serial.printf("hotspot up: %s at %s\n", RESCUE_SSID, WiFi.softAPIP().toString().c_str());
 }
 
 static void knockOne() {
+  if (apLock) return;
   cTap++;
   // Anything the Mac put on the screen goes away on one knock. It is
   // the Mac's idea of what you want to see, and this is the desk.
@@ -7397,6 +7445,7 @@ static void knockOne() {
 }
 
 static void knockTwo() {
+  if (apLock) return;
   cDouble++;
   // Told to stand up and not able to just yet. Ten minutes and it asks
   // again, which is the difference between a reminder and a nag.
@@ -7833,6 +7882,7 @@ static void remAddedCard(int n, uint32_t when) {
 
 static void touchGesture(uint8_t g) {
   lastActive = millis();
+  if (apLock) return;              // the hotspot screen is not a menu
 
   // Gesture mode is driven by knocking the desk, not by the pad, so
   // the pad does nothing here at all beyond the four second hold
@@ -8127,15 +8177,30 @@ static void input() {
     bool lvl = digitalRead(TOUCH_PIN);
     if (lvl != touchLvl) { touchLvl = lvl; touchLvlAt = now; }
     else if (lvl != touchRest && now - touchLvlAt > TOUCH_REST_MS) {
-      // A whole minute at one level. Whatever it is, that is resting.
+      // Ten seconds at one level. Whatever it is, that is resting.
       touchRest = lvl;
       prefs.putBool("trest", touchRest);     // so the next wake starts right
+      // Everything the wrong level started is cancelled with it: the
+      // press that was never a press, the hold it grew into, and the
+      // switch off that hold had armed.
+      touchOn = false; touchEdge = 0; touchLongDone = true; touchTaps = 0;
+      sleepArmed = 0; touchSeenFree = false;
+      lastActive = now;
       Serial.printf("pad resting level is now %s\n", touchRest ? "high" : "low");
+      flash("PAD RELEARNED", 1100);
     }
 
     // The pad settles before anything believes it, so a noisy edge is
     // not a press and a bounce on the way up is not a lift.
+    // Only a settled release counts, and settled means the debounced
+    // state agrees with the pin. Reading it off the raw level was
+    // wrong in a way that only showed on the way up: the instant a
+    // long press was released the level matched resting while
+    // touchOn was still true for another debounce, so the hold was
+    // still running, had been running for seconds, and armed the
+    // switch off at the exact moment you let go.
     bool want = (lvl != touchRest);
+    if (!want && !touchOn) touchSeenFree = true;
     if (want != touchOn) {
       if (!touchEdge) touchEdge = now;
       if (now - touchEdge >= TOUCH_DEBOUNCE) {
@@ -8162,7 +8227,7 @@ static void input() {
     // Going in fires under your finger rather than after it, which is
     // what makes it feel like the quickest of the four. Holding on past
     // that is a different question, answered when you let go.
-    if (touchOn && !touchLongDone && now - touchPressAt >= TOUCH_LONG_MS) {
+    if (touchOn && touchSeenFree && !touchLongDone && now - touchPressAt >= TOUCH_LONG_MS) {
       touchLongDone = true;
       touchTaps = 0;
       touchGesture(TG_LONG);
@@ -8176,13 +8241,16 @@ static void input() {
       // In gesture mode the long hold is the way back to being a
       // robot, not the way to switch one off. Switching off is still
       // there once you have stopped.
-      if (cfgGesture && held >= TOUCH_HOME_MS) {
+      if (cfgGesture && touchSeenFree && held >= TOUCH_HOME_MS) {
         cfgGesture = false;
         touchLongDone = true; touchTaps = 0;
         flash("GESTURE OFF", 1100);
         Serial.println("held to four in gesture mode: back to being a robot");
       }
-      if (!cfgGesture && !sleepArmed && held >= TOUCH_HOME_MS) {
+      // touchSeenFree is the whole of the fix: a pad that has never
+      // been seen at rest is a pad we are reading wrong, and it does
+      // not get to switch the robot off.
+      if (!cfgGesture && touchSeenFree && !sleepArmed && held >= TOUCH_HOME_MS) {
         sleepArmed = now;
         screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; faceMode = false;
         upState = U_OFF; swOn = false; swRun = false;
@@ -8355,6 +8423,7 @@ static void input() {
   // a desk you are working at is a drain and a distraction. Ten
   // seconds, whatever the sleep setting says, because the setting is
   // about a robot you are using and this is not one.
+  if (apLock) return;                            // the hotspot screen stays up
   if (btPairing()) return;                       // not while it is being paired
   if (cfgGesture) {
     if (!asleep && now - lastActive > GESTURE_DARK_MS) goSleep();
@@ -8686,6 +8755,10 @@ static void apiState() {
   o += "\"netName\":\"" + String(NET_NAME[cfgNet]) + "\",";
   o += "\"bt\":\"" + String(btShort()) + "\",";
   o += "\"safe\":" + String(safeMode ? "true" : "false") + ",";
+  o += "\"aplock\":" + String(apLock ? "true" : "false") + ",";
+  o += "\"padrest\":\"" + String(touchRest ? "high" : "low") +
+       "\",\"padnow\":\"" + String(digitalRead(TOUCH_PIN) ? "high" : "low") +
+       "\",\"padfree\":" + String(touchSeenFree ? "true" : "false") + ",";
   o += "\"netDown\":" + String(netDown ? "true" : "false") + ",";
   o += "\"bike\":" + String(cfgBike ? "true" : "false") + ",";
   o += "\"btpl\":" + String(cfgBikeTpl) + ",";
@@ -10612,6 +10685,9 @@ void loop() {
     // the ring. A hundred and ten milliseconds apart, which is what
     // the blinking was. Drawing one or the other fixes it and saves
     // a frame.
+    // Before everything, including the hold overlay: while the
+    // hotspot is up there is nothing else to look at.
+    if (apLock) { drawHotspot(); delay(2); return; }
     if (sleepArmed) { drawHoldTier(now); oled.display(); delay(2); return; }
     switch (screen) {
       case S_FOCUS:    drawFocus();    break;
