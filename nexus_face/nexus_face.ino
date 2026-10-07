@@ -309,7 +309,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.21.0"
+#define FW_VERSION "5.22.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -7197,6 +7197,86 @@ static void sawMac() {
     wake("mac");
   }
 }
+// ================================================================
+//  FIRMWARE FROM THE BROWSER
+//
+//  The release path needs the internet. This one needs nothing but
+//  this page, which is the whole point of it: on the hotspot, with no
+//  network and no cable, a .bin from your phone is the only way in.
+//
+//  Two callbacks. The second runs while the bytes are arriving and
+//  the first runs once they have all landed, so the authorisation has
+//  to be checked in the SECOND one. Checking it in the first would
+//  mean the whole image had already been written into the spare slot
+//  before anyone asked who sent it.
+// ================================================================
+bool   upLocal = false;              // a browser upload is in progress
+size_t upGot = 0, upWant = 0;
+String upErr = "";
+
+static void localUploadChunk() {
+  HTTPUpload& u = web.upload();
+
+  if (u.status == UPLOAD_FILE_START) {
+    upLocal = false; upGot = 0; upWant = 0; upErr = "";
+    if (!authed()) { upErr = "Pair first"; return; }
+    const esp_partition_t* slot = esp_ota_get_next_update_partition(NULL);
+    if (!slot) { upErr = "No OTA slot"; return; }
+    upWant = (size_t)web.header("X-Rafiq-Size").toInt();
+    if (upWant && upWant > slot->size) {
+      char d[40];
+      snprintf(d, sizeof(d), "Too big: %uk into %uk",
+               (unsigned)(upWant / 1024), (unsigned)(slot->size / 1024));
+      upErr = d;
+      return;
+    }
+    if (!Update.begin(upWant ? upWant : UPDATE_SIZE_UNKNOWN)) {
+      upErr = "Will not start"; return;
+    }
+    upLocal = true;
+    otaStatus = "From the page"; otaStatus2 = ""; otaPct = 0;
+    if (asleep) wake("upload");
+    drawOta();
+    return;
+  }
+
+  if (u.status == UPLOAD_FILE_WRITE) {
+    if (!upLocal) return;
+    // Every ESP32 application image starts 0xE9. Anything else is not
+    // firmware, and writing it would hand the bootloader a slot full
+    // of something it cannot run, on a robot with no cable in it.
+    if (upGot == 0 && (u.currentSize < 1 || u.buf[0] != 0xE9)) {
+      upErr = "Not a firmware file"; Update.abort(); upLocal = false; return;
+    }
+    if (Update.write(u.buf, u.currentSize) != u.currentSize) {
+      upErr = "Write failed"; Update.abort(); upLocal = false; return;
+    }
+    upGot += u.currentSize;
+    if (upWant) {
+      int p = (int)((upGot * 100) / upWant);
+      p = constrain(p, 0, 99);
+      if (p != otaPct) { otaPct = p; drawOta(); }
+    }
+    return;
+  }
+
+  if (u.status == UPLOAD_FILE_END) {
+    if (!upLocal) return;
+    upLocal = false;
+    // end(true) is what checks the image is whole and sets the slot
+    // to boot from. A truncated upload fails here rather than on the
+    // next boot, which is the only place it is any use.
+    if (!Update.end(true)) upErr = "Install failed";
+    return;
+  }
+
+  if (u.status == UPLOAD_FILE_ABORTED) {
+    if (upLocal) Update.abort();
+    upLocal = false;
+    if (!upErr.length()) upErr = "Cancelled";
+  }
+}
+
 static bool guard() {
   if (!authed()) { web.send(401, "application/json", "{\"ok\":false,\"err\":\"pair first\"}"); return false; }
   sawMac();
@@ -8584,6 +8664,16 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
     <div id="rel"></div>
   </div>
 
+  <h2>Firmware from a file</h2><div class="card">
+    <div class="sub" style="margin-bottom:8px">A .bin from this computer, straight
+      onto the robot. No internet needed, which is the point of the hotspot.</div>
+    <input type="file" id="fw" accept=".bin">
+    <div class="row" style="margin-top:8px">
+      <button onclick="sendFw()">Upload and install</button>
+    </div>
+    <div class="sub" id="fwp" style="margin-top:8px"></div>
+  </div>
+
   <h2>System</h2><div class="card"><table id="sys"></table>
     <div class="row" style="margin-top:8px">
       <button class="g" onclick="if(confirm('Reboot?'))act('/api/reboot')">Reboot</button>
@@ -8613,6 +8703,32 @@ window.rows=function(el,o){$(el).innerHTML=Object.entries(o).map(([k,v])=>'<tr><
 window.tok=function(){return localStorage.getItem('rtok')||''}
 window.hdr=function(){const h={'Content-Type':'application/x-www-form-urlencoded'};const t=tok();if(t)h['X-Rafiq-Token']=t;return h}
 window.post=async function(u,d){const r=await fetch(u,{method:'POST',headers:hdr(),body:new URLSearchParams(d||{})});if(r.status==401||r.status==403)askPair();return r}
+// Sent with XMLHttpRequest rather than fetch, because this is the one
+// request on the page worth watching: a couple of megabytes over a
+// hotspot is slow enough that a page doing nothing looks broken.
+window.sendFw=function(){
+  const f=document.getElementById('fw').files[0];
+  if(!f){alert('Choose a .bin file first');return}
+  if(!/\.bin$/i.test(f.name)&&!confirm(f.name+' is not a .bin. Try it anyway?'))return;
+  if(!confirm('Install '+f.name+'? The robot restarts when it is done.'))return;
+  const p=document.getElementById('fwp');
+  p.textContent='sending 0%';
+  const x=new XMLHttpRequest();
+  x.open('POST','/api/upload');
+  const t=tok(); if(t)x.setRequestHeader('X-Rafiq-Token',t);
+  x.setRequestHeader('X-Rafiq-Size',String(f.size));
+  x.upload.onprogress=function(e){
+    if(e.lengthComputable)p.textContent='sending '+Math.round(e.loaded*100/e.total)+'%';
+  };
+  x.onload=function(){
+    if(x.status==401||x.status==403){p.textContent='pair first';askPair();return}
+    let r={};try{r=JSON.parse(x.responseText)}catch(e){}
+    p.textContent=r.ok?'installed, restarting now':('refused: '+(r.err||('HTTP '+x.status)));
+  };
+  x.onerror=function(){p.textContent='upload failed'};
+  const fd=new FormData(); fd.append('f',f,f.name);
+  x.send(fd);
+};
 window.locked=false;
 window.askPair=async function(){
   if(locked)return;                       // one prompt, one code
@@ -9536,6 +9652,23 @@ static void setupWeb() {
     otaInstall();
   });
 
+  web.on("/api/upload", HTTP_POST, []() {
+    if (upErr.length()) {
+      String e = upErr; upErr = ""; upLocal = false;
+      otaPct = -1;
+      Serial.printf("upload refused: %s\n", e.c_str());
+      flash(e.c_str(), 1800);           // said out loud, whatever is on screen
+      web.send(200, "application/json",
+               String("{\"ok\":false,\"err\":\"") + e + "\"}");
+      return;
+    }
+    web.send(200, "application/json", "{\"ok\":true}");
+    otaStatus = "Installed"; otaStatus2 = ""; otaPct = 100; drawOta();
+    Serial.println("upload installed from the page: restarting");
+    delay(400);
+    ESP.restart();
+  }, localUploadChunk);
+
   web.on("/api/hotspot", HTTP_POST, []() {
     if (!guard()) return;
     startHotspot();
@@ -9677,8 +9810,8 @@ static void setupWeb() {
     delay(300); ESP.restart();
   });
   {
-    const char* keep[] = { "X-Rafiq-Token", "X-Rafiq-App" };
-    web.collectHeaders(keep, 2);
+    const char* keep[] = { "X-Rafiq-Token", "X-Rafiq-App", "X-Rafiq-Size" };
+    web.collectHeaders(keep, 3);
   }
   web.onNotFound([]() { web.send(404, "text/plain", "not found"); });
   web.begin();
