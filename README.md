@@ -7,6 +7,23 @@ own firmware so those work with no network at all.
 
 You drive it by knocking on the desk beside it.
 
+## 6.0: Bluetooth first
+
+Rafiq now lives on Bluetooth. Your iPhone gives it the time, the
+notifications, and commands from a Shortcut named **RAFIQ**. WiFi is
+something you ask for, for a while:
+
+| How | WiFi lasts |
+|-----|-----------|
+| `RAFIQ sync` from a Shortcut | about a minute: clock, prayer times, weather, update check, a new read |
+| Settings > Wireless > Network, or the page, or `RAFIQ wifi` | until a real restart, or 30 min unused |
+| Settings > Check update, or `RAFIQ update` | while the update screen is open |
+| Settings > Hotspot, or `RAFIQ config` | until 10 min after the last phone leaves |
+
+Install a file without internet: join `RAFIQ-SETUP`, open
+`192.168.4.1/ota`, pick the APP bin. Full details, every command, and
+how to build with light sleep are in [HANDOFF.md](HANDOFF.md).
+
 ## Driving it
 
 Knocking always works. Leaning is something you turn on **as well**, in

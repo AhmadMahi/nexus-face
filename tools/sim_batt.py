@@ -87,12 +87,7 @@ def t_rows():
     # size 1 is a 5x7 glyph in a 6x8 cell, and with a transparent
     # background it paints seven rows: y to y+6.
     for y in LY: assert y + 6 <= 63, f"a row at {y} paints past the bottom"
-    # Scoped to drawSystem. There is more than one screen that puts an
-    # address on the panel now, and the first match in the file was
-    # the hotspot's, which measures a different screen entirely.
-    sysfn = src[src.index("static void drawSystem() {"):]
-    sysfn = sysfn[:sysfn.index("\n}")]
-    ipy = int(re.search(r"ctr\(ip\.c_str\(\), (\d+), 1\);", sysfn).group(1))
+    ipy = int(re.search(r"ctr\(ip\.c_str\(\), (\d+), 1\);", src).group(1))
     assert LY[-1] + 6 < ipy, f"the last row ends {LY[-1]+6}, the address starts {ipy}"
     assert ipy + 6 <= 63, f"the address paints to {ipy+6}"
     assert "oled.drawFastHLine(4, 50" not in src, "the rule is still there, in the way"

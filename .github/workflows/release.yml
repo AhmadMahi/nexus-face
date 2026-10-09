@@ -23,7 +23,11 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.3.10
           arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" \
-            "FluxGarage RoboEyes" "ArduinoJson"
+            "FluxGarage RoboEyes" "ArduinoJson" "NimBLE-Arduino@2.5.1"
+          # Releases built here use the stock core, which has no power
+          # management. They run, but without light sleep: Bluetooth
+          # drops whenever the screen goes dark, as in 5.20. Build with
+          # the light-sleep core patch (see HANDOFF.md) for the full 6.0.
 
       # A tag ending in -test builds the stripped input test sketch instead
       # of the real firmware. The asset keeps its name either way, because

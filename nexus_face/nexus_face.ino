@@ -2,6 +2,12 @@
   ================================================================
    RAFIQ  -  ESP32-C3 desk companion
   ================================================================
+   6.0  Bluetooth first. The phone is home: its clock, its
+        notifications, and RAFIQ commands sent from a Shortcut. WiFi
+        is something you ask for (Settings, the page, or RAFIQ sync /
+        wifi / update / config) and it goes away again by itself.
+        Light sleep keeps the phone linked with the screen dark, on a
+        core built with power management. See HANDOFF.md.
    Knock on it to drive it. One rule holds everywhere:
 
      in a list      1 next item   2 open it    3 back out   4 reload
@@ -64,6 +70,8 @@ struct Note {
 #include <ArduinoJson.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
+#include "esp_pm.h"
+#include "driver/usb_serial_jtag.h"
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <time.h>
@@ -144,32 +152,12 @@ float    battFull = 4.10f;
 
 #define TOUCH_PIN 5
 bool     touchRest  = false;     // the level it sits at with nobody near
-// Has the pad been seen at rest since we started believing this level?
-// Nothing that can switch the robot off is allowed to fire until it
-// has. A press is the far side of a release, so on a pad that is
-// behaving this is true within one poll; on a pad we are reading
-// upside down it never becomes true, which is exactly when the four
-// second hold must not be able to put the robot to sleep.
-bool     touchSeenFree = false;
 bool     touchOn    = false;     // a finger is on it right now
 uint32_t touchCount = 0;
 uint32_t touchEdge  = 0;         // when the level last disagreed with us
 bool     touchLvl   = false;     // what the pin read last time
 uint32_t touchLvlAt = 0;         // when it last changed
-// Held this long at one level and that level is resting, whatever we
-// thought before.
-//
-// It was a minute, and a minute was unreachable. If the resting level
-// is learned wrong the pad reads as permanently pressed: a long press
-// fires at 0.7s, the switch off arms at four seconds and the robot is
-// in deep sleep at seven. A deep wake reloads the same remembered
-// wrong level and does it again. The correction sat sixty seconds
-// away and the robot never stayed awake long enough to reach it.
-//
-// Ten seconds instead, which no real press can reach: a TTP223
-// releases its own output after about five seconds on this board, so
-// anything still asserted at ten is not a finger.
-#define TOUCH_REST_MS 10000UL
+#define TOUCH_REST_MS 60000UL    // held this long and it is the resting level
 
 // ---------------- what a touch means ----------------
 //  The pad is the way this is driven now, and knocking is the thing you
@@ -224,6 +212,25 @@ bool     touchLongDone = false;  // the long press already fired this press
 //
 //  When the count began, or 0 if it is not running.
 uint32_t sleepArmed   = 0;
+// 6.1: the hold bar. Times follow C3 Buddy: Open from the hold time
+// until 1.5 s after it (at least 2 s), Cancel for a second, then Back,
+// then from Back + 2 s a switch-off bar that ends in deep sleep 3 s on.
+const uint16_t HOLD_OPTS[] = { 500, 700, 1000, 1500, 2000, 2500 };
+#define HOLD_N 6
+int  cfgHoldIdx = 1;
+bool holdShown  = false;
+bool cfg12h     = false;               // 12 hour clock
+// What wakes it from sleep: the pad and movement (knock, shake, lift),
+// only the pad, or only movement.
+int  cfgWakeBy  = 0;
+const char* WAKEBY_NAME[3] = { "touch+move", "touch", "move" };
+static bool touchWakes()  { return cfgWakeBy != 2; }
+static bool pocketLocked();
+static bool motionWakes() { return cfgWakeBy != 1 && !pocketLocked(); }   // 7.9: not while locked
+static uint32_t holdMs()          { return HOLD_OPTS[cfgHoldIdx]; }
+static uint32_t holdMaxMs()       { uint32_t a = holdMs() + 1500; return a > 2000 ? a : 2000; }
+static uint32_t holdBackMs()      { return holdMs() + (holdMaxMs() - holdMs()) / 2; }   // Open ends, Back begins
+
 // The longest unbroken touch the pad has ever reported, for finding
 // out what this board's own ceiling actually is rather than arguing
 // about datasheets. Shown on SYSTEM.
@@ -309,7 +316,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "5.22.0"
+#define FW_VERSION "7.10.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -319,8 +326,21 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 const char* RESCUE_SSID = "RAFIQ-SETUP";
 const char* RESCUE_PASS = "password";
 
-Adafruit_SSD1306 oled(SCRW, SCRH, &Wire, -1);
-RoboEyes<Adafruit_SSD1306> eyes(oled);
+//  The panel, with one addition: while a finger is held on the pad
+//  past the hold time, every frame gets the hold strip drawn along its
+//  bottom just before it goes out. The screens never know.
+static void drawHoldStrip();
+static bool gamePlaying();
+static bool holdStripWanted();
+struct OledX : public Adafruit_SSD1306 {
+  using Adafruit_SSD1306::Adafruit_SSD1306;
+  void display() {
+    if (holdStripWanted()) drawHoldStrip();
+    Adafruit_SSD1306::display();
+  }
+};
+OledX oled(SCRW, SCRH, &Wire, -1);
+RoboEyes<OledX> eyes(oled);
 WebServer   web(80);
 Preferences prefs;
 
@@ -356,10 +376,12 @@ float ax, ay, az, amag = 1, mx, my, mz, gxr, gyr, gzr, mtemp;
 
 // ---------------- screens ----------------
 enum { S_HOME = 0, S_BIKE, S_REMIND, S_FOCUS, S_WEATHER, S_MSG, S_PRAYER,
-       S_FAITH, S_READS, S_GAMES, S_SETTINGS, S_SYSTEM, S_COUNT };
+       S_FAITH, S_READS, S_GAMES, S_SETTINGS, S_SYSTEM,
+       S_TODAY, S_FHUB, S_CALM, S_COUNT };      // 7.6: the hubs
 const char* S_NAME[S_COUNT] =
-  { "HOME", "VEHICLE", "REMINDERS", "FOCUS", "WEATHER", "NOTICES", "PRAYER",
-    "FAITH", "SHORT READS", "GAMES", "SETTINGS", "SYSTEM" };
+  { "HOME", "VEHICLE", "REMINDERS", "MAC", "WEATHER", "NOTIFICATIONS", "PRAYER",
+    "FAITH", "SHORT READS", "GAMES", "SETTINGS", "SYSTEM",
+    "TODAY", "FAITH", "CALM" };
 
 // ---------------- online, or not ----------------
 //  Two different things, and keeping them apart matters.
@@ -392,6 +414,448 @@ bool netDown = false;
 int  netMisses = 0;                // failed joins since the last success
 bool hadNet = false;               // it has been online at least once this time up
 static bool offlineNow() { return cfgOffline || netDown; }
+
+// ---------------- 6.0: Bluetooth first ----------------
+//  Bluetooth is home. WiFi is something you ask for, for a while, and
+//  then it goes away again by itself.
+//
+//  cfgNet is what the radios are doing right now, and the rest of the
+//  file goes on asking it exactly as before. cfgNetHome is where it
+//  comes back to, and is the only one kept in flash: Bluetooth, or
+//  Off. WiFi is never kept, so a real restart always lands on
+//  Bluetooth.
+//
+//  A WiFi session is one of four kinds:
+//    MANUAL   you asked for WiFi. Ends on a real restart, or thirty
+//             minutes after the page or the Mac last used it. Deep
+//             sleep and waking again does not end it.
+//    SYNC     RAFIQ sync. Join, fetch everything, check for an update,
+//             write a read, radio off.
+//    UPDATE   Check update, asked for while on Bluetooth. Ends when
+//             you leave the update screen.
+//    HOTSPOT  The setup hotspot, for an update from a file. Ends ten
+//             minutes after the last phone leaves it.
+extern bool wxOk;                      // declared with the weather, further down
+int cfgNetHome = NET_BT;
+const char* lastReset = "";
+const char* bootNote = nullptr;
+volatile uint8_t btNews = 0;
+// ---- 7.9: pocket lock ----
+int  cfgPLock = 2;                     // off, 1, 3, 10 minutes
+const uint8_t PLOCK_MIN[4] = { 0, 1, 3, 10 };
+const char* PLOCK_NAME[4] = { "off", "1 min", "3 min", "10 min" };
+uint32_t lastUserAt = 0;               // the last real touch, not a popup or a glance
+bool     unlocking = false;
+uint32_t unlockAt = 0;
+bool     unlockShown = false;
+// ---- 7.8: the battery log, one charge cycle ----
+//  Kept in RTC memory through deep sleep and written to flash every half
+//  hour and before deep sleep: about fifty small writes a day, and a few
+//  additions per loop. It costs nothing you could measure.
+#define BLOG_MAGIC 0xB10C0001UL
+struct BLog {
+  uint32_t magic, start;               // start: when the cycle began (epoch, 0 if unknown)
+  float    v0; uint8_t pct0;           // the battery then
+  uint32_t sOn, sDark, sLight, sDeep, sWifi;   // seconds in each state
+  uint32_t wakes, restarts;
+};
+RTC_DATA_ATTR BLog blog;
+RTC_DATA_ATTR uint32_t rtcDeepAt = 0;
+RTC_DATA_ATTR bool blogArmed = true;   // a reset waits for the voltage to fall back first
+bool cfgBlog = true;
+int  cfgBlogV = 1;                     // 4.10, 4.20, 4.25, 4.30
+int  cfgCap = 350;                     // mAh
+const float BLOG_V[4] = { 4.10f, 4.20f, 4.25f, 4.30f };
+// Typical draw in each state, for the shares (estimates; "Used" is measured).
+const float BLOG_MA[5] = { 38.0f, 19.0f, 3.0f, 0.3f, 80.0f };
+// ---- 7.7: night sleep ----
+bool cfgNight = false;
+int  cfgBed = 23 * 60;                 // bedtime, minutes after midnight
+RTC_DATA_ATTR int nightPush = 0;       // "an hour later", for tonight only
+uint32_t nightCardUntil = 0;
+bool nightDeep = false;
+// ================================================================
+//  DESIGN RULES (7.6)
+// ================================================================
+//  One set of measures, so every screen reads as one product.
+//    panel     128 x 64
+//    padding   3 px each side, everywhere
+//    bar       11 px: name left, time or count right
+//    rows      12 px pitch, 4 visible, first text at y 14
+//    icons     8 x 8 at x 3; text after them at x 15 (icon + 4 px)
+//    hub icons the same icons, twice the size: one icon language
+//    selected  a rounded bar 1 px in from each edge
+//    values    right-aligned to the padding; 5 px further in with a scrollbar
+//    scrollbar 2 px at the right edge, only past four rows
+//    hint      centred on the bottom line, y 54
+#define UI_PAD     3
+#define UI_BAR_H   11
+#define UI_ROW_Y   14
+#define UI_ROW_H   12
+#define UI_ROWS    4
+#define UI_ICON    8
+#define UI_TEXT_X  (UI_PAD + UI_ICON + 4)
+#define UI_HINT_Y  54
+
+// Eight by eight, one byte a row, leftmost pixel the top bit.
+static const uint8_t IC_BELL[8]  = { 0x18, 0x3C, 0x7E, 0x7E, 0x7E, 0xFF, 0x00, 0x18 };
+static const uint8_t IC_CHECK[8] = { 0xFF, 0x81, 0x83, 0x85, 0xA9, 0x91, 0x81, 0xFF };
+static const uint8_t IC_MAC[8]   = { 0x00, 0x7E, 0x42, 0x42, 0x42, 0x7E, 0xFF, 0x00 };
+static const uint8_t IC_SUN[8]   = { 0x10, 0x54, 0x38, 0xFE, 0x38, 0x54, 0x10, 0x00 };
+static const uint8_t IC_CAR[8]   = { 0x00, 0x3C, 0x66, 0xFF, 0xFF, 0x66, 0x00, 0x00 };
+static const uint8_t IC_MOON[8]  = { 0x3C, 0x70, 0xE0, 0xE0, 0xE0, 0x70, 0x3C, 0x00 };
+static const uint8_t IC_BEADS[8] = { 0x3C, 0x42, 0x81, 0x81, 0x81, 0x42, 0x3C, 0x18 };
+static const uint8_t IC_DAWN[8]  = { 0x00, 0x54, 0x38, 0x7C, 0x7C, 0xFF, 0x00, 0x00 };
+static const uint8_t IC_BOOK[8]  = { 0x00, 0x66, 0x99, 0x99, 0x99, 0x99, 0xE7, 0x18 };
+static const uint8_t IC_STAR[8]  = { 0x10, 0x10, 0x38, 0xFE, 0x38, 0x6C, 0x44, 0x00 };
+static const uint8_t IC_SLIDE[8] = { 0x70, 0xFF, 0x70, 0x00, 0x0E, 0xFF, 0x0E, 0x00 };
+static const uint8_t IC_LEAF[8]  = { 0x0E, 0x3F, 0x7E, 0x7E, 0xFC, 0xF8, 0x80, 0x00 };
+static const uint8_t IC_PAGE[8]  = { 0xFE, 0x82, 0xBA, 0x82, 0xBA, 0x82, 0xFE, 0x00 };
+static const uint8_t IC_PAD[8]   = { 0x00, 0x7E, 0xDD, 0x8F, 0xDB, 0x7E, 0x66, 0x00 };
+static const uint8_t IC_HAND[8]  = { 0x20, 0x20, 0x2C, 0x3E, 0x7E, 0x7E, 0x3C, 0x00 };
+static const uint8_t IC_BT[8]    = { 0x10, 0x18, 0x54, 0x38, 0x38, 0x54, 0x18, 0x10 };
+static const uint8_t IC_SHIELD[8]= { 0x7E, 0x81, 0x81, 0x81, 0x42, 0x42, 0x24, 0x18 };
+static const uint8_t IC_BATT[8]  = { 0x00, 0xFC, 0x84, 0xB6, 0xB6, 0x84, 0xFC, 0x00 };
+static const uint8_t IC_CHIP[8]  = { 0x54, 0x7C, 0xC6, 0x44, 0xC6, 0x7C, 0x54, 0x00 };
+
+// ---- the hubs ----
+enum { HI_SCREEN = 0, HI_FAITH, HI_ADHKAR, HI_RELAX, HI_PSET };
+struct HubIt { uint8_t kind; uint8_t a; const uint8_t* icon; const char* name; };
+int inHub = -1, hubSel = 0, hubEntry = 0;
+
+extern "C" void ble_svc_gatt_changed(uint16_t start_handle, uint16_t end_handle);
+// getLocalTime(&t, 0) can give up without looking: it notes millis(),
+// then only looks while no millisecond has passed since. If the counter
+// ticks between the two, it reports "no time" with the clock fine. That
+// was the robot's "waiting for the clock" face appearing at random, and
+// the same answer reached prayer alerts and reminders. This just looks.
+static bool nowLocal(struct tm* t) {
+  time_t n = time(nullptr);
+  localtime_r(&n, t);
+  return t->tm_year > (2016 - 1900);
+}
+// ---- 7.3: devices and links ----
+//  Every device that has paired is remembered with a name. Two can be
+//  preferred: Primary (the notification phone: clock, notifications,
+//  guard, auto Away) and Second (a companion, say the Mac). With
+//  Multi-link on, two stay connected; a preferred device arriving takes
+//  the place of one that is not. btConn stays "the phone" for all the
+//  older code; btConn2 is the companion.
+struct DevRec { uint8_t a[6]; char label[18]; };
+#define DEV_N 6
+DevRec   devs[DEV_N];
+int      devN = 0;
+uint8_t  prefA[2][6];                  // all zero: no preference
+bool     cfgMulti = false, cfgAutoAway = true;
+volatile uint16_t btConn2 = 0xFFFF;
+struct LinkRec { uint16_t h; uint8_t a[6]; bool authed; };
+LinkRec  links[3];
+int      linkN = 0;                    // set on the NimBLE task, read by loop
+volatile uint16_t authQ[4];            // links that just finished pairing, for loop
+volatile uint8_t  authHead = 0, authTail = 0;
+bool     btEverLinked = false;
+uint32_t doorPauseUntil = 0;
+volatile uint32_t advFastUntil = 30000;     // fast for the first half minute after start
+volatile bool     advSlow = false;
+static void advFast() {                     // a link just went: listen quickly for a while
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->setMinInterval(244); adv->setMaxInterval(244);    // 152.5 ms
+  advSlow = false;
+  advFastUntil = millis() + 30000;
+}           // after turning a device away, a minute closed
+// ---- 7.3: automatic Away ----
+bool     awayAuto = false;             // this Away began because the phone left
+RTC_DATA_ATTR uint8_t rtcAwayCheck = 0;
+bool     awayCheckBoot = false, awayQuietDeep = false;
+#define  AUTO_AWAY_MS 120000UL
+// ---- 7.2: the Rafiq service ----
+//  An iPhone speaks to Rafiq through Apple's own services. Everything
+//  else (the Android app now, the Mac app later) speaks through this
+//  one. Four characteristics, all needing a bonded, encrypted link:
+//    CMD   write  a RAFIQ command, exactly as a Shortcut would send it
+//    NOTE  write  a notification: category, app, title, text (0x1F apart)
+//    TIME  write  8 bytes, the phone's wall clock in seconds, little end
+//    STAT  read   a line of key=value pairs about the robot
+#define RQ_SVC  "52a1f000-7a3e-4b5c-9d6f-0a1b2c3d4e5f"
+#define RQ_CMD  "52a1f001-7a3e-4b5c-9d6f-0a1b2c3d4e5f"
+#define RQ_NOTE "52a1f002-7a3e-4b5c-9d6f-0a1b2c3d4e5f"
+#define RQ_TIME "52a1f003-7a3e-4b5c-9d6f-0a1b2c3d4e5f"
+#define RQ_STAT "52a1f004-7a3e-4b5c-9d6f-0a1b2c3d4e5f"
+//  7.4:
+//    EVT   notify  gestures, as they happen ("1", "2", "hold" ...)
+//    PTR   write without response  "x y", -1000..1000, the pointer
+//    CFG   read    the settings, as JSON with /api/state's own names
+#define RQ_EVT  "52a1f005-7a3e-4b5c-9d6f-0a1b2c3d4e5f"
+#define RQ_PTR  "52a1f006-7a3e-4b5c-9d6f-0a1b2c3d4e5f"
+#define RQ_CFG  "52a1f007-7a3e-4b5c-9d6f-0a1b2c3d4e5f"
+NimBLECharacteristic* rqEvt = nullptr;
+//  7.5:
+//    LST  read   {"apps":[seen],"muted":[...],"vip":[...]}
+//    OTA  write without response: firmware bytes, after "!ota begin"
+#define RQ_LST  "52a1f008-7a3e-4b5c-9d6f-0a1b2c3d4e5f"
+#define RQ_OTA  "52a1f009-7a3e-4b5c-9d6f-0a1b2c3d4e5f"
+// ---- 7.5: the Mac's cards: 0 health, 1 top three, 2 pinned task ----
+struct Card { bool on; char title[22]; char line[3][24]; int8_t bar; };
+Card cards[3];
+int  macSel = 0;
+bool knobOn = false, knobUsed = false, walkOn = false, macBye = false, macDim = false;
+float knobRef = 0; int knobLast = 0; uint32_t knobAt = 0;
+int8_t leanState = 0;                  // -1 left, 0 middle, 1 right (gesture mode)
+uint32_t walkUntil = 0;
+// ---- app filter and VIPs, kept on the robot so every phone obeys it ----
+#define APPS_N 12
+#define MUTE_N 12
+#define VIP_N  8
+char seenApps[APPS_N][20]; int seenN = 0;
+char mutedApps[MUTE_N][20]; int mutedN = 0;
+char vipWords[VIP_N][20];  int vipN = 0;
+// ---- updates over Bluetooth ----
+volatile bool otaOn = false, otaErr = false;
+volatile uint32_t otaSize = 0, otaGot = 0, otaLastAt = 0;
+uint16_t otaConn = 0xFFFF;
+int otaPctSent = -1;
+extern bool cfgGesture, cfgFollow;     // both declared with gestures, further down
+struct AppMsg { uint8_t kind; uint16_t len; uint16_t conn; char data[420]; };
+#define APPQ_N 4
+AppMsg appQ[APPQ_N];
+volatile uint8_t appHead = 0, appTail = 0;   // written by NimBLE, read by loop
+volatile bool btApp = false;           // the phone on the line runs the Rafiq app
+extern bool timeOk;                    // both declared with the clock, further down
+extern const char* clockSrc;
+uint32_t appNoteSeq = 0;
+uint16_t appRxCmd = 0, appRxNote = 0;   // what has arrived from the app
+char     appLast[16] = "";
+// ---- 6.4 Away ----
+//  "Away: back at 3, call Ahmed". The screen shows that and the time,
+//  nothing else, through restarts, until a RAFIQ home. Everything done
+//  to it meanwhile is counted into the tamper log. Bluetooth stays on,
+//  or home could never arrive.
+bool     awayOn = false;
+String   awayText = "";
+#define  AWAY_SHOW_MS 3000UL        // a touch or a move while still listening
+#define  AWAY_SENT_SHOW_MS 5000UL   // when it has just been sent
+// 6.5: Away listens on Bluetooth for a while, then sleeps for real.
+//   sent from the phone: 5 minutes listening for home
+//   switched off and on: the message for 5 s, then 2 minutes listening
+//   after that: deep sleep. A touch or a move shows the message for
+//   3 s and it is straight back, Bluetooth never coming on, so nobody
+//   but a restart (you) can reach it.
+#define  AWAY_LISTEN_SENT_MS    300000UL
+#define  AWAY_LISTEN_RESTART_MS 120000UL
+#define  AWAY_RESTART_SHOW_MS     3000UL
+#define  AWAY_DEEP_SHOW_MS        3000UL
+uint32_t awayListenUntil = 0;
+uint32_t awayShowMs = AWAY_SHOW_MS;
+RTC_DATA_ATTR uint8_t rtcAwayDeep = 0;   // 1 asleep in Away, 2 pausing after a move
+enum { AE_TOUCH = 0, AE_SHAKE, AE_MOVE, AE_KNOCK, AE_N };
+const char* AE_NAME[AE_N] = { "Touched", "Shaken", "Moved", "Knocked" };
+uint16_t aeCount[AE_N] = { 0, 0, 0, 0 };
+uint32_t aeLast[AE_N]  = { 0, 0, 0, 0 };
+static void awayEv(int k) { if (!awayOn) return; aeCount[k]++; aeLast[k] = millis(); }
+uint32_t popGlanceMs = 1000;
+// ---- 7.0 ----
+// Who to get in touch with, shown in Away between showings of the
+// message. Kept in the firmware at the owner's request: leave these
+// out of anything pushed to a public repository.
+#define OWNER_NAME  "Ahmed"
+#define OWNER_PHONE "+918660027729"
+#define OWNER_PHONE_SHOW "+91 86600 27729"
+#define OWNER_MAIL  "mahiahmad53@gmail.com"
+// Relax from a Shortcut lasts this long, then the robot sleeps.
+#define RELAX_RQ_MS 180000UL
+uint32_t relaxUntil = 0;
+// The timer. While it runs, nothing else works: a touch only keeps the
+// screen on (or lets it go back to its rhythm), RAFIQ timer changes it
+// and RAFIQ home stops it. Done, it flashes until touched.
+bool     tmrOn = false, tmrDone = false, tmrPinned = false;
+uint32_t tmrStart = 0, tmrEnd = 0, tmrDoneAt = 0;           // how long news shows when it woke the robot
+// ---- 6.4 phone-away sleep ----
+//  Ten minutes dark and linked-or-listening after the phone goes, then
+//  off, waking every 3 minutes for the first hour and every 5 after to
+//  see whether it is back. A check wake is silent: no screen.
+RTC_DATA_ATTR uint32_t rtcAwaySince = 0;   // when checking began, system clock
+RTC_DATA_ATTR uint8_t  rtcWakeCheck = 0;   // this timer wake is a check, not a prayer
+bool     deepAuto = false;             // this deep sleep is the phone-away kind
+bool     checkWake = false;            // woke only to look for the phone
+uint32_t checkUntil = 0;
+#define  CHECK_WINDOW_MS 20000UL
+uint32_t    glanceUntil = 0;           // a lift's look at the time ends here
+#define GLANCE_MS 1500UL
+const char* banText = "";              // a quiet line on a black screen
+uint32_t    banUntil = 0;
+// 6.1 popups: drawn over wherever you are. A tap closes it and you are
+// exactly where you were; a hold opens it in Notifications. If it woke
+// the robot, closing it puts the robot back to sleep.
+bool     popOn = false, popWoke = false;
+uint32_t popUntil = 0;
+bool     notesDirty = false;
+uint32_t notesSavedAt = 0;
+int      noteSel = 0;
+static void popupShow();
+static void popupClose(bool open);
+static void goSleepQuick();
+static void popupOnWake();
+static void noteHeader(const Note& n, const char* right);
+static void twoButtons(const char* a, const char* b);
+static void saveNotes();
+NimBLEClient* btCl = nullptr;          // the phone, as a client: fetched once per link
+volatile bool btClStale = true;          // 1 linked, 2 unlinked, for loop to say
+enum { WS_NONE = 0, WS_MANUAL, WS_SYNC, WS_UPDATE, WS_HOTSPOT };
+int      wsKind    = WS_NONE;
+uint32_t wsStartMs = 0;
+uint32_t wsLastUse = 0;
+volatile bool wsEndWant = false;       // asked for from a web handler, done from loop
+bool     wsSawUp   = false;            // the update screen has been up this session
+#define WS_IDLE_S           600UL      // ten minutes unused, then off (7.4)
+#define WS_SYNC_MS       150000UL      // the whole of a sync, joining included
+#define WS_ASK_MS        180000UL      // an update question nobody answers
+#define WS_HOTSPOT_IDLE_MS 600000UL
+// Kept through deep sleep, lost on any real restart. That is the whole
+// rule for when manual WiFi ends, carried by where the number lives.
+RTC_DATA_ATTR uint32_t rtcWsUntil = 0;   // seconds on the system clock
+RTC_DATA_ATTR uint8_t  rtcWsKind  = 0;
+
+bool     syncRun = false, syncStarted = false, syncStoryDone = false, syncUpArmed = false;
+uint32_t syncAt = 0;
+bool     upQuick = false;              // a No ends the whole question
+bool     upAfterJoin = false;          // Check update, waiting for a network
+bool     upDirect = false;             // and go straight to the newest one
+uint32_t lastSyncAt = 0;               // system clock seconds, 0 never
+uint32_t askSince = 0;
+
+// Commands that change the radios wait a moment, so the answer to the
+// phone (clear that notification) goes out before the radio does.
+enum { RQ_NONE = 0, RQ_SYNC, RQ_UPDATE, RQ_WIFI, RQ_HOTSPOT, RQ_TAMPER, RQ_DEEP, RQ_REBOOT };
+int      rqPend = RQ_NONE;
+uint32_t rqPendAt = 0;
+
+// Weather from the phone or the last sync, kept in flash, because on
+// Bluetooth deep sleep is every time the phone is not around.
+uint32_t wxAt = 0;                     // system clock seconds it arrived
+volatile bool wxDirty = false;
+volatile bool netBusy = false;        // the network task is mid-fetch
+
+// Notifications still land in the list, but wake nothing.
+bool cfgQuiet = false;
+
+// The phone guard. Going away from the phone and the phone going away
+// from you are the same event, seen from here.
+bool     cfgPGuard = false;
+bool     pgEver = false;               // linked at least once since Bluetooth started
+uint32_t pgLostAt = 0, pgWeakSince = 0, pgRssiAt = 0, pgUntil = 0;
+float    pgRssi = 0;                   // smoothed; 0 means not measured yet
+bool     pgFired = false;
+const char* pgWhy = "";
+#define PG_LOST_MS   4000UL
+#define PG_WEAK_DBM  (-88)
+#define PG_OK_DBM    (-80)
+#define PG_WEAK_MS   6000UL
+#define PG_SHOW_MS 120000UL
+
+// Find me: the screen calls out for twenty seconds.
+uint32_t findUntil = 0;
+
+// Tamper. Armed, it goes dark and quiet and writes down what happens
+// to it. Only a real restart disarms it.
+uint32_t tamperCountAt = 0;            // the countdown, 0 when not counting
+#define TAMPER_COUNT_MS 10000UL
+RTC_DATA_ATTR uint8_t rtcTamper = 0;   // 1 armed, 2 pausing after a move
+RTC_DATA_ATTR char    rtcTz[32] = "";
+#define TLOG_PATH "/tamper.txt"
+#define TLOG_MAX  4096
+#define TL_N 24
+char tlLines[TL_N][24];
+int  tlN = 0, tlSel = 0;
+
+// Light sleep. Only on a core built with power management; a stock
+// core says no to esp_pm_configure and the robot behaves exactly as
+// 5.20 did, off the moment the screen goes dark on Bluetooth.
+bool pmAvail = false;
+int  pmMode  = -1;
+volatile uint32_t btDropAt = 0;        // when the phone last went
+#define BT_DEEP_GRACE_MS 600000UL      // no phone for ten minutes, then off (6.4)
+
+static bool wsStart(int kind);
+static void wsEnd(const char* why);
+static void wsTouch();
+static void serviceWs();
+static void syncBegin();
+static void pocketTick();
+static void blogTick();
+static void blogSave();
+static void blogReset();
+static void blogBoot(bool fromDeep);
+static void drawBattUse();
+static void nightTick();
+static void idleRhythm();
+static void nightGo();
+static void drawNightCard();
+static long secsToNightEnd();
+static void drawHub();
+static bool isHub(int s);
+static int hubCount(int s);
+static void hubEnter(int hubScr, int sel);
+static void uiHubCard(const char* name, const uint8_t* ic, const char* l1, const char* l2);
+static void uiRow(int r, const uint8_t* ic, const char* label, const char* value, bool on, bool scrolled);
+static void uiScroll(int first, int total);
+static int uiFirst(int sel, int total);
+static void gestTilt();
+static void evtSend(const char* what);
+static bool noteAllowed(const Note& n);
+static bool noteVip(const Note& n);
+static String lstJson();
+static void filtersLoad();
+static bool popRinging();
+static void drawMac();
+static int macItems(int* idx);
+static bool cardsAny();
+static void drawWalk();
+static void drawBleOta();
+static void otaStop(const char* why);
+static void listSave(const char* key, char (*src)[20], int n);
+static void appBang(char* c, uint16_t conn);
+static void linkTick();
+static void devLoad();
+static bool anyLinked();
+static void phoneFix();
+static void devLabel(const uint8_t* a, const char* label, bool onlyIfDefault);
+static const char* prefName(int k);
+static void ringInit();
+static void ringPx(int cx, int cy, int r, int k);
+static void fmtDur(long s, char* b, size_t n);
+static void fmtClock(time_t t, char* b, size_t n);
+static void appTick();
+static void cursorFeed(const char* b);
+static String cfgJson();
+static bool cfgApply(const String& k, int v);
+static void rafiqPayload(const char* p, bool fresh);
+static void tmrTick();
+static void tmrTouch();
+static void drawTimer();
+static bool tmrCommand(const char* c);
+static void tmrStop(const char* why);
+static void awayDeepGo();
+static void awayEyes(bool open);
+static void awayText1(const char* t);
+static void drawContact();
+static void awayDeepWake(bool timer);
+static void drawAway();
+static void awayFlush(bool all);
+static void awaySet(bool on, const char* text);
+static void wsFailCard(const char* a, const char* b);
+static bool rafiqTagged(const Note& n);
+static void pmSet(bool idle);
+static bool phoneHeld();
+static void pgTick();
+static void tlogAdd(const char* what);
+static void tamperArm();
+static void serviceTamper();
+static void rafiqNote(const Note& n);
+static bool rafiqIs(const Note& n);
+static void saveWx();
+static void tlogLoad();
+static void drawTlog();
+static void tlogDelete(int k);
 
 // The vehicle screen, off until you ask for it.
 //
@@ -432,20 +896,36 @@ int  bikeTry  = 0;
 static bool screenHasDepth(int s) {
   return s == S_FAITH || s == S_READS || s == S_GAMES ||
          s == S_FOCUS || s == S_SETTINGS || s == S_REMIND ||
-         s == S_MSG;
+         s == S_MSG ||
+         s == S_TODAY || s == S_FHUB || s == S_CALM;     // 7.6.1: the hubs have menus
 }
 
 // Which screens are worth offering at all. Weather needs the network
 // and the vehicle screen is something you asked for; neither should sit
 // in the carousel as a dead end.
 static bool screenOn_(int s) {
+  if (s == S_FOCUS)   return cardsAny();              // 7.5: the Mac screen, when it has something
   if (s == S_BIKE)    return cfgBike;
-  if (s == S_WEATHER) return !offlineNow();
+  if (s == S_WEATHER) return !offlineNow() || wxOk;   // the last report is still worth showing
   return true;
 }
+// The round, in order. Notifications come straight after home: they
+// are the thing most often looked for. The enum keeps its numbers for
+// the page and the Mac; only the walk changes.
+// 7.6: five stops. Everything else lives inside a hub, which is what
+// makes it quick to find: four choices to look at, not twelve.
+const int S_ORDER[] = { S_HOME, S_TODAY, S_FHUB, S_CALM, S_SETTINGS };
+#define S_ORDER_N (int)(sizeof(S_ORDER) / sizeof(S_ORDER[0]))
+static bool cardsAny();
+static int macItems(int* idx);
+static bool prayerSoon(int mins);
 static int nextScreen(int from) {
-  for (int i = 1; i <= S_COUNT; i++) {
-    int s = (from + i) % S_COUNT;
+  // Home looks ahead: with a prayer close, Faith comes first.
+  if (from == S_HOME && prayerSoon(15)) return S_FHUB;
+  int at = 0;
+  for (int i = 0; i < S_ORDER_N; i++) if (S_ORDER[i] == from) { at = i; break; }
+  for (int i = 1; i <= S_ORDER_N; i++) {
+    int s = S_ORDER[(at + i) % S_ORDER_N];
     if (screenOn_(s)) return s;
   }
   return S_HOME;
@@ -561,14 +1041,20 @@ enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
        C_PRAYER, C_HIJRI, C_MODE, C_BIKE, C_HOTSPOT, C_ACCEL, C_KNOCK, C_TAP,
        C_SHAKE, C_DEEP, C_WAKEH, C_BATT,
        C_PAIR, C_UPDATE,
-       C_AUTOUP, C_RESET, C_REBOOT, C_ABOUT, C_COUNT };
+       C_AUTOUP, C_RESET, C_REBOOT, C_ABOUT,
+       C_GUARD, C_TAMPER, C_TLOG, C_HOLD, C_CLOCK, C_WAKEBY,
+       C_MULTI, C_DEV1, C_DEV2, C_AUTOAWAY, C_NIGHT, C_BED,
+       C_BLOG, C_BVIEW, C_BRESET, C_PLOCK, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
     "Eye style", "Prayer times", "Hijri shift", "Network", "Vehicle",
     "Hotspot", "Accelerometer", "Knocks", "Tap strength",
     "Go back by", "Power down", "Wake on hold", "Battery full",
-    "Pair a Mac", "Check update", "Auto update",
-    "Reset settings", "Reboot", "About" };
+    "Pair a Mac", "Update", "Auto update",
+    "Reset settings", "Reboot", "About",
+    "Phone guard", "Tamper alarm", "Tamper log", "Hold time", "Clock", "Wake by",
+    "Multi-link", "Primary", "Second", "Auto away", "Night sleep", "Bedtime",
+    "Battery log", "Battery use", "New log at", "Pocket lock" };
 
 // ---------------- settings, in groups ----------------
 //
@@ -588,15 +1074,24 @@ const char* C_NAME[C_COUNT] =
 //  the check said so. Like this, every single setting is the same
 //  number of presses away or fewer, and the worst case goes from
 //  twenty three to seven.
-enum { SG_DISPLAY = 0, SG_WIRELESS, SG_CONTROLS, SG_SYSTEM, SG_COUNT };
-const char* SG_NAME[SG_COUNT] = { "Display", "Wireless", "Controls", "System" };
+// 7.6: grouped by what you are trying to do. Prayer settings is not in
+// the list: it is opened from Faith, next to the prayer times it changes.
+enum { SG_DISPLAY = 0, SG_TOUCH, SG_CONN, SG_SAFE, SG_BATT, SG_SYSTEM, SG_COUNT,
+       SG_FAITHSET = SG_COUNT, SG_ALL,
+       SG_WIRELESS = SG_CONN, SG_DEVICES = SG_CONN, SG_CONTROLS = SG_TOUCH };
+const char* SG_NAME[SG_ALL] = { "Display", "Touch and motion", "Connections",
+                                "Away and safety", "Battery", "System", "Prayer settings" };
+
 #define SG_MAX 8
 #define SG_END 0xFF
-const uint8_t SG_ROWS[SG_COUNT][SG_MAX] = {
-  { C_BRIGHT, C_FACE,    C_SLEEP, C_TURN,   C_POPUP,  C_EYES,   C_HIJRI, C_BIKE },
-  { C_MODE,   C_HOTSPOT, C_PAIR,  C_PRAYER, C_UPDATE, C_AUTOUP, SG_END,  SG_END },
-  { C_KNOCK,  C_TAP,     C_SHAKE, C_WAKEH,  C_ACCEL,  SG_END,   SG_END,  SG_END },
-  { C_DEEP,   C_BATT,    C_RESET, C_REBOOT, C_ABOUT,  SG_END,   SG_END,  SG_END },
+const uint8_t SG_ROWS[SG_ALL][SG_MAX] = {
+  { C_BRIGHT,   C_FACE,  C_CLOCK, C_SLEEP,  C_POPUP,  C_TURN,   C_EYES,  C_BIKE },
+  { C_WAKEBY,   C_PLOCK, C_WAKEH, C_HOLD,   C_SHAKE,  C_KNOCK,  C_TAP,   C_ACCEL },
+  { C_MODE,     C_MULTI, C_DEV1,  C_DEV2,   C_PAIR,   C_HOTSPOT, SG_END, SG_END },
+  { C_AUTOAWAY, C_GUARD, C_TAMPER, C_TLOG,  SG_END,   SG_END,   SG_END,  SG_END },
+  { C_BVIEW,    C_BLOG,  C_BRESET, C_BATT,  C_DEEP,   C_NIGHT,  C_BED,   SG_END },
+  { C_UPDATE,   C_RESET, C_REBOOT, C_ABOUT, SG_END,   SG_END,   SG_END,  SG_END },
+  { C_PRAYER,   C_HIJRI, SG_END,  SG_END,   SG_END,   SG_END,   SG_END,  SG_END },
 };
 static int sgLen(int g) {
   int n = 0; while (n < SG_MAX && SG_ROWS[g][n] != SG_END) n++; return n;
@@ -861,6 +1356,25 @@ const char* IDLE_LINES[] = {
   "no network needed", "hold to go in",         "still here" };
 const int IDLE_N = sizeof(IDLE_LINES) / sizeof(IDLE_LINES[0]);
 
+// The last time the clock was known to be right.
+//
+// A robot that has just come up has nothing to show and used to show a
+// cartoon face, which tells you nothing and looks like a fault. This
+// is something true instead.
+//
+// It is never fed back into the system clock and never sets timeOk. A
+// stale time that reminders and prayer alerts believed would be worse
+// than no time at all, so it is for the screen and nothing else.
+RTC_DATA_ATTR time_t lastGoodEpoch = 0;
+static bool lastGoodHM(char* o, size_t n) {
+  if (lastGoodEpoch <= 0) return false;
+  time_t e = lastGoodEpoch;
+  struct tm t;
+  if (!localtime_r(&e, &t)) return false;
+  snprintf(o, n, "%02d:%02d", t.tm_hour, t.tm_min);
+  return true;
+}
+
 // ---------------- the stopwatch ----------------
 //  Something you pick now, rather than something home became.
 //
@@ -1031,6 +1545,10 @@ NimBLERemoteCharacteristic* ancsCP = nullptr;
 
 static void btSet(int stage) {
   if (btStage == stage) return;
+  // Linked and unlinked are news worth a word when someone is looking.
+  // Set here, said from loop: this runs on the NimBLE task.
+  if (stage == BT_BONDED) btNews = 1;
+  else if (btStage == BT_BONDED && stage == BT_ADVERTISING) btNews = 2;
   btStage = stage;
   btSince = millis();
   Serial.printf("bluetooth: %s\n",
@@ -1112,7 +1630,7 @@ bool     ancsBusy = false;             // one attribute request at a time
 //  id is what you quote back to dismiss it or answer a call.
 #define NOTE_MAX 20
 // How many attributes ancsAsk requests and onDataSource expects back.
-#define ANCS_ATTRS 3
+#define ANCS_ATTRS 5
 Note notes[NOTE_MAX];
 int  noteN = 0;                        // in use, notes[0] is the newest
 int  noteIdx = 0;                      // which one is being read
@@ -1137,46 +1655,242 @@ volatile uint8_t  uidHead = 0, uidTail = 0;
 Note     noteStage;
 volatile bool noteReady = false;
 volatile bool btWokeReq = false;       // a connection wants the screen
-uint8_t  dsBuf[512];
+uint8_t  dsBuf[768];
+//  The longer parts of whatever is being parsed. The list keeps a
+//  hundred characters of a message; a RAFIQ command or a weather
+//  report from a Shortcut needs the whole of it, and when it was sent.
+char     stMsg[404];
+char     stSub[34];
+char     stDate[20];
 size_t   dsLen = 0;
 uint8_t  dsCat = 0;
 
+static int linkFind(uint16_t h) { for (int i = 0; i < linkN; i++) if (links[i].h == h) return i; return -1; }
+static void linkDrop(uint16_t h) {
+  int i = linkFind(h);
+  if (i < 0) return;
+  for (int k = i; k < linkN - 1; k++) links[k] = links[k + 1];
+  linkN--;
+}
+// Everything that was set up on the phone's link belongs to that link.
+static void phoneReset(uint16_t h) {
+  btConn = h;
+  btClStale = true; btApp = false;
+  ctsState = CTS_IDLE; ctsSyncedAt = 0; ctsFails = 0;
+  ancsState = (h == 0xFFFF) ? ANCS_NONE : ANCS_WAIT; ancsTries = 0;
+  ancsCP = nullptr; ancsBusy = false;
+  uidHead = uidTail = 0; dsLen = 0;
+}
+
 class BtServerCb : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* sv, NimBLEConnInfo& ci) override {
-    btConn = ci.getConnHandle();
-    btSet(ci.isEncrypted() ? BT_BONDED : BT_CONNECTED);
-    ancsState = ANCS_WAIT; ancsTries = 0;
-    btWokeReq = true;
+    uint16_t h = ci.getConnHandle();
+    if (linkN < 3) { links[linkN].h = h; memset(links[linkN].a, 0, 6); links[linkN].authed = false; linkN++; }
+    if (btConn == 0xFFFF) {                       // the first link is the phone, until told otherwise
+      phoneReset(h);
+      btSet(ci.isEncrypted() ? BT_BONDED : BT_CONNECTED);
+      btWokeReq = true;
+    } else {
+      btConn2 = h;                                // a companion
+    }
     // Ask for the encryption ourselves rather than waiting to be
-    // asked. The bundled library only did this when something
-    // demanded an encrypted read, so with nothing demanding one the
-    // bond never completed, the rung never left "linked", and the
-    // clock was never fetched. That was the whole of that bug.
+    // asked; with nothing demanding it the bond never completed.
     btSecAskedAt = millis();
-    NimBLEDevice::startSecurity(btConn);
+    NimBLEDevice::startSecurity(h);
+    // With Multi-link on, keep a door open: one more can come in, and
+    // loop decides who stays (two at most, preferred devices first).
+    if (cfgMulti && linkN < 2) NimBLEDevice::startAdvertising();   // a second is welcome; more is loop's call
   }
   void onDisconnect(NimBLEServer* sv, NimBLEConnInfo& ci, int reason) override {
-    btConn = 0xFFFF;
-    // Whatever was found on the last connection was found on handles
-    // belonging to that connection. None of it carries over.
-    ctsState = CTS_IDLE; ctsSyncedAt = 0; ctsFails = 0;
-    ancsState = ANCS_NONE; ancsCP = nullptr; ancsBusy = false;
-    uidHead = uidTail = 0; dsLen = 0;
-    btSet(BT_ADVERTISING);
+    uint16_t h = ci.getConnHandle();
+    bool wasComp = (h == btConn2);       // 7.4: the companion, not the phone
+    linkDrop(h);
+    if (h == btConn2) btConn2 = 0xFFFF;
+    if (h == btConn) {
+      btDropAt = millis();
+      // The phone went. If a companion is still here, it becomes the
+      // phone, so the clock and the rest carry on from it.
+      uint16_t other = btConn2;
+      btConn2 = 0xFFFF;
+      phoneReset(other);
+      if (other != 0xFFFF) btSet(BT_BONDED);
+      else                 btSet(BT_ADVERTISING);
+    }
     // Straight back to advertising, or the phone has nothing to come
     // back to and you would be pairing it by hand every time.
-    NimBLEDevice::startAdvertising();
+    if (linkN < (cfgMulti ? 2 : 1)) { advFast(); NimBLEDevice::startAdvertising(); }
+    // A companion gone takes gesture mode with it.
+    if (wasComp) {
+      cfgGesture = false; knobOn = false; macDim = false;
+      // 7.5: gone while awake, without saying goodnight: left behind.
+      if (walkOn && !macBye) { walkUntil = millis() + 60000UL; btWokeReq = true; }
+      macBye = false;
+    }
+    if (otaOn && h == otaConn) { otaErr = true; }
   }
   void onAuthenticationComplete(NimBLEConnInfo& ci) override {
+    uint16_t h = ci.getConnHandle();
     if (!ci.isEncrypted()) {
       Serial.println("bluetooth: pairing did not take");
-      btSet(BT_CONNECTED);
+      if (h == btConn) btSet(BT_CONNECTED);
       return;
     }
-    btConn = ci.getConnHandle();
-    btSet(BT_BONDED);
+    int i = linkFind(h);
+    if (i >= 0) { memcpy(links[i].a, ci.getIdAddress().getVal(), 6); links[i].authed = true; }
+    uint8_t nx = (authHead + 1) % 4;
+    if (nx != authTail) { authQ[authHead] = h; authHead = nx; }
+    // 90 to 120 ms, may skip 4, 6 s to give up: Apple's own guidance,
+    // and most of the radio's time asleep. Following the pointer asks
+    // for a quicker one while it runs.
+    NimBLEDevice::getServer()->updateConnParams(h, 72, 96, 4, 600);
+    // "Our services may have changed: read them again." Without this a
+    // bonded Mac keeps the list it saw before an update, and new
+    // channels (7.4's events, pointer, settings) never appear to it.
+    ble_svc_gatt_changed(0x0001, 0xFFFF);
+    if (h == btConn) btSet(BT_BONDED);
   }
 };
+
+// ---- the device list, kept in flash ----
+static void devSave() {
+  prefs.putBytes("devs", devs, sizeof(DevRec) * devN);
+  prefs.putInt("devn", devN);
+  prefs.putBytes("prefa", prefA, sizeof(prefA));
+}
+static void devLoad() {
+  devN = constrain(prefs.getInt("devn", 0), 0, DEV_N);
+  if (devN) prefs.getBytes("devs", devs, sizeof(DevRec) * devN);
+  memset(prefA, 0, sizeof(prefA));
+  if (prefs.isKey("prefa")) prefs.getBytes("prefa", prefA, sizeof(prefA));
+}
+static int devFind(const uint8_t* a) { for (int i = 0; i < devN; i++) if (!memcmp(devs[i].a, a, 6)) return i; return -1; }
+static int devSeen(const uint8_t* a) {
+  int i = devFind(a);
+  if (i >= 0) return i;
+  if (devN == DEV_N) { for (int k = 0; k < DEV_N - 1; k++) devs[k] = devs[k + 1]; devN--; }   // forget the oldest
+  i = devN++;
+  memcpy(devs[i].a, a, 6);
+  snprintf(devs[i].label, sizeof(devs[i].label), "Device %02X%02X", a[1], a[0]);
+  devSave();
+  return i;
+}
+static void devLabel(const uint8_t* a, const char* label, bool onlyIfDefault) {
+  int i = devSeen(a);
+  if (onlyIfDefault && strncmp(devs[i].label, "Device ", 7)) return;
+  snprintf(devs[i].label, sizeof(devs[i].label), "%.17s", label);
+  devSave();
+}
+static int prefRank(const uint8_t* a) {        // 1 primary, 2 second, 0 neither
+  static const uint8_t zero[6] = { 0 };
+  for (int k = 0; k < 2; k++) if (memcmp(prefA[k], zero, 6) && !memcmp(prefA[k], a, 6)) return k + 1;
+  return 0;
+}
+static const char* prefName(int k) {
+  static const uint8_t zero[6] = { 0 };
+  // "any" and "nothing has ever linked" looked identical, so pressing
+  // the row and watching it stay on "any" told you nothing about why.
+  if (!devN) return "none seen";
+  if (!memcmp(prefA[k], zero, 6)) return "any";
+  int i = devFind(prefA[k]);
+  return i < 0 ? "?" : devs[i].label;
+}
+static bool linkIsMac(int i) {
+  if (i < 0 || !links[i].authed) return false;
+  int d = devFind(links[i].a);
+  return d >= 0 && !strncmp(devs[d].label, "Mac", 3);
+}
+// The phone is whoever can be one: not a Mac. If a Mac holds the
+// phone's place and anything else is linked, they swap.
+static void phoneFix() {
+  int pi = linkFind(btConn);
+  if (pi < 0 || !linkIsMac(pi)) return;
+  for (int k = 0; k < linkN; k++) {
+    if (links[k].h == btConn || !links[k].authed || linkIsMac(k)) continue;
+    uint16_t mac = btConn;
+    phoneReset(links[k].h);
+    btConn2 = mac;
+    btSince = millis();
+    btSet(BT_BONDED);
+    Serial.println("links: the Mac is a companion; the other device is the phone");
+    return;
+  }
+}
+static bool anyLinked() {
+  for (int i = 0; i < linkN; i++) if (links[i].authed) return true;
+  return false;
+}
+
+// Loop's half: who stays, and who is the phone.
+static void linkTick() {
+  while (authTail != authHead) {
+    uint16_t h = authQ[authTail]; authTail = (authTail + 1) % 4;
+    int i = linkFind(h);
+    if (i < 0) continue;
+    btEverLinked = true;
+    devSeen(links[i].a);
+    int rank = prefRank(links[i].a);
+    NimBLEServer* sv = NimBLEDevice::getServer();
+    // More than two: the one to let go is a device nobody preferred,
+    // the newcomer itself if it is that, or else the other one.
+    if (linkN > 2 && sv) {
+      int victim = -1;
+      if (rank == 0) victim = i;
+      else for (int k = 0; k < linkN; k++) if (k != i && links[k].authed && prefRank(links[k].a) == 0) { victim = k; break; }
+      if (victim < 0) victim = i;
+      Serial.printf("links: three, letting %04X go\n", links[victim].h);
+      sv->disconnect(links[victim].h);
+      if (victim == i) {
+        // Turned away: keep the door shut a minute, or a phone that
+        // reconnects by itself would be in and out all day.
+        doorPauseUntil = millis() + 60000;
+        NimBLEDevice::stopAdvertising();
+        continue;
+      }
+    }
+    // The preferred phone always becomes the phone (but never a Mac).
+    if (rank == 1 && h != btConn && !linkIsMac(i)) {
+      uint16_t old = btConn;
+      phoneReset(h);
+      btConn2 = old;
+      btSince = millis();
+      btSet(BT_BONDED);
+      Serial.println("links: the primary device is the phone now");
+    }
+    if (!cfgMulti && linkN > 1 && sv && h != btConn) sv->disconnect(h);   // one at a time when Multi-link is off
+  }
+  phoneFix();
+  // Keep the door open. Asking once, from inside the connect callback,
+  // was not enough: when that one request did not take, nothing asked
+  // again, and the second device could never get in. Once a second is
+  // plenty; nothing else here is that cheap to check.
+  static uint32_t advCheckAt = 0;
+  if (btUp && cfgNet == NET_BT && millis() - advCheckAt > 1000) {
+    advCheckAt = millis();
+    bool want = (linkN == 0) || (cfgMulti && linkN < 2 && (int32_t)(millis() - doorPauseUntil) > 0);
+    NimBLEAdvertising* adv0 = NimBLEDevice::getAdvertising();
+    if (want && !adv0->isAdvertising()) {
+      NimBLEDevice::startAdvertising();
+      Serial.printf("links: %d linked, advertising again\n", linkN);
+    }
+  }
+  // 7.4: two in, nothing goes out. Not even listening for a third.
+  if (btUp && linkN >= 2) {
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    if (adv->isAdvertising()) NimBLEDevice::stopAdvertising();
+  }
+  // Fast for half a minute after a link goes (so it comes straight
+  // back), then slow: a phone that is away does not need hearing ten
+  // times a second, and the battery does.
+  if (btUp && !advSlow && (int32_t)(millis() - advFastUntil) > 0) {
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    bool was = adv->isAdvertising();
+    if (was) NimBLEDevice::stopAdvertising();
+    adv->setMinInterval(874); adv->setMaxInterval(874);   // 546.25 ms
+    advSlow = true;
+    if (was) NimBLEDevice::startAdvertising();
+  }
+}
+
 
 //  Both of these run on the NimBLE host task, so they do nothing but
 //  write down what arrived. Drawing or sleeping from here is how you
@@ -1202,6 +1916,7 @@ static void onDataSource(NimBLERemoteCharacteristic* c, uint8_t* d,
   Note n = {};
   n.uid = dsBuf[1] | (dsBuf[2] << 8) | (dsBuf[3] << 16) | ((uint32_t)dsBuf[4] << 24);
   n.cat = dsCat;
+  stMsg[0] = stSub[0] = stDate[0] = 0;
   size_t p = 5;
   // Exactly as many as ancsAsk asked for. The number has to match or
   // nothing ever arrives: loop one too many and the last turn runs
@@ -1215,8 +1930,11 @@ static void onDataSource(NimBLERemoteCharacteristic* c, uint8_t* d,
     char*  dst = nullptr; size_t cap = 0;
     if      (id == 0) { dst = n.app;   cap = sizeof(n.app); }
     else if (id == 1) { dst = n.title; cap = sizeof(n.title); }
-    else if (id == 3) { dst = n.msg;   cap = sizeof(n.msg); }
+    else if (id == 2) { dst = stSub;   cap = sizeof(stSub); }
+    else if (id == 3) { dst = stMsg;   cap = sizeof(stMsg); }
+    else if (id == 5) { dst = stDate;  cap = sizeof(stDate); }
     if (dst) { size_t k = L < cap - 1 ? L : cap - 1; memcpy(dst, dsBuf + p + 3, k); dst[k] = 0; }
+    if (id == 3) { strncpy(n.msg, stMsg, sizeof(n.msg) - 1); n.msg[sizeof(n.msg) - 1] = 0; }
     p += 3 + L;
   }
   n.unread = true;
@@ -1226,9 +1944,162 @@ static void onDataSource(NimBLERemoteCharacteristic* c, uint8_t* d,
   ancsBusy = false;
 }
 
+//  Once per connection, never more. NimBLEServer::getClient() deletes
+//  everything it has discovered every time it is called, so calling it
+//  for the clock after the notifications were set up threw the
+//  notification subscriptions away (nothing ever arrived) and left
+//  ancsCP pointing at freed memory (the occasional reboot). C3 Buddy
+//  learned this first; this is its rule. (btCl and btClStale are
+//  declared with the 6.0 globals, because the disconnect callback,
+//  further up, has to mark it stale.)
 static NimBLEClient* btPeer() {
   NimBLEServer* sv = NimBLEDevice::getServer();
-  return (sv && btConn != 0xFFFF) ? sv->getClient(btConn) : nullptr;
+  if (!sv || btConn == 0xFFFF) return nullptr;
+  if (btClStale || !btCl) { btCl = sv->getClient(btConn); btClStale = false; }
+  return btCl;
+}
+
+// NimBLE's task only queues; loop does the work, as for ANCS.
+class RqChrCb : public NimBLECharacteristicCallbacks {
+ public:
+  explicit RqChrCb(uint8_t k) : kind(k) {}
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& ci) override {
+    if (kind == 9) {                     // 7.5: firmware bytes, straight to flash
+      if (!otaOn || otaErr) return;
+      NimBLEAttValue v = c->getValue();
+      size_t n = v.length();
+      if (otaGot + n > otaSize || Update.write((uint8_t*)v.data(), n) != n) { otaErr = true; return; }
+      otaGot += n; otaLastAt = millis();
+      return;
+    }
+    if (kind == 5) {                     // the pointer: no queue, ten a second
+      NimBLEAttValue v = c->getValue();
+      char b[24]; size_t n = v.length() < sizeof(b) - 1 ? v.length() : sizeof(b) - 1;
+      memcpy(b, v.data(), n); b[n] = 0;
+      cursorFeed(b);
+      return;
+    }
+    if (ci.getConnHandle() == btConn) btApp = true;   // the phone runs the app (a companion's writes do not count)
+    uint8_t next = (appHead + 1) % APPQ_N;
+    if (next == appTail) return;       // full: drop, the app will resend
+    AppMsg& m = appQ[appHead];
+    NimBLEAttValue v = c->getValue();
+    size_t n = v.length() < sizeof(m.data) - 1 ? v.length() : sizeof(m.data) - 1;
+    memcpy(m.data, v.data(), n); m.data[n] = 0;
+    m.len = (uint16_t)n; m.kind = kind; m.conn = ci.getConnHandle();
+    appHead = next;
+  }
+  void onRead(NimBLECharacteristic* c, NimBLEConnInfo& ci) override {
+    if (kind == 6) { String j = cfgJson(); c->setValue((const uint8_t*)j.c_str(), j.length()); return; }
+    if (kind == 8) { String j = lstJson(); c->setValue((const uint8_t*)j.c_str(), j.length()); return; }
+    char b[420];
+    long tl = (tmrOn && !tmrDone) ? (long)(tmrEnd - millis()) / 1000 : 0;
+    if (tl < 0) tl = 0;
+    snprintf(b, sizeof(b),
+             "fw=%s;bat=%d;away=%d;timer=%ld;unread=%d;quiet=%d;guard=%d;wake=%d;h12=%d;clock=%d;rxc=%u;rxn=%u;relax=%d;follow=%d;gest=%d;knob=%d;walk=%d;v=%.2f;ls=%d;lon=%lu;ldk=%lu;lls=%lu;ldp=%lu;lwf=%lu;lwk=%lu;lrs=%lu;lst=%lu;lp0=%d;last=%s",
+             FW_VERSION, isnan(battV) ? -1 : battPct(battV), awayOn ? 1 : 0, tl,
+             noteUnread(), cfgQuiet ? 1 : 0, cfgPGuard ? 1 : 0, cfgWakeBy, cfg12h ? 1 : 0,
+             timeOk ? 1 : 0, (unsigned)appRxCmd, (unsigned)appRxNote,
+             relaxOn ? 1 : 0, cfgFollow ? 1 : 0, cfgGesture ? 1 : 0, knobOn ? 1 : 0, walkOn ? 1 : 0,
+             isnan(battV) ? 0.0f : battV, pmMode == 1 ? 1 : 0,
+             (unsigned long)blog.sOn, (unsigned long)blog.sDark, (unsigned long)blog.sLight,
+             (unsigned long)blog.sDeep, (unsigned long)blog.sWifi, (unsigned long)blog.wakes,
+             (unsigned long)blog.restarts, (unsigned long)blog.start, (int)blog.pct0, appLast);
+    c->setValue((const uint8_t*)b, strlen(b));
+  }
+ private:
+  uint8_t kind;
+};
+
+static void rqServiceAdd(NimBLEServer* sv) {
+  NimBLEService* svc = sv->createService(RQ_SVC);
+  const uint32_t WR = NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC;  // not W: RoboEyes owns W
+  svc->createCharacteristic(RQ_CMD,  WR)->setCallbacks(new RqChrCb(1));
+  svc->createCharacteristic(RQ_NOTE, WR)->setCallbacks(new RqChrCb(2));
+  svc->createCharacteristic(RQ_TIME, WR)->setCallbacks(new RqChrCb(3));
+  svc->createCharacteristic(RQ_STAT, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC)
+     ->setCallbacks(new RqChrCb(4));
+  rqEvt = svc->createCharacteristic(RQ_EVT, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::NOTIFY);
+  svc->createCharacteristic(RQ_PTR, NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC)
+     ->setCallbacks(new RqChrCb(5));
+  svc->createCharacteristic(RQ_CFG, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC)
+     ->setCallbacks(new RqChrCb(6));
+  svc->createCharacteristic(RQ_LST, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC)
+     ->setCallbacks(new RqChrCb(8));
+  svc->createCharacteristic(RQ_OTA, NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC)
+     ->setCallbacks(new RqChrCb(9));
+}
+
+// What the app sent, handled on loop.
+static void appTick() {
+  while (appTail != appHead) {
+    AppMsg& m = appQ[appTail];
+    if (m.kind == 1) {                             // a command
+      Serial.printf("app: %s\n", m.data);
+      appRxCmd++;
+      snprintf(appLast, sizeof(appLast), "%.15s", m.data);
+      for (char* q = appLast; *q; q++) if (*q == ';' || *q == '=') *q = ' ';
+      if (!strcmp(m.data, "ping")) { }             // the app saying hello
+      else if (m.data[0] == '!') appBang(m.data, m.conn);   // 7.4: what the apps' HTTP calls did
+      else if (!strncmp(m.data, "iam ", 4)) {      // the app saying who it is
+        int li = linkFind(m.conn);
+        // Every characteristic here needs an encrypted link, so a write
+        // arriving at all is the proof that the link is encrypted.
+        // Waiting for our own authed flag to agree threw the name away
+        // whenever iam arrived first, which on a reconnect to a Mac
+        // that is already bonded is exactly what happens. The Mac was
+        // then never remembered, never appeared in the device list, and
+        // Second had nothing to offer but "any".
+        if (li >= 0 && !links[li].authed) {
+          NimBLEServer* sv = NimBLEDevice::getServer();
+          if (sv) {
+            NimBLEConnInfo ci = sv->getPeerInfoByHandle(m.conn);
+            if (ci.isEncrypted()) {
+              memcpy(links[li].a, ci.getIdAddress().getVal(), 6);
+              links[li].authed = true;
+              devSeen(links[li].a);
+            }
+          }
+        }
+        if (li >= 0 && links[li].authed) devLabel(links[li].a, m.data + 4, false);
+        phoneFix();
+        appRxCmd--;                                 // not a command anyone sent
+      }
+      else rafiqPayload(m.data, true);             // fresh, it was sent just now
+    } else if (m.kind == 2) {                      // a notification
+      appRxNote++;
+      // cat \x1F app \x1F title \x1F text
+      char* f[4] = { m.data, nullptr, nullptr, nullptr };
+      int k = 1;
+      for (char* p = m.data; *p && k < 4; p++) if (*p == 0x1F) { *p = 0; f[k++] = p + 1; }
+      if (k == 4) {
+        Note n = {};
+        n.uid = 0x40000000UL | (++appNoteSeq & 0x3FFFFFFFUL);   // never an ANCS id
+        n.cat = (uint8_t)atoi(f[0]);
+        n.unread = true;
+        n.at = millis();
+        strncpy(n.app,   f[1], sizeof(n.app) - 1);
+        strncpy(n.title, f[2], sizeof(n.title) - 1);
+        strncpy(n.msg,   f[3], sizeof(n.msg) - 1);
+        if (noteAllowed(n)) {
+          addNote(n);
+          if (!cfgQuiet || noteVip(n)) popupShow();
+        }
+      }
+    } else if (m.kind == 3 && m.len >= 8) {        // the time
+      int64_t wall = 0;
+      for (int i = 7; i >= 0; i--) wall = (wall << 8) | (uint8_t)m.data[i];
+      if (wall > 1700000000LL) {
+        struct timeval tv = { .tv_sec = (time_t)wall, .tv_usec = 0 };
+        settimeofday(&tv, nullptr);
+        setenv("TZ", "UTC0", 1); tzset();          // a wall clock, as from an iPhone
+        timeOk = true; clockSrc = "your phone";
+        ctsState = CTS_DONE; ctsSyncedAt = millis();
+        Serial.println("clock: set by the app");
+      }
+    }
+    appTail = (appTail + 1) % APPQ_N;
+  }
 }
 
 static void bleOn() {
@@ -1254,6 +2125,7 @@ static void bleOn() {
   btHid->setReportMap((uint8_t*)HID_MAP, sizeof(HID_MAP));
   btKeys = btHid->getInputReport(1);
   if (!isnan(battV)) btHid->setBatteryLevel(battPct(battV));
+  rqServiceAdd(sv);                    // 7.2: for the Android app, and the Mac app later
   sv->start();                         // starts the services too
 
   // 3 flags + 18 solicitation + 4 appearance + 4 HID = 29 of 31. The
@@ -1270,6 +2142,7 @@ static void bleOn() {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->setAdvertisementData(ad);
   adv->setScanResponseData(sr);
+  advFast();
 
   btUp = true;
   // start() says whether the controller took it. An earlier build
@@ -1283,6 +2156,7 @@ static void bleOn() {
 // bleOn and bleOff, not btStart and btStop: the core already owns
 // those two, for a classic controller the C3 does not have.
 static void bleOff() {
+  btCl = nullptr; btClStale = true;   // deinit deletes it
   if (!btUp) return;
   Serial.println("bluetooth: stopping");
   NimBLEDevice::deinit(true);
@@ -1332,8 +2206,15 @@ WiFiUDP   tapUdp;
 // every ten seconds, which is fine for "are you there" and useless
 // for a press: you would tap and wait. This goes the other way and
 // arrives in the time it takes a packet to cross the room.
+// 7.5: anything the apps should hear: gestures, a task done, a prayer,
+// update progress. Bonded and encrypted, so no token travels with it.
+static void evtSend(const char* what) {
+  if (rqEvt && linkN) { rqEvt->setValue((const uint8_t*)what, strlen(what)); rqEvt->notify(); }
+}
 static void sendTap(const char* what) {
-  if (!cfgGesture || !macLinked || !online() || macAddr == IPAddress()) return;
+  if (!cfgGesture) return;
+  evtSend(what);
+  if (!macLinked || !online() || macAddr == IPAddress()) return;
   // The token goes with it. A packet that moves your pointer and
   // presses your keys is a packet anyone on the network could send,
   // so Rafiq checks both who it came from and that it knew the word.
@@ -1395,16 +2276,6 @@ unsigned long sleptAt = 0;           // when the screen went dark
 
 // ---------------- runtime ----------------
 bool asleep = false, screenOn = true, timeOk = false, rescueAP = false, fsOk = false;
-// The hotspot takes the robot over.
-//
-// It is the screen you go to when something is wrong with the
-// network, and the one thing you need from it is a name and a
-// password you can type into a phone without the robot wandering off
-// a menu or going dark halfway through. So while it is up the panel
-// shows that and nothing else, every gesture is ignored, and it does
-// not sleep. Rebooting is the way out, from the page it just told
-// you how to reach.
-bool apLock = false;
 // The web server is not started at boot when the radio is meant to be
 // down, so whether it has been started is a separate question from
 // whether the board has booted.
@@ -1545,8 +2416,11 @@ static void ancsAsk(uint32_t uid) {
   uint8_t cmd[] = { 0x00,
     (uint8_t)uid, (uint8_t)(uid >> 8), (uint8_t)(uid >> 16), (uint8_t)(uid >> 24),
     0x00,                               // app identifier   )
-    0x01, (uint8_t)(sizeof(((Note*)0)->title) - 2), 0,   //  ) ANCS_ATTRS
-    0x03, (uint8_t)(sizeof(((Note*)0)->msg) - 4), 0 };   //  ) of them
+    0x01, (uint8_t)(sizeof(((Note*)0)->title) - 2), 0,   //  )
+    0x02, (uint8_t)(sizeof(stSub) - 2), 0,                //  ) ANCS_ATTRS
+    0x03, (uint8_t)((sizeof(stMsg) - 4) & 0xFF),          //  ) of them
+          (uint8_t)((sizeof(stMsg) - 4) >> 8),
+    0x05 };                             // the date, for RAFIQ
   dsLen = 0; ancsBusy = true; ancsAskedAt = millis();
   if (!ancsCP->writeValue(cmd, sizeof(cmd), true)) ancsBusy = false;
 }
@@ -1564,7 +2438,13 @@ static void ancsAction(uint32_t uid, uint8_t action) {
 //  Newest first, and never the same one twice: iOS re-announces a
 //  notification when its badge changes, and a list that grew every
 //  time would be nothing but duplicates.
+// The newest one that landed while the robot was asleep, so waking it
+// yourself can show you what you missed rather than Home.
+uint32_t noteSleptOn = 0;
+
 static void addNote(const Note& n) {
+  notesDirty = true;
+  if (asleep) noteSleptOn = n.uid;
   for (int i = 0; i < noteN; i++) {
     if (notes[i].uid == n.uid) { notes[i] = n; notes[i].at = millis(); return; }
   }
@@ -1585,16 +2465,29 @@ static void btTick() {
   if (cfgNet != NET_BT) return;
   uint32_t now = millis();
 
-  if (btWokeReq) { btWokeReq = false; wake("phone"); }
+  // A phone coming back to a robot it already knows is not news, and
+  // lighting the screen for it every time it walks back into range is
+  // a battery spent on nothing. Pairing for the first time still shows.
+  if (btWokeReq) {
+    btWokeReq = false;
+    if (!asleep || NimBLEDevice::getNumBonds() == 0) wake("phone");
+  }
 
   // Handed over whole, so the screen never sees half a notification.
   if (noteReady) {
     noteReady = false;
-    addNote(noteStage);
-    wake("notification");
-    if (popupSecs()) {
-      screen = S_MSG; depth = 0;
-      popupUntil = millis() + popupSecs() * 1000UL;
+    if (rafiqIs(noteStage)) rafiqNote(noteStage);
+    else {
+      // Says RAFIQ but did not come from Shortcuts. Kept as a
+      // notification, with the app it came from, so a Shortcut that is
+      // being refused shows you why instead of doing nothing quietly.
+      if (rafiqTagged(noteStage))
+        snprintf(noteStage.msg, sizeof(noteStage.msg), "Not run, from %s", noteStage.app);
+      // 7.5: switched-off apps never arrive; a VIP shows even when quiet.
+      if (noteAllowed(noteStage)) {
+        addNote(noteStage);
+        if (!cfgQuiet || noteVip(noteStage)) popupShow();
+      }
     }
   }
 
@@ -1611,18 +2504,19 @@ static void btTick() {
 
   // The notification service only appears once you have said yes to
   // the prompt on the phone, so not finding it is not a failure yet.
-  if (ancsState == ANCS_WAIT && now - ancsLastTry > ANCS_SETTLE_MS) {
+  if (ancsState == ANCS_WAIT && !btApp && now - ancsLastTry > ANCS_SETTLE_MS) {
     ancsLastTry = now;
     if (setupAncs()) {
       ancsState = ANCS_READY;
       Serial.println("ancs: ready");
+      { int li = linkFind(btConn); if (li >= 0 && links[li].authed) devLabel(links[li].a, "iPhone", true); }
     } else if (++ancsTries >= ANCS_GIVE_UP) {
       ancsState = ANCS_FAIL;
       Serial.println("ancs: no access; say yes to the prompt on the phone");
     }
   }
 
-  if (ctsState != CTS_DONE && ctsFails < CTS_GIVE_UP &&
+  if (ctsState != CTS_DONE && ctsFails < CTS_GIVE_UP && !btApp &&
       now - ctsAskedAt > CTS_RETRY_MS) {
     ctsAskedAt = now; ctsFails++;
     if (readCts()) { ctsState = CTS_DONE; ctsSyncedAt = now; ctsFails = 0; }
@@ -1688,6 +2582,7 @@ static void startSensors() {
     if (rReg(t[i], A_DEVID) != 0xE5) continue;
     adxl = t[i];
     wReg(adxl, A_DATA_FORMAT, 0x0B);
+    wReg(adxl, 0x2C, 0x1A);            // 7.7: BW_RATE, low power at 100 Hz
     wReg(adxl, A_THRESH_TAP, 0x28); wReg(adxl, A_DUR, 0x10);
     wReg(adxl, A_LATENT, 0x30);     wReg(adxl, A_WINDOW, 0xC0);
     wReg(adxl, A_TAP_AXES, 0x07);
@@ -1822,9 +2717,11 @@ static void at(int x, int y, const char* s, int size = 1) {
 }
 static void clockStr(char* o, size_t n, bool sec) {
   struct tm t;
-  if (!timeOk || !getLocalTime(&t, 0)) { snprintf(o, n, sec ? "--:--:--" : "--:--"); return; }
-  if (sec) snprintf(o, n, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
-  else     snprintf(o, n, "%02d:%02d", t.tm_hour, t.tm_min);
+  if (!timeOk || !nowLocal(&t)) { snprintf(o, n, sec ? "--:--:--" : "--:--"); return; }
+  int h = t.tm_hour;
+  if (cfg12h) { h %= 12; if (!h) h = 12; }
+  if (sec) snprintf(o, n, cfg12h ? "%d:%02d:%02d" : "%02d:%02d:%02d", h, t.tm_min, t.tm_sec);
+  else     snprintf(o, n, cfg12h ? "%d:%02d" : "%02d:%02d", h, t.tm_min);
 }
 
 // The eyes are drawn as plain filled shapes by the library. A pupil and
@@ -1919,7 +2816,8 @@ static void titleBarC(const char* title) {
   oled.setTextColor(SSD1306_WHITE);
 }
 static void bar(const char* title) {
-  if (!timeOk) { titleBar(title, ""); return; }
+  // 7.6: the title and the clock with a gap of one letter, or the title alone
+  if (!timeOk || UI_PAD + (int)strlen(title) * 6 + 6 + 5 * 6 > SCRW - UI_PAD) { titleBar(title, ""); return; }
   char t[8];
   clockStr(t, sizeof(t), false);
   titleBar(title, t);
@@ -2096,15 +2994,21 @@ static Bits fb;                         // what the faces draw from
 static void loadBits() {
   Bits& b = fb;
   struct tm t;
-  fb.ok = timeOk && getLocalTime(&t, 0);
+  fb.ok = timeOk && nowLocal(&t);
   if (!fb.ok) {
     strcpy(fb.hm, "--:--"); strcpy(fb.hh, "--"); strcpy(fb.mm, "--"); strcpy(fb.ss, "--");
     strcpy(fb.day, "waiting"); strcpy(fb.dlong, "for the clock"); strcpy(fb.dshort, "--");
     fb.H = fb.M = fb.sec = 0; fb.mday = 1; fb.yday = 0;
     return;
   }
-  snprintf(fb.hm, sizeof(fb.hm), "%02d:%02d", t.tm_hour, t.tm_min);
-  snprintf(fb.hh, sizeof(fb.hh), "%02d", t.tm_hour);
+  if (cfg12h) {
+    int h12 = t.tm_hour % 12; if (!h12) h12 = 12;
+    snprintf(fb.hm, sizeof(fb.hm), "%d:%02d", h12, t.tm_min);
+    snprintf(fb.hh, sizeof(fb.hh), "%d", h12);
+  } else {
+    snprintf(fb.hm, sizeof(fb.hm), "%02d:%02d", t.tm_hour, t.tm_min);
+    snprintf(fb.hh, sizeof(fb.hh), "%02d", t.tm_hour);
+  }
   snprintf(fb.mm, sizeof(fb.mm), "%02d", t.tm_min);
   snprintf(fb.ss, sizeof(fb.ss), "%02d", t.tm_sec);
   strftime(fb.day,    sizeof(fb.day),    "%A", &t);
@@ -2262,9 +3166,18 @@ static void offlineIcon(int x, int y) {
 // How strong the signal is, nought to four. Anything still connected
 // gets at least one bar: nought means no network at all, which is a
 // different thing from a weak one and should not look the same.
+// WiFi's signal on WiFi; on Bluetooth, the phone link's.
+static bool linkRssi(int& r) {
+  if (online()) { r = (int)WiFi.RSSI(); return true; }
+  if (cfgNet == NET_BT && btUp && btConn != 0xFFFF) {
+    int8_t v = 0;
+    if (ble_gap_conn_rssi(btConn, &v) == 0 && v < 0) { r = v; return true; }
+  }
+  return false;
+}
 static int sigBars() {
-  if (!online()) return 0;
-  int r = (int)WiFi.RSSI();
+  int r;
+  if (!linkRssi(r)) return 0;
   if (r >= -55) return 4;
   if (r >= -65) return 3;
   if (r >= -75) return 2;
@@ -2341,7 +3254,7 @@ static void arc(int cx, int cy, int r, float part) {
 
 static bool hijriNow(int& hy, int& hm, int& hd) {
   struct tm t;
-  if (!timeOk || !getLocalTime(&t, 0)) return false;
+  if (!timeOk || !nowLocal(&t)) return false;
   long jd = gregToJdn(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday) + cfgHijriAdj;
   hijriFromJdn(jd, hy, hm, hd);
   if (hm < 1) hm = 1; if (hm > 12) hm = 12;
@@ -2517,8 +3430,9 @@ static void faceStatus() {
   drawSig(3, 41, sigBars());
 
   char r[12];
-  if (online()) snprintf(r, sizeof(r), "%ddBm", (int)WiFi.RSSI());
-  else          snprintf(r, sizeof(r), "no wifi");
+  { int q;
+    if (linkRssi(q)) snprintf(r, sizeof(r), "%ddBm", q);
+    else             snprintf(r, sizeof(r), cfgNet == NET_BT ? "no phone" : "no wifi"); }
   at(23, 42, r);
 
   // Two pieces pinned to their own ends rather than one centred line:
@@ -2554,8 +3468,9 @@ static void faceVitals() {
   snprintf(l[3], 14, "taps %s",  nt);
   if (isnan(battV)) snprintf(l[4], 14, "batt none");
   else              snprintf(l[4], 14, "batt %d%%", battPct(battV));
-  if (online()) snprintf(l[5], 14, "rssi %d", (int)WiFi.RSSI());
-  else          snprintf(l[5], 14, "offline");
+  { int q;
+    if (linkRssi(q)) snprintf(l[5], 14, "%s %d", online() ? "rssi" : "bt", q);
+    else             snprintf(l[5], 14, "offline"); }
   for (int i = 0; i < 6; i++) at(i % 2 ? 68 : 4, 17 + (i / 2) * 15, l[i]);
 }
 
@@ -2588,8 +3503,10 @@ static void faceTerminal() {
     snprintf(l[2], 24, "net   %.13s", s.c_str());
     snprintf(l[3], 24, "rssi  %d dBm", (int)WiFi.RSSI());
   } else {
-    snprintf(l[2], 24, "net   none");
-    snprintf(l[3], 24, "rssi  --");
+    int q;
+    snprintf(l[2], 24, "net   %s", cfgNet == NET_BT ? "bluetooth" : "none");
+    if (linkRssi(q)) snprintf(l[3], 24, "rssi  %d dBm", q);
+    else             snprintf(l[3], 24, "rssi  --");
   }
   if (isnan(battV)) snprintf(l[4], 24, "batt  no pack");
   else              snprintf(l[4], 24, "batt  %d%% %.2fV", battPct(battV), battV);
@@ -2700,7 +3617,10 @@ static void drawHome() {
   // not know it. This comes before the no-clock screen because off
   // the network with no clock is still the offline home, not a board
   // sitting there waiting for something that is not coming.
-  if (offlineNow()) {
+  // 6.0.1: on Bluetooth the phone gives it the time, and with the
+  // time, home is the watch face, exactly as it was on WiFi. The hello
+  // and pairing screens are only for when there is no clock yet.
+  if (offlineNow() && !(cfgNet == NET_BT && (fb.ok || NimBLEDevice::getNumBonds() > 0))) {
     char hi[34];
     snprintf(hi, sizeof(hi), "%s, %s",
              GREET[(millis() / 11000UL) % GREET_N], cfgName);
@@ -2743,39 +3663,28 @@ static void drawHome() {
   // anyone wanted it. Home stays home, and says what it is waiting for
   // rather than showing an empty clock.
   if (!fb.ok) {
-    ctr("WAITING FOR THE CLOCK", 4, 1);
-    robotHead(SCRW / 2, 37, true);        // 23px of aerial clears the title
+    ctr("CONNECTING", 4, 1);
+    char lk[8];
+    if (lastGoodHM(lk, sizeof(lk))) {
+      // The time we last knew, said plainly and labelled as past, so it
+      // is never mistaken for the time now.
+      ctr(lk, 22, 2);
+      ctr("last known", 42, 1);
+    } else {
+      // Nothing to remember yet, so just plainly alive and waiting.
+      char d[5];
+      int k = (int)((millis() / 400UL) % 4);
+      for (int i = 0; i < k; i++) d[i] = '.';
+      d[k] = 0;
+      ctr(d, 26, 2);
+    }
     // a different line every eight seconds, so it is never a dead panel
     ctr(IDLE_LINES[(millis() / 8000UL) % IDLE_N], 55, 1);
     oled.display();
     return;
   }
 
-  switch (cfgFace) {
-    case F_STACK:    faceStack();       break;
-    case F_DATEUP:    faceDateUp();      break;
-    case F_MINIMAL:    faceMinimal();     break;
-    case F_SIDE:    faceSide();        break;
-    case F_BANNER:    faceBanner();      break;
-    case F_DRIFT:    faceDrift();       break;
-    case F_PARALLAX:    faceParallax();    break;
-    case F_WATER:    faceFill(true);  break;
-    case F_SAND:     faceFill(false); break;
-    case F_DIAL:      faceDial();       break;
-    case F_BAUHAUS:   faceBauhaus();    break;
-    case F_REGULATOR: faceRegulator();  break;
-    case F_RINGS:     faceRings();      break;
-    case F_INFOGRAPH: faceInfograph();  break;
-    case F_STATUS:    faceStatus();     break;
-    case F_VITALS:    faceVitals();     break;
-    case F_BARS:      faceBars();       break;
-    case F_TERMINAL:  faceTerminal();   break;
-    case F_BINARY:    faceBinary();     break;
-    case F_ARABIC:    faceArabic();     break;
-    case F_HIJRI:     faceHijri();      break;
-    case F_CRESCENT:  faceCrescent();   break;
-    default:         faceClassic();     break;
-  }
+  drawFaceOnly();
   // Last, over whichever face just drew itself, or a face that fills
   // the screen would paint straight over it. A single press means
   // something different in here and nothing else would say so.
@@ -2806,12 +3715,24 @@ static void drawWeather() {
   oled.print(l);
   oled.drawCircle(30 + tw + 5, 19, 2, SSD1306_WHITE);
   at(30 + tw + 10, 16, "C");
-  snprintf(l, sizeof(l), "%d%%", (int)roundf(wHum));
-  at(30 + tw + 10, 30, l);
+  if (!isnan(wHum)) {
+    snprintf(l, sizeof(l), "%d%%", (int)roundf(wHum));
+    at(30 + tw + 10, 30, l);
+  }
 
   ctr(wxWord(wCode), 44, 1);
-  snprintf(l, sizeof(l), "%s  %.0f km/h", wCity, wWind);
-  ctr(l, 54, 1);
+  // Off the network it is a report, not a reading, so it says how old.
+  uint32_t tnow = (uint32_t)time(nullptr);
+  char ln[48];
+  if (!online() && wxAt && tnow >= wxAt) {
+    uint32_t age = (tnow - wxAt) / 60;
+    if (age < 60)        snprintf(ln, sizeof(ln), "%.11s  %lum ago", wCity, (unsigned long)age);
+    else if (age < 2880) snprintf(ln, sizeof(ln), "%.11s  %luh ago", wCity, (unsigned long)(age / 60));
+    else                 snprintf(ln, sizeof(ln), "%.11s  %lud ago", wCity,
+                                  (unsigned long)(age / 1440 > 99 ? 99 : age / 1440));
+  } else if (isnan(wWind)) snprintf(ln, sizeof(ln), "%s", wCity);
+  else snprintf(ln, sizeof(ln), "%s  %.0f km/h", wCity, wWind);
+  ctr(ln, 54, 1);
   oled.display();
 }
 
@@ -2822,7 +3743,7 @@ static void fmt12(char* o, size_t n, int mins) {
 }
 static bool isFriday() {
   struct tm t;
-  return timeOk && getLocalTime(&t, 0) && t.tm_wday == 5;
+  return timeOk && nowLocal(&t) && t.tm_wday == 5;
 }
 static int nextPrayer(int nowMin) {
   for (int i = 0; i < 5; i++) if (prayerAt(i) > nowMin) return i;
@@ -2838,7 +3759,7 @@ static void drawPrayer() {
     return;
   }
   struct tm t;
-  int nowMin = (timeOk && getLocalTime(&t, 0)) ? t.tm_hour * 60 + t.tm_min : -1;
+  int nowMin = (timeOk && nowLocal(&t)) ? t.tm_hour * 60 + t.tm_min : -1;
   int nx = nowMin >= 0 ? nextPrayer(nowMin) : -1;
 
   char v[12];
@@ -2909,25 +3830,18 @@ static bool noteIsCall(const Note& n) {
   return n.cat == CAT_CALL || n.cat == CAT_MISSED || n.cat == CAT_VOICE;
 }
 
-static void drawHotspot() {
-  oled.clearDisplay();
-  titleBar("HOTSPOT", "on");
-  ctr(RESCUE_SSID, 16, 1);
-  char pw[26];
-  snprintf(pw, sizeof(pw), "pass  %s", RESCUE_PASS);
-  ctr(pw, 28, 1);
-  String ip = WiFi.softAPIP().toString();
-  ctr(ip.c_str(), 40, 1);
-  ctr("restart from the page", 54, 1);
-  oled.display();
+static const char* noteRow(int i, char* b, size_t n) {
+  if (i >= noteN) { snprintf(b, n, "Clear all"); return b; }
+  const Note& x = notes[i];
+  snprintf(b, n, "%c%s: %s", x.unread ? '*' : ' ', appShort(x),
+           x.title[0] ? x.title : x.msg);
+  return b;
 }
-
 static void drawMessage() {
   oled.clearDisplay();
 
-  // The corner: how many, and nothing else. Reading is a hold away.
   if (depth == 0) {
-    bar("NOTICES");
+    bar("NOTIFICATIONS");
     bellIcon(SCRW / 2, 31, 11);
     char l[26];
     int un = noteUnread();
@@ -2935,60 +3849,54 @@ static void drawMessage() {
     else if (un) snprintf(l, sizeof(l), "%d new of %d", un, noteN);
     else         snprintf(l, sizeof(l), "%d kept", noteN);
     ctr(l, 45, 1);
-    ctr(noteN ? "hold to read"
+    ctr(noteN ? "Hold to open"
               : cfgNet != NET_BT        ? "needs bluetooth"
-              : ancsState == ANCS_READY ? "from your phone"
+              : (ancsState == ANCS_READY || btApp) ? "from your phone"
               : ancsState == ANCS_FAIL  ? "allow it on the phone"
                                         : "linking up", 56, 1);
     oled.display();
     return;
   }
 
-  if (noteConfirm) {
-    bar("NOTICES");
-    ctr("Clear them all?", 26, 1);
-    ctr(noteYes ? "> YES    no" : "  yes  > NO", 44, 1);
-    oled.display();
+  if (depth == 1) {
+    if (noteSel > noteN) noteSel = noteN;
+    char r[12]; snprintf(r, sizeof(r), "%d", noteN);
+    drawList("NOTIFICATIONS", r, noteN + 1, noteSel, noteRow);
     return;
   }
 
-  // Past the last one is the offer, the same way the reminders do it.
-  if (noteIdx >= noteN) {
-    bar("NOTICES");
-    ctr("That is all", 26, 1);
-    ctr("hold to clear them", 44, 1);
-    oled.display();
-    return;
-  }
-
+  // depth 2: one of them, read in full
+  if (!noteN) { depth = 0; return; }
+  if (noteIdx >= noteN) noteIdx = noteN - 1;
   Note& n = notes[noteIdx];
-  // The ribbon: who it is from on the left, when it came on the right.
   char when[8];
   if (timeOk) {
     uint32_t ago = (millis() - n.at) / 1000UL;
     time_t   at  = time(nullptr) - (time_t)ago;
     struct tm* lt = localtime(&at);
-    if (lt) snprintf(when, sizeof(when), "%02d:%02d", lt->tm_hour, lt->tm_min);
-    else    snprintf(when, sizeof(when), "--:--");
+    if (lt) {
+      int h = lt->tm_hour;
+      if (cfg12h) { h %= 12; if (!h) h = 12; }
+      snprintf(when, sizeof(when), cfg12h ? "%d:%02d" : "%02d:%02d", h, lt->tm_min);
+    } else snprintf(when, sizeof(when), "--:--");
   } else {
     snprintf(when, sizeof(when), "--:--");
   }
-  titleBar(appShort(n), when);
-
-  if (noteIsCall(n)) {
-    // A call is a number, and the number is the whole of what you
-    // want to see. No body, nothing to scroll, just who it was.
-    ctr(n.cat == CAT_MISSED ? "Missed call"
-      : n.cat == CAT_VOICE  ? "Voicemail" : "Calling", 20, 1);
-    marquee(n.title[0] ? n.title : "unknown", 34, 1);
-  } else {
-    if (n.title[0]) marquee(n.title, 15, 1);
-    fitText(n.msg[0] ? n.msg : "(no text)", 27, 50, n.at);
+  // 7.4: the text first, then everything that frames it drawn over a
+  // cleared strip. fitText scrolls long text by moving it up past its
+  // top line, and drawn last it ran over the header and the buttons.
+  if (noteIsCall(n)) marquee(n.title[0] ? n.title : "unknown", 30, 1);
+  else               fitText(n.msg[0] ? n.msg : "(no text)", 24, 50, n.at);
+  oled.fillRect(0, 0, SCRW, 23, SSD1306_BLACK);
+  oled.fillRect(0, 51, SCRW, 13, SSD1306_BLACK);
+  noteHeader(n, when);
+  {
+    char app[22]; snprintf(app, sizeof(app), "%s", appShort(n));
+    ctr(app, 14, 1);
   }
-
-  char foot[24];
-  snprintf(foot, sizeof(foot), "%d/%d  hold clears", noteIdx + 1, noteN);
-  ctr(foot, 56, 1);
+  char pos[32];
+  snprintf(pos, sizeof(pos), "tap:%d/%d", noteIdx + 1, noteN);
+  twoButtons(pos, "hold:clear");
   oled.display();
 }
 
@@ -3201,6 +4109,34 @@ static void ringArc(int cx, int cy, int r, float frac) {
 //  settings list left the list showing round the edges and the title
 //  band sliced in half, which looked like a glitch rather than a
 //  thing the robot meant to do.
+static bool holdStripWanted() {
+  return holdShown && touchOn && !sleepArmed && !cfgGesture && !gamePlaying() && !awayOn && !tmrOn;
+}
+// Along the bottom, like C3 Buddy: a bar filling left to right with a
+// mark where Open turns into Back, and on the right what letting go
+// will do, in a solid label.
+static void drawHoldStrip() {
+  uint32_t held = millis() - touchPressAt;
+  uint32_t a = holdMs(), b = holdMaxMs(), m = holdBackMs();
+  float f = (float)(held - a) / (float)(b - a);
+  if (f < 0) f = 0;
+  if (f > 1) f = 1;
+  bool back = held >= m;
+  oled.fillRect(0, 51, SCRW, 13, SSD1306_BLACK);
+  oled.drawFastHLine(0, 51, SCRW, SSD1306_WHITE);
+  oled.drawRoundRect(2, 54, 80, 8, 3, SSD1306_WHITE);
+  int w = (int)(76 * f);
+  if (w > 1) oled.fillRoundRect(4, 56, w, 4, 1, SSD1306_WHITE);
+  int tick = 4 + (int)(76.0f * (float)(m - a) / (float)(b - a));
+  oled.drawFastVLine(tick, 52, 2, SSD1306_WHITE);
+  oled.fillRoundRect(86, 53, 40, 10, 3, SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_BLACK);
+  const char* lab = back ? "BACK" : "OPEN";
+  oled.setCursor(86 + (40 - (int)strlen(lab) * 6) / 2, 54);
+  oled.print(lab);
+  oled.setTextColor(SSD1306_WHITE);
+}
 static void drawHoldTier(uint32_t now) {
   uint32_t gone = now - sleepArmed;
   if (gone > TOUCH_COUNT_MS) gone = TOUCH_COUNT_MS;
@@ -3625,6 +4561,11 @@ static void drawSystem() {
   vals[0] = v;
   if (online())      snprintf(v, sizeof(v), "%d dBm", (int)WiFi.RSSI());
   else if (rescueAP) snprintf(v, sizeof(v), "hotspot");
+  else if (cfgNet == NET_BT) {
+    int q;
+    if (linkRssi(q)) snprintf(v, sizeof(v), "bt %d dBm", q);
+    else             snprintf(v, sizeof(v), "bt %s", btShort());
+  }
   else               snprintf(v, sizeof(v), "offline");
   vals[1] = v;
   snprintf(v, sizeof(v), "%u kB", (unsigned)(ESP.getFreeHeap() / 1024));
@@ -3674,9 +4615,9 @@ static void drawSystem() {
 // settings, or DONE on a list, threw you onto the focus screen and left
 // you there. A word about what just happened should never move you.
 static void drawFlash() {
+  // 6.4: white words on black. Full white screens are kept for the
+  // things that must be noticed: the call to prayer, the guard, find.
   oled.clearDisplay();
-  oled.fillRect(0, 0, SCRW, SCRH, SSD1306_WHITE);
-  oled.setTextColor(SSD1306_BLACK);
   int n = strlen(flashWord);
   int size = n * 12 <= SCRW - 8 ? 2 : 1;
   ctr(flashWord, size == 2 ? 20 : 26, size);
@@ -4019,6 +4960,9 @@ static void drawToast() {
   if (toastKind == "break")  head = "TAKE A BREAK";
   if (toastKind == "remind") head = "REMINDER";
   if (toastKind == "note")   head = "REMINDERS";
+  if (toastKind == "rafiq")  head = "RAFIQ";
+  if (toastKind == "syncfail") head = "SYNC FAILED";
+  if (toastKind == "hotspot") head = "HOTSPOT";
   bar(head);
 
   bool loud = (toastKind == "remind" || toastKind == "break");
@@ -4237,18 +5181,82 @@ static void drawTapSet() {
   oled.display();
 }
 
+// Whichever face is chosen, drawn and nothing else. Shared so the
+// picker shows the real thing rather than a second copy of this list
+// that could drift out of step with it.
+static void drawFaceOnly() {
+  switch (cfgFace) {
+    case F_STACK:    faceStack();       break;
+    case F_DATEUP:    faceDateUp();      break;
+    case F_MINIMAL:    faceMinimal();     break;
+    case F_SIDE:    faceSide();        break;
+    case F_BANNER:    faceBanner();      break;
+    case F_DRIFT:    faceDrift();       break;
+    case F_PARALLAX:    faceParallax();    break;
+    case F_WATER:    faceFill(true);  break;
+    case F_SAND:     faceFill(false); break;
+    case F_DIAL:      faceDial();       break;
+    case F_BAUHAUS:   faceBauhaus();    break;
+    case F_REGULATOR: faceRegulator();  break;
+    case F_RINGS:     faceRings();      break;
+    case F_INFOGRAPH: faceInfograph();  break;
+    case F_STATUS:    faceStatus();     break;
+    case F_VITALS:    faceVitals();     break;
+    case F_BARS:      faceBars();       break;
+    case F_TERMINAL:  faceTerminal();   break;
+    case F_BINARY:    faceBinary();     break;
+    case F_ARABIC:    faceArabic();     break;
+    case F_HIJRI:     faceHijri();      break;
+    case F_CRESCENT:  faceCrescent();   break;
+    default:         faceClassic();     break;
+  }
+}
+
+// Choosing a watch face by looking at it.
+//
+// There are twenty three, and the setting used to cycle them one name
+// at a time from the settings list, so finding the one you wanted
+// meant pressing a row twenty times and reading words. Hold the row
+// and the face itself is on the screen: tap for the next, hold to keep
+// it, anything else puts back the one you came in with.
+int facePickFrom = -1;
+uint32_t facePickAt = 0;
+static void drawFacePick() {
+  drawFaceOnly();
+  // A strip along the bottom, cleared first, because a face may well
+  // have drawn into it.
+  oled.fillRect(0, 52, SCRW, SCRH - 52, SSD1306_BLACK);
+  oled.drawFastHLine(0, 51, SCRW, SSD1306_WHITE);
+  // The strip is 21 characters wide and the two halves have to share
+  // it. The name alone can be twelve, and "hold:keep" is nine, so they
+  // take turns on the left: the hint while you have just arrived, the
+  // name once you are looking. The count keeps the right, always.
+  char l[26];
+  if (millis() - facePickAt < 3000UL) snprintf(l, sizeof(l), "hold:keep");
+  else                                snprintf(l, sizeof(l), "%.12s", FACE_NAME[cfgFace]);
+  at(UI_PAD, 54, l);
+  char r[8];
+  snprintf(r, sizeof(r), "%d/%d", cfgFace + 1, FACE_N);
+  at(SCRW - UI_PAD - (int)strlen(r) * 6, 54, r);
+  oled.display();
+}
+
 static void drawSettings() {
   oled.clearDisplay();
-  if (depth == 0) {
-    bar("SETTINGS");
-    gearIcon(SCRW / 2, 32, 11);
-    ctr("Hold to open", 52, 1);
-    oled.display();
+  if (depth == 0) {                      // 7.6: the same card as every hub
+    char l1[20], l2[20];
+    if (!isnan(battV)) snprintf(l1, sizeof(l1), "Battery %d%%", battPct(battV));
+    else               snprintf(l1, sizeof(l1), "No battery");
+    snprintf(l2, sizeof(l2), "%s", linkN ? (linkN > 1 ? "2 linked" : "Linked") : "Not linked");
+    uiHubCard("SETTINGS", IC_SLIDE, l1, l2);
     return;
   }
+  if (depth == 2 && itemIdx == C_FACE)  { drawFacePick(); return; }
   if (depth == 2 && itemIdx == C_ABOUT) { drawAbout(); return; }
   if (depth == 2 && itemIdx == C_ACCEL) { drawAccel(); return; }
   if (depth == 2 && itemIdx == C_PAIR)  { drawPair();  return; }
+  if (depth == 2 && itemIdx == C_TLOG)  { drawTlog();  return; }
+  if (depth == 2 && itemIdx == C_BVIEW) { drawBattUse(); return; }   // 7.8
   if (depth == 2 && itemIdx == C_RESET) {
     oled.clearDisplay();
     bar("RESET SETTINGS");
@@ -4265,27 +5273,28 @@ static void drawSettings() {
     if (tapChosen)  { drawTapTest(); return; }
     drawTapTry(); return;
   }
-  // The four groups. They all fit on one screen, which is the point.
+  // The groups. Four fit on the screen; the list moves to keep the
+  // chosen one in view.
   if (depth == 1 && setGrp < 0) {
+    static const uint8_t* const ic[SG_COUNT] = { IC_SUN, IC_HAND, IC_BT, IC_SHIELD, IC_BATT, IC_CHIP };
     bar("SETTINGS");
-    for (int g = 0; g < SG_COUNT; g++) {
-      int y = 14 + g * 12;
-      bool on = (g == grpSel);
-      if (on) { oled.fillRect(0, y - 2, SCRW, 12, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
-      else      oled.setTextColor(SSD1306_WHITE);
-      at(3, y, SG_NAME[g]);
-      char n[4];
-      snprintf(n, sizeof(n), "%d", sgLen(g));
-      at(SCRW - 3 - (int)strlen(n) * 6, y, n);
+    int first = uiFirst(grpSel, SG_COUNT);
+    for (int r = 0; r < UI_ROWS && first + r < SG_COUNT; r++) {
+      int g = first + r;
+      uiRow(r, ic[g], SG_NAME[g], "", g == grpSel, SG_COUNT > UI_ROWS);   // names only: they need the room
     }
-    oled.setTextColor(SSD1306_WHITE);
+    uiScroll(first, SG_COUNT);
     oled.display();
     return;
   }
 
   const int grp = setGrp < 0 ? SG_DISPLAY : setGrp;
   const int rows = sgLen(grp);
-  bar(depth == 2 ? "CHANGE" : SG_NAME[grp]);
+  {
+    char up[22]; snprintf(up, sizeof(up), "%s", depth == 2 ? "CHANGE" : SG_NAME[grp]);
+    for (char* q = up; *q; q++) *q = toupper((unsigned char)*q);
+    bar(up);
+  }
 
   char v[18];
   int here = sgPos(grp, itemIdx);
@@ -4295,9 +5304,10 @@ static void drawSettings() {
   for (int r = 0; r < 4 && first + r < rows; r++) {
     int i = SG_ROWS[grp][first + r], y = 14 + r * 12;
     bool on = (i == itemIdx);
-    if (on) { oled.fillRect(0, y - 2, SCRW, 12, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
+    const int sc = rows > UI_ROWS ? 5 : 0;          // 7.6: room for the scrollbar
+    if (on) { oled.fillRoundRect(1, y - 2, SCRW - 2 - (sc ? 3 : 0), UI_ROW_H, 2, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
     else      oled.setTextColor(SSD1306_WHITE);
-    at(3, y, C_NAME[i]);
+    at(UI_PAD + 1, y, C_NAME[i]);
     switch (i) {
       case C_BRIGHT: { int k = 0;
                        for (int j = 0; j < BRIGHT_N; j++) if (BRIGHT_OPTS[j] == cfgBright) k = j;
@@ -4310,7 +5320,26 @@ static void drawSettings() {
       case C_MODE:   snprintf(v, sizeof(v), "%s",
                               cfgNet == NET_OFF ? "off" :
                               cfgNet == NET_BT  ? btShort() :
-                              (netDown ? "no signal" : "wifi")); break;
+                              rescueAP ? "hotspot" :
+                              wsKind == WS_SYNC ? "syncing" :
+                              (netDown ? "no signal" : "wifi now")); break;
+      case C_GUARD:  snprintf(v, sizeof(v), "%s", cfgPGuard ? "on" : "off"); break;
+      case C_TAMPER: snprintf(v, sizeof(v), "hold"); break;
+      case C_TLOG:   snprintf(v, sizeof(v), "hold"); break;
+      case C_HOLD:   snprintf(v, sizeof(v), "%u.%u s", HOLD_OPTS[cfgHoldIdx] / 1000, (HOLD_OPTS[cfgHoldIdx] % 1000) / 100); break;
+      case C_CLOCK:  snprintf(v, sizeof(v), "%s", cfg12h ? "12 hour" : "24 hour"); break;
+      case C_WAKEBY: snprintf(v, sizeof(v), "%s", WAKEBY_NAME[cfgWakeBy]); break;
+      case C_MULTI:  if (cfgMulti) snprintf(v, sizeof(v), "on, %d in", linkN);
+                     else          snprintf(v, sizeof(v), "off"); break;
+      case C_DEV1:   snprintf(v, sizeof(v), "%.12s", prefName(0)); break;
+      case C_DEV2:   snprintf(v, sizeof(v), "%.12s", prefName(1)); break;
+      case C_AUTOAWAY: snprintf(v, sizeof(v), "%s", cfgAutoAway ? "on" : "off"); break;
+      case C_NIGHT:  snprintf(v, sizeof(v), "%s", cfgNight ? "on" : "off"); break;
+      case C_BLOG:   snprintf(v, sizeof(v), "%s", cfgBlog ? "on" : "off"); break;
+      case C_PLOCK:  snprintf(v, sizeof(v), "%s", PLOCK_NAME[constrain(cfgPLock, 0, 3)]); break;
+      case C_BVIEW:  snprintf(v, sizeof(v), "%s", cfgBlog ? "hold" : "off"); break;
+      case C_BRESET: snprintf(v, sizeof(v), "%.2f V", BLOG_V[constrain(cfgBlogV, 0, 3)]); break;
+      case C_BED:    snprintf(v, sizeof(v), "%02d:%02d", cfgBed / 60, cfgBed % 60); break;
       case C_BIKE:   snprintf(v, sizeof(v), "%s", cfgBike ? "on" : "off"); break;
       case C_SHAKE:  snprintf(v, sizeof(v), "%s",
                               (cfgBack == BACK_KNOCK && !cfgKnock)
@@ -4333,16 +5362,24 @@ static void drawSettings() {
                      else snprintf(v, sizeof(v), "%ds", popupSecs()); break;
       case C_EYES:   snprintf(v, sizeof(v), "%s", STYLES[cfgEyes].name); break;
       case C_HOTSPOT:snprintf(v, sizeof(v), "%s", rescueAP ? "on" : "hold"); break;
-      case C_UPDATE: snprintf(v, sizeof(v), "%s", online() ? "hold" : "offline"); break;
+      case C_UPDATE: snprintf(v, sizeof(v), "%s", rescueAP ? "hotspot on" : "from a file"); break;
       // Everything left is something you open rather than something
       // with a value. "x2" meant knock twice, from when knocking was
       // the only way in; holding is how you open anything now.
       default:       snprintf(v, sizeof(v), "hold"); break;
     }
-    oled.setCursor(SCRW - 3 - (int)strlen(v) * 6, y);
-    oled.print(v);
+    // 7.6: never into the label, never under the scrollbar
+    {
+      const int sc = rows > UI_ROWS ? 5 : 0;
+      int room = (SCRW - UI_PAD - sc - (UI_PAD + 1) - ((int)strlen(C_NAME[i]) + 1) * 6) / 6;
+      if (room < 0) room = 0;
+      if ((int)strlen(v) > room) v[room] = 0;
+      oled.setCursor(SCRW - UI_PAD - sc - (int)strlen(v) * 6, y);
+      oled.print(v);
+    }
   }
   oled.setTextColor(SSD1306_WHITE);
+  uiScroll(first, rows);
   oled.display();
 }
 
@@ -5975,6 +7012,7 @@ static void fetchWeather() {
   wWind = curNum(b, "wind_speed_10m", NAN);
   wCode = (int)curNum(b, "weather_code", -1);
   wxOk  = !isnan(wTemp);
+  if (wxOk) { wxAt = (uint32_t)time(nullptr); wxDirty = true; }   // kept by loop()
 }
 
 static int parseHHMM(const char* s) {
@@ -6026,7 +7064,7 @@ static void loadAdj() {
 
 static void fetchPrayer() {
   struct tm t;
-  if (!timeOk || !getLocalTime(&t, 0)) return;
+  if (!timeOk || !nowLocal(&t)) return;
   if (!locate()) return;
 
   char d[16];
@@ -6751,9 +7789,10 @@ static void screenPower(bool on) {
   screenOn = on;
   oled.ssd1306_command(on ? SSD1306_DISPLAYON : SSD1306_DISPLAYOFF);
 }
+extern bool macDim;
 static void applyBright() {
   oled.ssd1306_command(SSD1306_SETCONTRAST);
-  oled.ssd1306_command(cfgBright);
+  oled.ssd1306_command(macDim ? min(cfgBright, 8) : cfgBright);   // 7.5: low while you type
 }
 static void applyEyes(int i) {
   cfgEyes = (i + STYLE_N) % STYLE_N;
@@ -6765,6 +7804,7 @@ static void applyEyes(int i) {
 }
 static void goSleep() {
   if (asleep) return;
+  if (awayOn) { awayEyes(false); goSleepQuick(); return; }  // Away: eyes close quickly, then dark
   asleep = true;
   applyEyes(cfgEyes);
   eyes.setIdleMode(OFF); eyes.setAutoblinker(OFF);
@@ -6784,8 +7824,9 @@ static void goSleep() {
 // from deep or there is no Mac to keep hold of, otherwise the screen
 // goes dark again and the Mac keeps its connection.
 static void backToSleep() {
-  if (wokeForAlarm || !macLinked) { wokeForAlarm = false; wantDeep = true; }
-  else                            goSleep();
+  // A linked phone is somebody listening too, as the Mac is.
+  if ((wokeForAlarm || !macLinked) && !phoneHeld()) { wokeForAlarm = false; wantDeep = true; }
+  else                                              { wokeForAlarm = false; goSleep(); }
 }
 
 // How long until the next prayer wants saying something about, so a
@@ -6855,7 +7896,7 @@ static long secsToNextRem() {
 
 static long secsToNextAlert() {
   struct tm t;
-  if (!prayerOk || !timeOk || !getLocalTime(&t, 0)) return -1;
+  if (!prayerOk || !timeOk || !nowLocal(&t)) return -1;
   int nowMin = t.tm_hour * 60 + t.tm_min;
   long best = -1;
   for (int i = 0; i < 5; i++) {
@@ -6892,7 +7933,9 @@ static void resetSettings() {
   cfgAutoUp = false; prefs.putBool("autoup", cfgAutoUp);
   cfgKnock = false;  prefs.putBool("knock", cfgKnock);
   cfgHijriAdj = 0;   prefs.putInt("hadj", cfgHijriAdj);
-  cfgNet = NET_WIFI; prefs.putInt("net", cfgNet);
+  cfgNetHome = NET_BT; prefs.putInt("net", cfgNetHome);
+  cfgPGuard = false; prefs.putBool("guard", cfgPGuard);
+  cfgQuiet = false;  prefs.putBool("quiet", cfgQuiet);
   cfgWakeIdx = 2;    prefs.putInt("wakeh", cfgWakeIdx);
   cfgBike = false;   prefs.putBool("bike", cfgBike);
   cfgBikeTpl = 0;    prefs.putInt("btpl", cfgBikeTpl);
@@ -6951,6 +7994,8 @@ static void sleepCard() {
 #define SLEEP_RELEASE_MS 20000UL     // long enough for a hand, not for a bag
 #define SLEEP_RETRY_S    60          // and then look again this often
 static void sleepNow(long secs) {
+  rtcDeepAt = (uint32_t)time(nullptr);   // 7.8: the deep sleep is counted on waking
+  blogSave();
   // Lying down deliberately is not a crash, and a deep wake is a
   // boot, so without this a robot that sleeps often in Bluetooth mode
   // would count its way to the fallback having never once failed.
@@ -7060,6 +8105,7 @@ static void wakeGate() {
 }
 
 static void goDeep() {
+  if (notesDirty) saveNotes();         // the list survives the sleep
   // The pad can wake it now, so this no longer needs INT1 soldered.
   // Until this version deep sleep simply never happened on a board
   // without that wire, which is every board this has ever run on.
@@ -7074,8 +8120,10 @@ static void goDeep() {
   // those cost a wake, a WiFi reconnect and a slice of the battery for
   // nothing. Waking should be something you did on purpose.
   if (deepOff) return;
-  Serial.println("switching off until touched");
-  sleepCard();
+  awayFlush(true);
+  bool checking = deepAuto && cfgNet == NET_BT && NimBLEDevice::getNumBonds() > 0;
+  Serial.println(checking ? "switching off, checking for the phone" : "switching off until touched");
+  if (!checking) { sleepCard(); rtcAwaySince = 0; }
 
   screenPower(false);
 
@@ -7094,6 +8142,18 @@ static void goDeep() {
   if (pray > 0 && rem > 0) secs = pray < rem ? pray : rem;
   else if (pray > 0)       secs = pray;
   else if (rem > 0)        secs = rem;
+  rtcWakeCheck = 0;
+  if (checking) {
+    uint32_t tnow = (uint32_t)time(nullptr);
+    if (!rtcAwaySince) rtcAwaySince = tnow;
+    long chk = (tnow - rtcAwaySince < 3600) ? 180 : 300;   // 3 min for an hour, then 5
+    if (secs <= 0 || chk < secs) { secs = chk; rtcWakeCheck = 1; }
+  }
+  if (nightDeep) {                        // 7.7: night sleep ends just before Fajr
+    long ne = secsToNightEnd();
+    if (ne > 0 && (secs <= 0 || ne < secs)) secs = ne;
+    nightDeep = false;
+  }
   rtcAlarmAt = (secs > 0 && timeOk) ? (uint32_t)time(nullptr) + (uint32_t)secs : 0;
   if (secs > 0)
     Serial.printf("next wake in %ld s (%s)\n", secs,
@@ -7106,11 +8166,12 @@ static void goDeep() {
 }
 
 static void wake(const char* why) {
+  if (asleep && blog.magic == BLOG_MAGIC) blog.wakes++;      // 7.8
   lastActive = millis();
   wokeBy = why;
   if (!asleep) return;
   asleep = false;
-  setCpuFrequencyMhz(160);
+  if (pmAvail) pmSet(false); else setCpuFrequencyMhz(160);
   screenPower(true);
   eyes.setAutoblinker(ON, 7, 5); eyes.setIdleMode(ON, 5, 4);
   applyEyes(cfgEyes); eyes.open();
@@ -7118,8 +8179,18 @@ static void wake(const char* why) {
   // sensor on a desk, and three hundred milliseconds of animation
   // between your knock and your Mac is three hundred milliseconds
   // of nothing useful.
-  if (!cfgGesture)
-    for (int i = 0; i < 18; i++) { eyesFrame(); delay(16); }
+  // 6.1: a short opening for a touch, none for a notification or a
+  // card, so news is on the screen the moment it arrives.
+  // Lifted or shaken, it is a look at the time and no more: the face
+  // at once, and dark again shortly after unless the pad is touched.
+  bool glance = !strcmp(why, "shake") || !strcmp(why, "picked up") || !strcmp(why, "moved");
+  bool news = glance || !strcmp(why, "notification") || !strcmp(why, "shortcut") || !strcmp(why, "guard") ||
+              !strcmp(why, "timer") ||
+              !strcmp(why, "update") || !strcmp(why, "sync") || !strcmp(why, "message");
+  glanceUntil = (glance && !awayOn) ? millis() + GLANCE_MS : 0;
+  if (!cfgGesture && !news && !awayOn)
+    for (int i = 0; i < 8; i++) { eyesFrame(); delay(16); }
+  if (awayOn) { awayEyes(true); lastActive = millis(); lastDraw = 0; }   // eyes open, then the message
   screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
   navLatch = true;                     // the lean that woke it is not also a command
   upSince = 0; upConsumed = false;
@@ -7134,8 +8205,9 @@ static void wake(const char* why) {
 //  and starts to flash, and on the minute itself it flashes for a
 //  minute and then leaves you alone. Each step fires once a day.
 static void servicePrayerAlert() {
+  if (awayOn) return;                  // away: nothing comes up
   struct tm t;
-  if (!prayerOk || !timeOk || !getLocalTime(&t, 0)) return;
+  if (!prayerOk || !timeOk || !nowLocal(&t)) return;
 
   if (alertDay != t.tm_yday) {                 // a new day, a clean slate
     alertDay = t.tm_yday;
@@ -7161,6 +8233,7 @@ static void servicePrayerAlert() {
     alertPhase = (d == 10) ? AL_TEN : (d == 5) ? AL_FIVE : AL_NOW;
     alertUntil = millis() + (d == 10 ? ALERT_TEN_MS : d == 5 ? ALERT_FIVE_MS : ALERT_NOW_MS);
     wake("prayer");
+    if (d == 0) { char b[24]; snprintf(b, sizeof(b), "pray %s", PRAYERS[i]); evtSend(b); }   // 7.5: the Mac pauses
     Serial.printf("prayer alert: %s in %d min\n", PRAYERS[i], d);
     return;
   }
@@ -7197,88 +8270,9 @@ static void sawMac() {
     wake("mac");
   }
 }
-// ================================================================
-//  FIRMWARE FROM THE BROWSER
-//
-//  The release path needs the internet. This one needs nothing but
-//  this page, which is the whole point of it: on the hotspot, with no
-//  network and no cable, a .bin from your phone is the only way in.
-//
-//  Two callbacks. The second runs while the bytes are arriving and
-//  the first runs once they have all landed, so the authorisation has
-//  to be checked in the SECOND one. Checking it in the first would
-//  mean the whole image had already been written into the spare slot
-//  before anyone asked who sent it.
-// ================================================================
-bool   upLocal = false;              // a browser upload is in progress
-size_t upGot = 0, upWant = 0;
-String upErr = "";
-
-static void localUploadChunk() {
-  HTTPUpload& u = web.upload();
-
-  if (u.status == UPLOAD_FILE_START) {
-    upLocal = false; upGot = 0; upWant = 0; upErr = "";
-    if (!authed()) { upErr = "Pair first"; return; }
-    const esp_partition_t* slot = esp_ota_get_next_update_partition(NULL);
-    if (!slot) { upErr = "No OTA slot"; return; }
-    upWant = (size_t)web.header("X-Rafiq-Size").toInt();
-    if (upWant && upWant > slot->size) {
-      char d[40];
-      snprintf(d, sizeof(d), "Too big: %uk into %uk",
-               (unsigned)(upWant / 1024), (unsigned)(slot->size / 1024));
-      upErr = d;
-      return;
-    }
-    if (!Update.begin(upWant ? upWant : UPDATE_SIZE_UNKNOWN)) {
-      upErr = "Will not start"; return;
-    }
-    upLocal = true;
-    otaStatus = "From the page"; otaStatus2 = ""; otaPct = 0;
-    if (asleep) wake("upload");
-    drawOta();
-    return;
-  }
-
-  if (u.status == UPLOAD_FILE_WRITE) {
-    if (!upLocal) return;
-    // Every ESP32 application image starts 0xE9. Anything else is not
-    // firmware, and writing it would hand the bootloader a slot full
-    // of something it cannot run, on a robot with no cable in it.
-    if (upGot == 0 && (u.currentSize < 1 || u.buf[0] != 0xE9)) {
-      upErr = "Not a firmware file"; Update.abort(); upLocal = false; return;
-    }
-    if (Update.write(u.buf, u.currentSize) != u.currentSize) {
-      upErr = "Write failed"; Update.abort(); upLocal = false; return;
-    }
-    upGot += u.currentSize;
-    if (upWant) {
-      int p = (int)((upGot * 100) / upWant);
-      p = constrain(p, 0, 99);
-      if (p != otaPct) { otaPct = p; drawOta(); }
-    }
-    return;
-  }
-
-  if (u.status == UPLOAD_FILE_END) {
-    if (!upLocal) return;
-    upLocal = false;
-    // end(true) is what checks the image is whole and sets the slot
-    // to boot from. A truncated upload fails here rather than on the
-    // next boot, which is the only place it is any use.
-    if (!Update.end(true)) upErr = "Install failed";
-    return;
-  }
-
-  if (u.status == UPLOAD_FILE_ABORTED) {
-    if (upLocal) Update.abort();
-    upLocal = false;
-    if (!upErr.length()) upErr = "Cancelled";
-  }
-}
-
 static bool guard() {
   if (!authed()) { web.send(401, "application/json", "{\"ok\":false,\"err\":\"pair first\"}"); return false; }
+  wsTouch();                           // somebody is using the WiFi
   sawMac();
   return true;
 }
@@ -7345,21 +8339,23 @@ static void focusBegin(int mins) {
 
 // The pointer arrives over UDP, ten or so a second, as two numbers in
 // thousandths. Nothing is acknowledged and nothing is retried.
-static void serviceCursor() {
+// "x y", each -1000..1000. From UDP on WiFi, or Bluetooth (7.4).
+static void cursorFeed(const char* b) {
   if (!cfgFollow) return;
+  int x = 0, y = 0;
+  if (sscanf(b, "%d %d", &x, &y) == 2) {
+    curX = constrain(x / 1000.0f, -1.0f, 1.0f);
+    curY = constrain(y / 1000.0f, -1.0f, 1.0f);
+    curUntil = millis() + CURSOR_HOLD_MS;
+  }
+}
+static void serviceCursor() {
+  if (!cfgFollow || !online()) return;
   int n = cursorUdp.parsePacket();
   while (n > 0) {
     char b[32];
     int got = cursorUdp.read(b, sizeof(b) - 1);
-    if (got > 0) {
-      b[got] = 0;
-      int x = 0, y = 0;
-      if (sscanf(b, "%d %d", &x, &y) == 2) {
-        curX = constrain(x / 1000.0f, -1.0f, 1.0f);
-        curY = constrain(y / 1000.0f, -1.0f, 1.0f);
-        curUntil = millis() + CURSOR_HOLD_MS;
-      }
-    }
+    if (got > 0) { b[got] = 0; cursorFeed(b); }
     n = cursorUdp.parsePacket();
   }
 }
@@ -7408,34 +8404,40 @@ static void zikrTick() {
 
 static void startHotspot() {
   if (rescueAP) return;
-  // Asking for the hotspot is asking for the radio, so it says so and
-  // turns the mode back rather than quietly contradicting a setting
-  // you chose. There is no third state where the radio is both off and
-  // serving an access point.
-  if (cfgOffline) {
-    bleOff();                      // the aerial cannot serve both
-    cfgNet = NET_WIFI;
-    prefs.putInt("net", cfgNet);
-    netDown = false; netMisses = 0; netNextTry = 0;
-    flash("NETWORK BACK ON", 1100);
-  }
+  // On Bluetooth the hotspot is a session of its own: the radio comes
+  // up for it, and goes back to Bluetooth ten minutes after the last
+  // phone leaves. Nothing is written to flash, so a restart is home.
+  if (cfgNet != NET_WIFI && !wsStart(WS_HOTSPOT)) return;
   WiFi.mode(online() ? WIFI_AP_STA : WIFI_AP);
   WiFi.softAP(RESCUE_SSID, RESCUE_PASS);
   rescueAP = true;
-  apLock   = true;
-  screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
-  sleepArmed = 0; wantDeep = false;
-  if (asleep) wake("hotspot");
+  wsLastUse = millis();
   Serial.printf("hotspot up: %s at %s\n", RESCUE_SSID, WiFi.softAPIP().toString().c_str());
+  // Say how to use it, on the screen, because there is nowhere else
+  // to read it from.
+  toastKind = "hotspot";
+  // Two lines of 21 is all this card shows: the network and its
+  // password, then where to go.
+  toastText = String(RESCUE_SSID) + " " + RESCUE_PASS + "\n192.168.4.1 > Update";
+  toastUntil = millis() + 120000; toastFlash = millis(); remShowing = -1;
+  wake("hotspot");
 }
 
 static void knockOne() {
-  if (apLock) return;
   cTap++;
+  if (awayOn) { lastActive = millis(); return; }   // away: nothing but the message
+  if (tmrOn && !awayOn) { lastActive = millis(); return; }   // timer: nothing else
+  // The new cards from 6.0 take a press before anything else: it
+  // cancels a countdown, quiets the guard, stops the finder.
+  if (tamperCountAt) { tamperCountAt = 0; flash("NOT ARMED", 1200); return; }
+  if (pgUntil)       { pgUntil = 0; return; }
+  if (walkUntil)     { walkUntil = 0; return; }     // 7.5: Mac left behind, seen
+  if (findUntil)     { findUntil = 0; return; }
+  if (popOn)         { popupClose(false); return; }
   // Anything the Mac put on the screen goes away on one knock. It is
   // the Mac's idea of what you want to see, and this is the desk.
   if (dndUntil)    { dndUntil = 0;      return; }
-  if (relaxOn)     { relaxOn = false;    return; }
+  if (relaxOn)     { relaxOn = false; relaxUntil = 0; return; }
   if (canvasUntil) { canvasUntil = 0;    return; }
   if (toastUntil)  {
     // Waved away. That is "not now" rather than "done", so it comes
@@ -7454,6 +8456,17 @@ static void knockOne() {
     remShowing = -1; remWokeIt = false;
     toastUntil = 0; toastText = ""; toastKind = "";
     if (back) backToSleep();
+    return;
+  }
+  // 7.6: in a hub's menu a tap moves the choice; inside an item, it
+  // goes on to the next item of the same hub.
+  if (isHub(screen)) {
+    if (depth == 1) { int n = hubCount(screen); if (n) hubSel = (hubSel + 1) % n; return; }
+    screen = nextScreen(screen); return;
+  }
+  if (inHub >= 0 && depth == 0 && screen != S_SETTINGS) {
+    int n = hubCount(inHub);
+    if (n) hubEnter(inHub, (hubSel + 1) % n);
     return;
   }
   if (depth == 0) {
@@ -7510,8 +8523,8 @@ static void knockOne() {
                        for (int k = 0; k < BRIGHT_N; k++) if (BRIGHT_OPTS[k] == cfgBright) i = k;
                        cfgBright = BRIGHT_OPTS[(i + 1) % BRIGHT_N];
                        applyBright(); prefs.putInt("bri", cfgBright); break; }
-      case C_FACE:   cfgFace = (cfgFace + 1) % FACE_N;
-                     prefs.putInt("face", cfgFace); break;
+      case C_FACE:   // Into the picker, where you can see them.
+                     facePickFrom = cfgFace; facePickAt = millis(); depth = 2; break;
       case C_SLEEP:  cfgSleepIdx = (cfgSleepIdx + 1) % SLEEP_N;
                      prefs.putInt("slpi", cfgSleepIdx); break;
       case C_TURN:   cfgAutoTurn = !cfgAutoTurn;
@@ -7524,9 +8537,20 @@ static void knockOne() {
   }
 }
 
+static void knockTwoInner();
 static void knockTwo() {
-  if (apLock) return;
+  // 7.6: a hub opens to its menu, and the menu opens the chosen item.
+  if (!awayOn && !tmrOn && isHub(screen)) {
+    if (depth == 0) { depth = 1; hubSel = 0; return; }
+    hubEnter(screen, hubSel);
+    return;
+  }
+  knockTwoInner();
+}
+static void knockTwoInner() {
   cDouble++;
+  if (awayOn) { lastActive = millis(); return; }   // away: nothing but the message
+  if (tmrOn && !awayOn) { lastActive = millis(); return; }   // timer: nothing else
   // Told to stand up and not able to just yet. Ten minutes and it asks
   // again, which is the difference between a reminder and a nag.
   if (toastUntil && (toastKind == "break" || toastKind == "remind")) {
@@ -7660,9 +8684,76 @@ static void knockTwo() {
     switch (itemIdx) {
       case C_REBOOT:  delay(150); ESP.restart(); break;
       case C_UPDATE:
-        if (online()) { upState = U_MENU; upPick = 0; upMsg = ""; }
-        else { upState = U_FAIL; upMsg = "No network"; }
+        // 7.4.1: one way to update, a file through the hotspot. Rafiq
+        // no longer fetches releases from GitHub by itself.
+        startHotspot();
         break;
+      case C_GUARD:
+        cfgPGuard = !cfgPGuard;
+        prefs.putBool("guard", cfgPGuard);
+        pgFired = false; pgUntil = 0;
+        flash(cfgPGuard ? "GUARD ON" : "GUARD OFF", 1000);
+        break;
+      case C_TAMPER: tamperArm(); break;
+      case C_TLOG:   tlogLoad(); depth = 2; break;
+      case C_HOLD:
+        cfgHoldIdx = (cfgHoldIdx + 1) % HOLD_N; prefs.putInt("holdi", cfgHoldIdx);
+        break;
+      case C_CLOCK:
+        cfg12h = !cfg12h; prefs.putBool("h12", cfg12h);
+        break;
+      case C_WAKEBY:
+        cfgWakeBy = (cfgWakeBy + 1) % 3; prefs.putInt("wakeby", cfgWakeBy);
+        break;
+      case C_MULTI:
+        cfgMulti = !cfgMulti; prefs.putBool("multi", cfgMulti);
+        if (cfgMulti && btUp) NimBLEDevice::startAdvertising();
+        else if (!cfgMulti && btConn2 != 0xFFFF && NimBLEDevice::getServer())
+          NimBLEDevice::getServer()->disconnect(btConn2);
+        flash(cfgMulti ? "TWO AT ONCE" : "ONE AT A TIME", 1100);
+        break;
+      case C_DEV1: case C_DEV2: {
+        // Walk the remembered devices, then "any". The other slot's
+        // device is skipped, so one device cannot be both.
+        int k = (itemIdx == C_DEV1) ? 0 : 1;
+        static const uint8_t zero[6] = { 0 };
+        int cur = memcmp(prefA[k], zero, 6) ? devFind(prefA[k]) : -1;
+        for (int step = 0; step <= devN; step++) {
+          cur++;
+          if (cur >= devN) { memset(prefA[k], 0, 6); break; }
+          if (memcmp(devs[cur].a, prefA[1 - k], 6)) { memcpy(prefA[k], devs[cur].a, 6); break; }
+        }
+        devSave();
+        break;
+      }
+      case C_AUTOAWAY:
+        cfgAutoAway = !cfgAutoAway; prefs.putBool("autoaway", cfgAutoAway);
+        break;
+      case C_PLOCK:
+        cfgPLock = (cfgPLock + 1) % 4; prefs.putInt("plock", cfgPLock);
+        flash(cfgPLock ? "POCKET LOCK ON" : "POCKET LOCK OFF", 1100);
+        break;
+      case C_BLOG:
+        cfgBlog = !cfgBlog; prefs.putBool("blog", cfgBlog);
+        if (cfgBlog && blog.magic != BLOG_MAGIC) blogReset();
+        break;
+      case C_BRESET:
+        cfgBlogV = (cfgBlogV + 1) % 4; prefs.putInt("blogv", cfgBlogV); blogArmed = true;
+        break;
+      case C_BVIEW:
+        if (cfgBlog) { subIdx = 0; depth = 2; }
+        break;
+      case C_NIGHT:
+        cfgNight = !cfgNight; prefs.putBool("night", cfgNight);
+        flash(cfgNight ? "NIGHT SLEEP ON" : "NIGHT SLEEP OFF", 1100);
+        break;
+      case C_BED: {
+        // 21:00 to 01:30, half an hour a press, then round again
+        int b = cfgBed < 720 ? cfgBed + 1440 : cfgBed;
+        b += 30; if (b > 1440 + 90) b = 21 * 60;
+        cfgBed = b % 1440; prefs.putInt("bed", cfgBed);
+        break;
+      }
       case C_AUTOUP:
         cfgAutoUp = !cfgAutoUp;
         prefs.putBool("autoup", cfgAutoUp);
@@ -7676,26 +8767,18 @@ static void knockTwo() {
       case C_PRAYER:  prayerWanted = true; nextPrayerTry = 0; break;
       case C_ACCEL:   depth = 2; break;
       case C_MODE:
-        // Walked, the way every other list is walked: wifi, then
-        // bluetooth, then off, then round again.
-        cfgNet = (cfgNet + 1) % NET_N;
-        prefs.putInt("net", cfgNet);
-        netDown = false;
+        // Bluetooth, then WiFi for now, then off, then round again.
+        // Only Bluetooth and Off are kept. WiFi lasts until a real
+        // restart, or half an hour of nobody using it.
         if (cfgNet == NET_WIFI) {
-          bleOff();
-          netNextTry = 0;                   // the task picks it up at once
-          WiFi.mode(WIFI_STA);
-          WiFi.setSleep(false);
-          setupWeb();                       // never started if it booted offline
-          flash("LOOKING FOR WIFI", 1300);
+          cfgNetHome = NET_OFF; prefs.putInt("net", cfgNetHome);
+          wsEnd("EVERYTHING OFF");
+        } else if (cfgNet == NET_BT) {
+          if (wsStart(WS_MANUAL)) flash("WIFI UNTIL RESTART", 1500);
         } else {
-          // Either of the others takes the WiFi radio down. Two
-          // radios on one aerial is one radio's worth of each.
-          WiFi.disconnect(true, false);
-          WiFi.mode(WIFI_OFF);
-          if (screen == S_WEATHER) screen = S_HOME;
-          if (cfgNet == NET_BT) { bleOn();  flash("BLUETOOTH ON", 1300); }
-          else                  { bleOff(); flash("EVERYTHING OFF", 1300); }
+          cfgNetHome = NET_BT; prefs.putInt("net", cfgNetHome);
+          cfgNet = NET_BT; bleOn();
+          flash("BLUETOOTH ON", 1300);
         }
         break;
       case C_BIKE:
@@ -7752,6 +8835,17 @@ static void knockTwo() {
 
 static void knockThree() {
   cTriple++;
+  if (awayOn) { lastActive = millis(); return; }   // away: nothing but the message
+  if (tmrOn && !awayOn) { lastActive = millis(); return; }   // timer: nothing else
+  // 7.6: back from a hub's menu to its front, from its front to Home, and
+  // from where an item began straight back to its hub's menu.
+  if (isHub(screen)) { if (depth == 1) depth = 0; else { screen = S_HOME; depth = 0; } return; }
+  if (inHub >= 0 && depth <= hubEntry &&
+      !(screen == S_SETTINGS && depth == 1 && setGrp != SG_FAITHSET)) {
+    int h = inHub; inHub = -1;
+    screen = h; depth = 1;
+    return;
+  }
   if (screen == S_FOCUS && (swOn || depth == 1)) {
     if (swOn) { swOn = false; swRun = false; depth = 0; return; }
     depth = 0; itemIdx = 0;
@@ -7761,6 +8855,11 @@ static void knockThree() {
   // altogether. Leaving takes one more press, which is what you want
   // when the thing you were looking for is in the group next door.
   if (screen == S_SETTINGS && depth == 1 && setGrp >= 0) { setGrp = -1; return; }
+  if (screen == S_SETTINGS && itemIdx == C_FACE && depth == 2) {
+    if (facePickFrom >= 0) cfgFace = facePickFrom;
+    facePickFrom = -1; depth = 1;
+    return;
+  }
   if (screen == S_SETTINGS && itemIdx == C_RESET && depth == 2) { depth = 1; return; }
   if (screen == S_SETTINGS && itemIdx == C_TAP && depth >= 2) {
     if (depth == 3) {
@@ -7793,6 +8892,8 @@ static void knockThree() {
 
 static void knockFour() {
   cQuad++;
+  if (awayOn) { lastActive = millis(); return; }   // away: nothing but the message
+  if (tmrOn && !awayOn) { lastActive = millis(); return; }   // timer: nothing else
   // Ticking one off at the device, so the robot can change the list and
   // not only show it. Rafiq sees it on its next look.
   if (screen == S_FOCUS && depth == 1 && itemIdx < taskCount) {
@@ -7847,10 +8948,10 @@ static void updateKnock(uint8_t n) {
       if (n == 1) { upYes = !upYes; return; }
       if (n == 2) {
         if (upYes) { upState = U_OFF; otaInstall(); upState = U_FAIL; }  // returns only if it failed
-        else upState = U_MENU;
+        else upState = upQuick ? U_OFF : U_MENU;
         return;
       }
-      upState = U_MENU;
+      upState = upQuick ? U_OFF : U_MENU;
       return;
 
     case U_LIST:
@@ -7864,7 +8965,7 @@ static void updateKnock(uint8_t n) {
       return;
 
     default:                                   // it said its piece
-      upState = U_MENU;
+      upState = upQuick ? U_OFF : U_MENU;
       return;
   }
 }
@@ -7933,13 +9034,7 @@ static void clickShrink() {
 // waiting to find out costs a third of a second and buys nothing.
 // Anywhere with somewhere to go back to, and in the places where a
 // double turns a page, there is.
-static bool doubleMeansSomething() {
-  if (depth != 0) return true;                      // back one level
-  if (faceMode || inReader()) return true;          // the page before
-  if (screen == S_GAMES && gState == GS_PLAY) return true;
-  if (dndUntil || relaxOn || canvasUntil || toastUntil) return true;
-  return false;
-}
+
 
 // A card when one lands, saying how many and when the next is due.
 static void remAddedCard(int n, uint32_t when) {
@@ -7962,7 +9057,66 @@ static void remAddedCard(int n, uint32_t when) {
 
 static void touchGesture(uint8_t g) {
   lastActive = millis();
-  if (apLock) return;              // the hotspot screen is not a menu
+  if (awayOn) { lastActive = millis(); return; }   // away: nothing but the message
+  if (tmrOn && !awayOn) { lastActive = millis(); return; }   // timer: nothing else
+  // The new cards from 6.0 take a press before anything else: it
+  // cancels a countdown, quiets the guard, stops the finder.
+  if (tamperCountAt) { tamperCountAt = 0; flash("NOT ARMED", 1200); return; }
+  if (nightCardUntil) {                               // 7.7: tap, an hour later; hold, now
+    if (g == TG_ONE) {
+      nightPush = constrain(nightPush + 60, 0, 360); nightCardUntil = 0;
+      char b[24]; int at = (cfgBed + nightPush) % 1440;
+      snprintf(b, sizeof(b), "SLEEP AT %02d:%02d", at / 60, at % 60); flash(b, 1300);
+    } else { nightCardUntil = 0; nightGo(); }
+    return;
+  }
+  if (pgUntil)       { pgUntil = 0; return; }
+  if (walkUntil)     { walkUntil = 0; return; }     // 7.5: Mac left behind, seen
+  if (findUntil)     { findUntil = 0; return; }
+  if (popOn && popRinging()) {                           // 7.5: a call, ringing
+    ancsAction(notes[0].uid, g == TG_LONG ? 1 : 0);      // hold declines, tap answers
+    flash(g == TG_LONG ? "DECLINED" : "ANSWERED", 900);
+    popupClose(false);
+    return;
+  }
+  if (popOn) {
+    if (g == TG_LONG) popupClose(true);                  // open it
+    else if (popWoke) {                                   // a touch on a glance: stay up
+      popWoke = false;
+      popUntil = millis() + popupSecs() * 1000UL;
+    } else popupClose(false);
+    return;
+  }
+  // The face picker: a tap is the next one, a hold keeps what is on
+  // the screen, and anything else puts back the one you arrived with.
+  if (screen == S_SETTINGS && depth == 2 && itemIdx == C_FACE) {
+    if (g == TG_ONE) { cfgFace = (cfgFace + 1) % FACE_N; facePickAt = 0; return; }
+    if (g == TG_LONG) {
+      prefs.putInt("face", cfgFace);
+      facePickFrom = -1; depth = 1;
+      flash("KEPT", 800);
+      return;
+    }
+    if (facePickFrom >= 0) cfgFace = facePickFrom;
+    facePickFrom = -1; depth = 1;
+    return;
+  }
+  if (screen == S_SETTINGS && depth == 2 && itemIdx == C_TLOG && g == TG_ONE) {
+    tlSel = (tlSel + 1) % (tlN + 1);
+    return;
+  }
+  if (screen == S_SETTINGS && depth == 2 && itemIdx == C_BVIEW) {    // 7.8: the battery log
+    if (g == TG_ONE)  { subIdx = (subIdx + 1) % 9; return; }
+    if (g == TG_LONG) { blogReset(); blogSave(); subIdx = 0; flash("NEW LOG", 900); return; }
+  }
+  if (screen == S_SETTINGS && depth == 2 && itemIdx == C_TLOG && g == TG_LONG) {
+    if (tlSel >= tlN) { if (fsOk) LittleFS.remove(TLOG_PATH); flash("LOG CLEARED", 1100); }
+    else              { tlogDelete(tlSel); flash("DELETED", 800); }
+    int keep = tlSel;
+    tlogLoad();
+    tlSel = keep < tlN ? keep : tlN;
+    return;
+  }
 
   // Gesture mode is driven by knocking the desk, not by the pad, so
   // the pad does nothing here at all beyond the four second hold
@@ -7974,10 +9128,13 @@ static void touchGesture(uint8_t g) {
   // handler had to be taught to ignore would have arrived at your
   // Mac as a second tap.
   if (cfgGesture) {
-    if (gestByTouch()) {
-      if (g == TG_ONE) sendTap("1");
-      else if (g == TG_TWO) sendTap("2");
-    }
+    // 7.5: the pad, named as the pad, so the Mac can tell it from a knock
+    // (a mute must never come from a bumped desk). A hold that turned the
+    // knob was the knob, not a hold.
+    if (g == TG_ONE) sendTap("t1");
+    else if (g == TG_LONG) { if (!knobUsed) sendTap("th"); }
+    else if (g == TG_TWO) { if (!knobUsed) sendTap("t2"); }
+    knobUsed = false;
     return;
   }
 
@@ -8066,40 +9223,70 @@ static void touchGesture(uint8_t g) {
       default: depth = 0; return;
     }
   }
-  // Notices read the way the reminders do: one goes on, two comes
-  // back, holding clears. A call is only ever cleared here and never
-  // on the phone, because a knock that declines a call by accident
-  // is not a feature.
-  if (screen == S_MSG && depth > 0) {
-    if (noteConfirm) {
-      if (g == TG_ONE) { noteYes = !noteYes; return; }
-      if (g == TG_LONG) {
-        if (noteYes) { noteN = 0; noteIdx = 0; flash("CLEARED", 1100); }
-        noteConfirm = false; depth = 0;
-        return;
+  // Notifications, C3 Buddy's way. The list: a tap moves, a hold opens
+  // the one picked, and holding on the last row clears them all. A
+  // message: a tap goes to the next, a hold clears this one, back
+  // returns to the list.
+  if (screen == S_FOCUS) {                    // 7.5: the Mac screen
+    int idx[4]; int k = macItems(idx);
+    if (depth == 0) {
+      if (g == TG_LONG && k) { depth = 1; macSel = 0; clickShrink(); return; }
+      if (g == TG_LONG) return;
+    } else {
+      switch (g) {
+        case TG_ONE:  if (k) macSel = (macSel + 1) % k; return;
+        case TG_LONG:
+          if (k) {
+            int w = idx[macSel < k ? macSel : 0];
+            char b[12]; snprintf(b, sizeof(b), "done %d", w); evtSend(b);
+            if (w == 0) cards[2].on = false;
+            else { cards[1].line[w - 1][0] = 0; }
+            flash("DONE", 700);
+            if (macItems(idx) == 0) depth = 0;
+          }
+          return;
+        case TG_TWO: depth = 0; return;
+        default: return;
       }
-      if (g == TG_TWO) { noteConfirm = false; return; }
-      return;
     }
+  }
+  if (screen == S_MSG && depth == 1) {
     switch (g) {
-      case TG_ONE:  if (noteIdx < noteN) noteIdx++; return;
-      case TG_TWO:  if (noteIdx > 0) noteIdx--; else depth = 0; return;
+      case TG_ONE:  noteSel = (noteSel + 1) % (noteN + 1); return;
       case TG_LONG:
-        if (noteIdx >= noteN && noteN) { noteConfirm = true; noteYes = false; }
-        else if (noteIdx < noteN) {
-          Note& n = notes[noteIdx];
-          n.unread = false;
-          if (!noteIsCall(n)) ancsAction(n.uid, 1);   // clear it on the phone too
-          for (int i = noteIdx; i < noteN - 1; i++) notes[i] = notes[i + 1];
-          noteN--;
-          if (noteIdx > noteN) noteIdx = noteN;
+        if (noteSel >= noteN) {
+          if (noteN) { noteN = 0; noteIdx = 0; noteSel = 0; notesDirty = true; flash("CLEARED", 1100); }
+          depth = 0;
+        } else {
+          noteIdx = noteSel; notes[noteIdx].unread = false; notesDirty = true; depth = 2;
         }
         return;
-      default: depth = 0; return;
+      case TG_TWO:  depth = 0; return;
+      default: return;
+    }
+  }
+  if (screen == S_MSG && depth == 2) {
+    switch (g) {
+      case TG_ONE:
+        if (noteN) { noteIdx = (noteIdx + 1) % noteN; notes[noteIdx].unread = false; notesDirty = true; }
+        return;
+      case TG_LONG:
+        if (noteIdx < noteN) {
+          Note& n = notes[noteIdx];
+          if (!noteIsCall(n)) ancsAction(n.uid, 1);   // clear it on the phone too
+          for (int i = noteIdx; i < noteN - 1; i++) notes[i] = notes[i + 1];
+          noteN--; notesDirty = true;
+          noteSel = noteIdx < noteN ? noteIdx : noteN;
+          flash("CLEARED", 700);
+        }
+        depth = noteN ? 1 : 0;
+        return;
+      case TG_TWO:  depth = 1; noteSel = noteIdx; return;
+      default: return;
     }
   }
   if (g == TG_LONG && screen == S_MSG && depth == 0 && noteN) {
-    depth = 1; noteIdx = 0; noteConfirm = false;
+    depth = 1; noteSel = 0;
     clickShrink();
     return;
   }
@@ -8159,9 +9346,10 @@ static void touchGesture(uint8_t g) {
     }
     return;
   }
-  // The clock has nothing to open, so going in means the faces.
-  if (g == TG_LONG && screen == S_HOME && depth == 0 && timeOk) {
-    faceMode = true;
+  // 7.6: a hold on Home goes straight to Today's menu: what is new is
+  // always one hold away. (Faces are chosen in Settings, Display.)
+  if (g == TG_LONG && screen == S_HOME && depth == 0) {
+    screen = S_TODAY; depth = 1; hubSel = 0; inHub = -1;
     clickShrink();
     return;
   }
@@ -8195,9 +9383,10 @@ static void settleBurst() {
     uint32_t now = millis();
     bool byPad = touchOn || (now - touchLiftAt) < SHAKE_AFTER_MS
                          || (now - touchPressAt) < SHAKE_AFTER_MS;
-    if (gestByKnock() && !byPad) {
-      if (n == 1) sendTap("1");
-      else if (n == 2) sendTap("2");
+    if (!byPad) {                        // 7.5: named, and three counts
+      if (n == 1) sendTap("k1");
+      else if (n == 2) sendTap("k2");
+      else if (n >= 3) sendTap("k3");
     }
     return;
   }
@@ -8257,30 +9446,15 @@ static void input() {
     bool lvl = digitalRead(TOUCH_PIN);
     if (lvl != touchLvl) { touchLvl = lvl; touchLvlAt = now; }
     else if (lvl != touchRest && now - touchLvlAt > TOUCH_REST_MS) {
-      // Ten seconds at one level. Whatever it is, that is resting.
+      // A whole minute at one level. Whatever it is, that is resting.
       touchRest = lvl;
       prefs.putBool("trest", touchRest);     // so the next wake starts right
-      // Everything the wrong level started is cancelled with it: the
-      // press that was never a press, the hold it grew into, and the
-      // switch off that hold had armed.
-      touchOn = false; touchEdge = 0; touchLongDone = true; touchTaps = 0;
-      sleepArmed = 0; touchSeenFree = false;
-      lastActive = now;
       Serial.printf("pad resting level is now %s\n", touchRest ? "high" : "low");
-      flash("PAD RELEARNED", 1100);
     }
 
     // The pad settles before anything believes it, so a noisy edge is
     // not a press and a bounce on the way up is not a lift.
-    // Only a settled release counts, and settled means the debounced
-    // state agrees with the pin. Reading it off the raw level was
-    // wrong in a way that only showed on the way up: the instant a
-    // long press was released the level matched resting while
-    // touchOn was still true for another debounce, so the hold was
-    // still running, had been running for seconds, and armed the
-    // switch off at the exact moment you let go.
     bool want = (lvl != touchRest);
-    if (!want && !touchOn) touchSeenFree = true;
     if (want != touchOn) {
       if (!touchEdge) touchEdge = now;
       if (now - touchEdge >= TOUCH_DEBOUNCE) {
@@ -8290,88 +9464,55 @@ static void input() {
           touchCount++;
           touchPressAt = now;
           touchLongDone = false;
-          if (asleep) { wake("touch"); touchTaps = 0; touchLongDone = true; }
-        } else {
-          // Every lift is a jolt, so every lift is recorded, including
-          // the one that ends a long press. Only the ones that were
-          // not already spent on a long press count towards a tap.
-          touchLiftAt = now;
-          if (!touchLongDone) {
-            if (touchTaps < 3) touchTaps++;
-            if (touchTaps == 3) { touchGesture(TG_THREE); touchTaps = 0; }
+          holdShown = false;
+          glanceUntil = 0;                       // a touch makes a glance a real wake
+          awayEv(AE_TOUCH);
+          if (tmrOn && !awayOn) { tmrTouch(); touchLongDone = true; touchTaps = 0; holdShown = false; }
+          if (asleep && pocketLocked()) {            // 7.9: locked: only a hold wakes it
+            unlocking = true; unlockAt = now; unlockShown = false;
+            touchTaps = 0; touchLongDone = true;
           }
+          else if (asleep) { if (touchWakes()) { wake("touch"); popupOnWake(); }
+                             lastUserAt = now; touchTaps = 0; touchLongDone = true; }
+          else lastUserAt = now;                     // awake: a real touch keeps it unlocked
+        } else {
+          touchLiftAt = now;
+          // What the bar said is what happens. Nothing is decided while
+          // the finger is still down, so nothing has to be undone.
+          uint32_t held = now - touchPressAt;
+          if (!touchLongDone) {
+            if      (held < holdMs())     touchGesture(TG_ONE);    // a tap, at once
+            else if (held < holdBackMs()) touchGesture(TG_LONG);   // Open
+            else                          touchGesture(TG_TWO);    // Back
+          }
+          touchLongDone = false; holdShown = false; touchTaps = 0;
         }
       }
     } else touchEdge = 0;
 
-    // Going in fires under your finger rather than after it, which is
-    // what makes it feel like the quickest of the four. Holding on past
-    // that is a different question, answered when you let go.
-    if (touchOn && touchSeenFree && !touchLongDone && now - touchPressAt >= TOUCH_LONG_MS) {
-      touchLongDone = true;
-      touchTaps = 0;
-      touchGesture(TG_LONG);
-    }
-    if (touchOn && touchLongDone) {
+    if (touchOn && !touchLongDone) {
       uint32_t held = now - touchPressAt;
       if (held > touchLongest) touchLongest = held;
-      // Four seconds. It goes home right now, not when you let go,
-      // and the decision is made. Going home first means switching
-      // off finds you there.
-      // In gesture mode the long hold is the way back to being a
-      // robot, not the way to switch one off. Switching off is still
-      // there once you have stopped.
-      if (cfgGesture && touchSeenFree && held >= TOUCH_HOME_MS) {
+      if (held >= holdMs() && !cfgGesture) holdShown = true;
+      if (cfgGesture && held >= TOUCH_HOME_MS) {
         cfgGesture = false;
-        touchLongDone = true; touchTaps = 0;
+        touchLongDone = true; holdShown = false;
         flash("GESTURE OFF", 1100);
         Serial.println("held to four in gesture mode: back to being a robot");
       }
-      // touchSeenFree is the whole of the fix: a pad that has never
-      // been seen at rest is a pad we are reading wrong, and it does
-      // not get to switch the robot off.
-      if (!cfgGesture && touchSeenFree && !sleepArmed && held >= TOUCH_HOME_MS) {
+      // Held to four: home, and the three second count to switching
+      // off, as before 6.1. Letting go now does nothing; the count runs.
+      if (!cfgGesture && !sleepArmed && !awayOn && !tmrOn && held >= TOUCH_HOME_MS) {
         sleepArmed = now;
+        touchLongDone = true; holdShown = false;
         screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; faceMode = false;
-        upState = U_OFF; swOn = false; swRun = false;
+        upState = U_OFF; swOn = false; swRun = false; popOn = false;
         Serial.println("held to four: home, and switching off");
       }
     }
-
-    // The count, once it has started, belongs to the clock and not to
-    // your finger.
-    //
-    // It used to stop if you let go, which read well and did not
-    // work. A TTP223 lets go of its own accord if a pad stays
-    // covered, around five seconds on this board. So the count began
-    // at four, the chip released itself at five with two still
-    // showing, and the robot announced it was staying up. Holding on
-    // could never switch it off, because the pad let go before you
-    // did.
-    //
-    // Four seconds is the whole of the decision now. Nothing after it
-    // can take it back, which is the only arrangement the pad cannot
-    // beat, and the three that follow are an announcement rather than
-    // a question.
     if (sleepArmed) {
       lastActive = now;
       if (now - sleepArmed >= TOUCH_COUNT_MS) { sleepArmed = 0; wantDeep = true; }
-    }
-    // Quiet long enough that nothing more is coming.
-    //
-    // Except where nothing can. At the top of the carousel a double
-    // means back, back from there means home, and a triple already
-    // means home, so a second press buys nothing at all. With nothing
-    // to wait for it does not wait, and flicking through the screens
-    // lands the instant you lift. Everywhere a double does something,
-    // the window still has to pass.
-    if (!touchOn && touchTaps == 1 && !doubleMeansSomething()) {
-      touchTaps = 0;
-      touchGesture(TG_ONE);
-    }
-    else if (!touchOn && touchTaps && now - touchLiftAt >= TOUCH_GAP_MS) {
-      uint8_t n = touchTaps; touchTaps = 0;
-      touchGesture(n == 1 ? TG_ONE : TG_TWO);
     }
     if (touchOn) lastActive = now;             // a finger on it is not idle
   }
@@ -8405,9 +9546,20 @@ static void input() {
     if ((s & INT_FF) && lastLowG && now - lastLowG < 400 &&
         (!lastFallAt || now - lastFallAt > 4000)) {
       lastFallAt = now;
-      wake("fall"); onFall(); return;
+      // A drop in a bag or a pocket should not leave the robot awake
+      // for the next several minutes over something nobody watched.
+      // The animation is for when you are looking; if it was asleep
+      // when it fell, it goes straight back to being asleep.
+      bool fellAsleep = asleep;
+      wake("fall"); onFall();
+      if (fellAsleep) goSleep();
+      return;
     }
-    if (s & INT_TAP1) {
+    if (s & INT_TAP1) awayEv(AE_KNOCK);
+    if ((s & INT_TAP1) && (awayOn || (asleep && !motionWakes()))) {
+      if (awayOn && asleep && motionWakes()) wake("knock");   // show the message, act on nothing
+    }
+    else if (s & INT_TAP1) {
       if (tapTesting) { tapSeen++; tapLastSeen = now; }
       // In gesture mode a knock is the whole point and waking is not.
       // The robot sits dark on the desk and the knock goes straight
@@ -8422,8 +9574,10 @@ static void input() {
 
   if (fabsf(amag - 1.0f) > SHAKE_G && now - lastShake > 600) {
     lastShake = now; cShake++;
-    if (asleep) { wake("shake"); return; }
-    lastActive = now;
+    awayEv(AE_SHAKE);
+    if (asleep) { if (motionWakes()) wake("shake"); return; }
+    // 7.1: a shake still steps back (below), but is not "activity": a
+    // bag being carried shakes, and that must not keep the screen lit.
     // One step back per shake, however long you keep shaking: the 600ms
     // above is what stops a good rattle counting as six. It never goes
     // past the clock, so shaking at an empty desk cannot do anything
@@ -8454,8 +9608,9 @@ static void input() {
     }
   }
   if (fabsf(amag - 1.0f) > 0.12f || fabsf(gxr) + fabsf(gyr) + fabsf(gzr) > 25.0f) {
-    if (asleep) wake("picked up");
-    lastActive = now;
+    if (asleep) { awayEv(AE_MOVE); if (!motionWakes()) return; wake("picked up"); }
+    // 7.1: moving it wakes it (above, by the Wake by setting) but does
+    // not keep it awake. Only touching, knocking and using a screen do.
   }
 
   // Everything above watches the MAGNITUDE of the acceleration, and
@@ -8476,8 +9631,8 @@ static void input() {
   lastDirD = dirD;
   if (dirD > 0.12f) {   // three times what a still device wanders
     refAx = ax; refAy = ay; refAz = az;
-    if (asleep) wake("moved");
-    lastActive = now;
+    if (asleep) { awayEv(AE_MOVE); if (!motionWakes()) return; wake("moved"); }
+    // 7.1: turning it over is not an interaction either.
   } else {
     refAx += (ax - refAx) * 0.005f;
     refAy += (ay - refAy) * 0.005f;
@@ -8503,7 +9658,6 @@ static void input() {
   // a desk you are working at is a drain and a distraction. Ten
   // seconds, whatever the sleep setting says, because the setting is
   // about a robot you are using and this is not one.
-  if (apLock) return;                            // the hotspot screen stays up
   if (btPairing()) return;                       // not while it is being paired
   if (cfgGesture) {
     if (!asleep && now - lastActive > GESTURE_DARK_MS) goSleep();
@@ -8659,19 +9813,17 @@ td{padding:3px 0}td:first-child{color:var(--mut);text-align:left}td:last-child{t
   </div>
 
   <h2>Update</h2><div class="card">
-    <button onclick="if(confirm('Install the newest release?'))act('/api/update')">Install the newest release</button>
-    <button class="g" onclick="listRel()">List earlier releases</button>
-    <div id="rel"></div>
-  </div>
-
-  <h2>Firmware from a file</h2><div class="card">
-    <div class="sub" style="margin-bottom:8px">A .bin from this computer, straight
-      onto the robot. No internet needed, which is the point of the hotspot.</div>
-    <input type="file" id="fw" accept=".bin">
-    <div class="row" style="margin-top:8px">
-      <button onclick="sendFw()">Upload and install</button>
+    <div id="upg" style="display:none">
+      <button onclick="if(confirm('Install the newest release?'))act('/api/update')">Install the newest release</button>
+      <button class="g" onclick="listRel()">List earlier releases</button>
+      <div id="rel"></div>
     </div>
-    <div class="sub" id="fwp" style="margin-top:8px"></div>
+    <div id="upf">
+      <p style="margin:10px 0 6px">Pick the <b>APP</b> bin (Rafiq_vX_APP_wireless_update.bin), not the FULL one. Keep this page open until it says it is restarting.</p>
+      <input type="file" id="upfile" accept=".bin" style="width:100%">
+      <button onclick="upFile()">Install this file</button>
+      <div id="ups" style="margin-top:8px"></div>
+    </div>
   </div>
 
   <h2>System</h2><div class="card"><table id="sys"></table>
@@ -8701,34 +9853,10 @@ const $=i=>document.getElementById(i);
 window.esc=function(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 window.rows=function(el,o){$(el).innerHTML=Object.entries(o).map(([k,v])=>'<tr><td>'+k+'</td><td>'+esc(v)+'</td></tr>').join('')}
 window.tok=function(){return localStorage.getItem('rtok')||''}
+window.updTab=function(f){document.getElementById('upg').style.display=f?'none':'';document.getElementById('upf').style.display=f?'':'none';document.getElementById('ub1').className=f?'g':'';document.getElementById('ub2').className=f?'':'g'};
+window.upFile=function(){const x=document.getElementById('upfile').files[0],st=document.getElementById('ups');if(!x){st.textContent='Pick a file first';return}const d=new FormData();d.append('f',x,x.name);const r=new XMLHttpRequest();r.open('POST','/ota');const t=tok();if(t)r.setRequestHeader('X-Rafiq-Token',t);r.upload.onprogress=function(e){if(e.lengthComputable)st.textContent='Sending '+Math.round(e.loaded*100/e.total)+'%'};r.onload=function(){st.textContent=r.responseText};r.onerror=function(){st.textContent='The connection dropped. If Rafiq restarted, it worked.'};st.textContent='Sending';r.send(d)};
 window.hdr=function(){const h={'Content-Type':'application/x-www-form-urlencoded'};const t=tok();if(t)h['X-Rafiq-Token']=t;return h}
 window.post=async function(u,d){const r=await fetch(u,{method:'POST',headers:hdr(),body:new URLSearchParams(d||{})});if(r.status==401||r.status==403)askPair();return r}
-// Sent with XMLHttpRequest rather than fetch, because this is the one
-// request on the page worth watching: a couple of megabytes over a
-// hotspot is slow enough that a page doing nothing looks broken.
-window.sendFw=function(){
-  const f=document.getElementById('fw').files[0];
-  if(!f){alert('Choose a .bin file first');return}
-  if(!/\.bin$/i.test(f.name)&&!confirm(f.name+' is not a .bin. Try it anyway?'))return;
-  if(!confirm('Install '+f.name+'? The robot restarts when it is done.'))return;
-  const p=document.getElementById('fwp');
-  p.textContent='sending 0%';
-  const x=new XMLHttpRequest();
-  x.open('POST','/api/upload');
-  const t=tok(); if(t)x.setRequestHeader('X-Rafiq-Token',t);
-  x.setRequestHeader('X-Rafiq-Size',String(f.size));
-  x.upload.onprogress=function(e){
-    if(e.lengthComputable)p.textContent='sending '+Math.round(e.loaded*100/e.total)+'%';
-  };
-  x.onload=function(){
-    if(x.status==401||x.status==403){p.textContent='pair first';askPair();return}
-    let r={};try{r=JSON.parse(x.responseText)}catch(e){}
-    p.textContent=r.ok?'installed, restarting now':('refused: '+(r.err||('HTTP '+x.status)));
-  };
-  x.onerror=function(){p.textContent='upload failed'};
-  const fd=new FormData(); fd.append('f',f,f.name);
-  x.send(fd);
-};
 window.locked=false;
 window.askPair=async function(){
   if(locked)return;                       // one prompt, one code
@@ -8868,13 +9996,11 @@ static void apiState() {
   o += "\"hadj\":" + String(cfgHijriAdj) + ",";
   o += "\"offline\":" + String(cfgOffline ? "true" : "false") + ",";
   o += "\"net\":" + String(cfgNet) + ",";
+  o += "\"home\":" + String(cfgNetHome) + ",\"ws\":" + String(wsKind) + ",";
+  o += "\"guard\":" + String(cfgPGuard ? "true" : "false") + ",";
   o += "\"netName\":\"" + String(NET_NAME[cfgNet]) + "\",";
   o += "\"bt\":\"" + String(btShort()) + "\",";
   o += "\"safe\":" + String(safeMode ? "true" : "false") + ",";
-  o += "\"aplock\":" + String(apLock ? "true" : "false") + ",";
-  o += "\"padrest\":\"" + String(touchRest ? "high" : "low") +
-       "\",\"padnow\":\"" + String(digitalRead(TOUCH_PIN) ? "high" : "low") +
-       "\",\"padfree\":" + String(touchSeenFree ? "true" : "false") + ",";
   o += "\"netDown\":" + String(netDown ? "true" : "false") + ",";
   o += "\"bike\":" + String(cfgBike ? "true" : "false") + ",";
   o += "\"btpl\":" + String(cfgBikeTpl) + ",";
@@ -9005,6 +10131,52 @@ static void apiState() {
   web.send(200, "application/json", o);
 }
 
+// ================================================================
+//  INSTALLING FROM A FILE  (6.0)
+// ================================================================
+//  GitHub needs the internet. This needs only the hotspot: join it,
+//  open 192.168.4.1/ota, pick the APP file. A FULL image is refused
+//  by its size, because it would not fit the slot.
+
+bool   otaUpOk = false;
+String otaUpErr = "";
+size_t otaUpGot = 0;
+
+static void otaUpload() {
+  HTTPUpload& u = web.upload();
+  if (u.status == UPLOAD_FILE_START) {
+    otaUpOk = false; otaUpErr = ""; otaUpGot = 0;
+    if (!rescueAP && !authed()) { otaUpErr = "join the Rafiq hotspot first"; return; }
+    wake("update");
+    wsLastUse = millis();
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) { otaUpErr = Update.errorString(); return; }
+    Serial.printf("installing %s from a file\n", u.filename.c_str());
+  } else if (u.status == UPLOAD_FILE_WRITE) {
+    if (otaUpErr.length()) return;
+    // Every ESP image starts with 0xE9. Anything else is not firmware.
+    if (otaUpGot == 0 && u.currentSize && u.buf[0] != 0xE9) {
+      otaUpErr = "that is not a firmware file"; Update.abort(); return;
+    }
+    if (Update.write(u.buf, u.currentSize) != u.currentSize) {
+      otaUpErr = Update.errorString(); Update.abort(); return;
+    }
+    otaUpGot += u.currentSize;
+    wsLastUse = millis();
+    if ((otaUpGot & 0xFFFF) < u.currentSize) {        // every 64 kB
+      oled.clearDisplay(); bar("UPDATING");
+      char l[22]; snprintf(l, sizeof(l), "%u kB", (unsigned)(otaUpGot / 1024));
+      ctr(l, 28, 1); ctr("from a file", 44, 1);
+      oled.display();
+    }
+  } else if (u.status == UPLOAD_FILE_END) {
+    if (otaUpErr.length()) return;
+    if (Update.end(true)) { otaUpOk = true; Serial.printf("file installed, %u bytes\n", (unsigned)otaUpGot); }
+    else otaUpErr = Update.errorString();
+  } else if (u.status == UPLOAD_FILE_ABORTED) {
+    Update.abort(); otaUpErr = "the upload stopped";
+  }
+}
+
 static void setupWeb() {
   if (webUp) return;
   webUp = true;
@@ -9018,9 +10190,19 @@ static void setupWeb() {
                "always a way in.</p></body>");
       return;
     }
+    wsTouch();
     web.send_P(200, "text/html; charset=utf-8", PAGE);
   });
-  web.on("/api/state", HTTP_GET, []() { if (!authed()) { web.send(401, "application/json", "{\"ok\":false}"); return; } sawMac(); apiState(); });
+  web.on("/api/state", HTTP_GET, []() { if (!authed()) { web.send(401, "application/json", "{\"ok\":false}"); return; } wsTouch(); sawMac(); apiState(); });
+  // Installing from a file, for when there is no internet to reach
+  // GitHub with: join the hotspot and open this. Only while the
+  // hotspot is up, or for a paired Mac, so a page on the home network
+  // cannot be used to put something else on the robot.
+  web.on("/ota", HTTP_POST, []() {
+    bool ok = otaUpOk && !Update.hasError();
+    web.send(200, "text/plain", ok ? "Installed. Rafiq is restarting." : ("Not installed: " + otaUpErr));
+    if (ok) { delay(800); ESP.restart(); }
+  }, []() { otaUpload(); });
 
   // ---- pairing ----
   // Asking for a code is the one thing that needs no token, because
@@ -9107,7 +10289,7 @@ static void setupWeb() {
       return;
     }
     struct tm nowT;
-    if (!timeOk || !getLocalTime(&nowT, 0)) {
+    if (!timeOk || !nowLocal(&nowT)) {
       web.send(409, "application/json", "{\"ok\":false,\"err\":\"the clock is not set yet\"}");
       return;
     }
@@ -9513,39 +10695,10 @@ static void setupWeb() {
   // screen for.
   web.on("/api/cfgv", HTTP_POST, []() {
     if (!guard()) return;
-    String k = web.arg("k");
-    int v = web.arg("v").toInt();
-    if      (k == "bri")  { cfgBright   = constrain(v, 0, 255);           prefs.putInt("bri", cfgBright);   applyBright(); }
-    else if (k == "face") { cfgFace     = constrain(v, 0, FACE_N - 1);    prefs.putInt("face", cfgFace); }
-    else if (k == "slpi") { cfgSleepIdx = constrain(v, 0, SLEEP_N - 1);   prefs.putInt("slpi", cfgSleepIdx); }
-    else if (k == "popi") { cfgPopupIdx = constrain(v, 0, POPUP_N - 1);   prefs.putInt("popi", cfgPopupIdx); }
-    else if (k == "eye")  { cfgEyes     = constrain(v, 0, STYLE_N - 1);   prefs.putInt("eye", cfgEyes); applyEyes(cfgEyes); }
-    // Reachable from the app on purpose. The pad is the only thing
-    // driving this now, so if the pad ever stops there has to be a way
-    // back in that does not involve the pad, and the network is it.
-    else if (k == "knock"){ cfgKnock    = (v != 0);                      prefs.putBool("knock", cfgKnock); }
-    else if (k == "bike") { cfgBike     = (v != 0);                      prefs.putBool("bike", cfgBike); }
-    else if (k == "btpl") { cfgBikeTpl  = constrain(v, 0, BIKE_TPL_N - 1); prefs.putInt("btpl", cfgBikeTpl); }
-    else if (k == "net")  { cfgNet = constrain(v, 0, NET_N - 1);         prefs.putInt("net", cfgNet);
-                            if (cfgNet == NET_BT) bleOn(); else bleOff();
-                            if (cfgOffline) { WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF); }
-                            else { netDown = false; netMisses = 0; netNextTry = 0;
-                                   WiFi.mode(WIFI_STA); WiFi.setSleep(false); setupWeb(); } }
-    else if (k == "offl") { cfgNet = v ? NET_OFF : NET_WIFI;             prefs.putInt("net", cfgNet);
-                            if (cfgOffline) { WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF); }
-                            else { netDown = false; netMisses = 0; netNextTry = 0;
-                                   WiFi.mode(WIFI_STA); WiFi.setSleep(false); setupWeb(); } }
-    else if (k == "hadj") { cfgHijriAdj = constrain(v, -2, 2);           prefs.putInt("hadj", cfgHijriAdj); }
-    else if (k == "shake"){ cfgBack = v ? BACK_BOTH : BACK_KNOCK;        prefs.putInt("back", cfgBack); }
-    else if (k == "back") { cfgBack = constrain(v, 0, BACK_N - 1);       prefs.putInt("back", cfgBack); }
-    else if (k == "wakeh"){ cfgWakeIdx = constrain(v, 0, WAKE_N - 1);    prefs.putInt("wakeh", cfgWakeIdx); }
-    // Not written to flash. See cfgGesture: it belongs to the Mac.
-    else if (k == "gest") { cfgGesture = (v != 0); if (cfgGesture) wake("gesture"); }
-    else if (k == "gsrc") { cfgGestSrc = constrain(v, 0, GSRC_N - 1); }
-    else if (k == "deepi"){ cfgDeepIdx  = constrain(v, 0, DEEP_N - 1);   prefs.putInt("deepi", cfgDeepIdx); }
-    // Sent in hundredths, because the form only carries whole numbers.
-    else if (k == "bfull"){ battFull    = constrain(v / 100.0f, 3.90f, 4.30f); prefs.putFloat("bfull", battFull); }
-    else { web.send(400, "application/json", "{\"ok\":false,\"err\":\"no such setting\"}"); return; }
+    if (!cfgApply(web.arg("k"), web.arg("v").toInt())) {
+      web.send(400, "application/json", "{\"ok\":false,\"err\":\"no such setting\"}");
+      return;
+    }
     okJson();
   });
   web.on("/api/autoup", HTTP_POST, []() {
@@ -9606,8 +10759,7 @@ static void setupWeb() {
         strncpy(pn.msg,   message.c_str(), sizeof(pn.msg) - 1);
         addNote(pn);
       }
-      wake("message");
-      if (popupSecs()) { screen = S_MSG; depth = 0; popupUntil = millis() + popupSecs() * 1000UL; }
+      popupShow();
     }
     web.send(200, "application/json", "{\"ok\":true}");
   });
@@ -9651,23 +10803,6 @@ static void setupWeb() {
     delay(250);
     otaInstall();
   });
-
-  web.on("/api/upload", HTTP_POST, []() {
-    if (upErr.length()) {
-      String e = upErr; upErr = ""; upLocal = false;
-      otaPct = -1;
-      Serial.printf("upload refused: %s\n", e.c_str());
-      flash(e.c_str(), 1800);           // said out loud, whatever is on screen
-      web.send(200, "application/json",
-               String("{\"ok\":false,\"err\":\"") + e + "\"}");
-      return;
-    }
-    web.send(200, "application/json", "{\"ok\":true}");
-    otaStatus = "Installed"; otaStatus2 = ""; otaPct = 100; drawOta();
-    Serial.println("upload installed from the page: restarting");
-    delay(400);
-    ESP.restart();
-  }, localUploadChunk);
 
   web.on("/api/hotspot", HTTP_POST, []() {
     if (!guard()) return;
@@ -9810,8 +10945,8 @@ static void setupWeb() {
     delay(300); ESP.restart();
   });
   {
-    const char* keep[] = { "X-Rafiq-Token", "X-Rafiq-App", "X-Rafiq-Size" };
-    web.collectHeaders(keep, 3);
+    const char* keep[] = { "X-Rafiq-Token", "X-Rafiq-App" };
+    web.collectHeaders(keep, 2);
   }
   web.onNotFound([]() { web.send(404, "text/plain", "not found"); });
   web.begin();
@@ -9831,8 +10966,7 @@ static bool knockPending() {
 }
 
 // eyes opening slowly, a look either way, one unhurried blink
-static void animWake() {
-  const unsigned long TOTAL = 2600;
+static void animWake(unsigned long TOTAL) {
   unsigned long t0 = millis();
   while (millis() - t0 < TOTAL) {
     float p = (float)(millis() - t0) / (float)TOTAL;
@@ -10055,6 +11189,10 @@ static void netLoop(void*) {
     } else {
       netMisses = 0;
       hadNet = true;
+      // Each flag is cleared before its fetch starts, so the flags alone
+      // cannot say a fetch is still running. This can: a session must
+      // not take the radio away in the middle of one.
+      netBusy = true;
       if (wantTime)      { wantTime = false;      trySyncTime(1500); }
       if (wantWx)        { wantWx = false;        fetchWeather(); }
       if (wantPrayerNow) { wantPrayerNow = false; fetchPrayer(); }
@@ -10080,8 +11218,2205 @@ static void netLoop(void*) {
         bool ok = otaFetchList();
         if (seq == upSeq) upState = ok ? U_LIST : U_FAIL;
       }
+      netBusy = false;
     }
     vTaskDelay(pdMS_TO_TICKS(40));
+  }
+}
+
+// ================================================================
+//  6.0: BLUETOOTH FIRST
+// ================================================================
+
+// ---- light sleep ----
+static void pmInit() {
+  esp_pm_config_t c = {};
+  c.max_freq_mhz = 160; c.min_freq_mhz = 160; c.light_sleep_enable = false;
+  pmAvail = (esp_pm_configure(&c) == ESP_OK);
+  pmMode = 0;
+  Serial.printf("power: %s\n", pmAvail ? "light sleep on offer" : "stock core, no light sleep");
+}
+static void pmSet(bool idle) {
+  if (!pmAvail) return;
+  int m = idle ? 1 : 0;
+  if (m == pmMode) return;
+  esp_pm_config_t c = {};
+  c.max_freq_mhz = 160;
+  c.min_freq_mhz = idle ? 40 : 160;
+  c.light_sleep_enable = idle;
+  if (esp_pm_configure(&c) == ESP_OK) pmMode = m;
+}
+// Linked to the phone, on a core that can stay linked in the dark.
+static bool phoneHeld() {
+  return pmAvail && cfgNet == NET_BT && btUp && btConn != 0xFFFF;
+}
+
+// ---- WiFi sessions ----
+static void wsTouch() {
+  wsLastUse = millis();
+  if (wsKind == WS_MANUAL) rtcWsUntil = (uint32_t)time(nullptr) + WS_IDLE_S;
+}
+
+static bool wsStart(int kind) {
+  if (cfgNet == NET_WIFI) {              // already up: only the reason can change
+    if (kind == WS_MANUAL && wsKind != WS_MANUAL) { wsKind = WS_MANUAL; rtcWsKind = WS_MANUAL; }
+    wsTouch();
+    return true;
+  }
+  if (kind != WS_HOTSPOT && !netCount) {
+    wsFailCard("No WiFi saved yet", "RAFIQ config to add");
+    return false;
+  }
+  bleOff();
+  cfgNet = NET_WIFI;
+  wsKind = kind; wsStartMs = millis(); wsSawUp = false;
+  rtcWsKind = (kind == WS_MANUAL) ? WS_MANUAL : 0;
+  if (kind != WS_MANUAL) rtcWsUntil = 0;
+  netDown = false; netMisses = 0; netNextTry = 0; hadNet = false; netUsing = -1;
+  WiFi.persistent(false);
+  WiFi.mode(kind == WS_HOTSPOT ? WIFI_AP : WIFI_STA);
+  WiFi.setSleep(false);
+  setupWeb();
+  wsTouch();
+  Serial.printf("wifi session: %s\n", kind == WS_MANUAL ? "manual" : kind == WS_SYNC ? "sync" :
+                                      kind == WS_UPDATE ? "update" : "hotspot");
+  return true;
+}
+
+static void wsEnd(const char* why) {
+  if (cfgNet != NET_WIFI) return;
+  // Up to fifteen seconds for a fetch that is already under way. The
+  // network task runs while this waits, because this yields.
+  for (int i = 0; i < 150 && netBusy; i++) vTaskDelay(pdMS_TO_TICKS(100));
+  wantTime = false; wantWx = false; wantPrayerNow = false;
+  wantOtaLatest = false; wantOtaList = false;
+  if (upState != U_OFF) upState = U_OFF;
+  if (rescueAP) WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  rescueAP = false;
+  syncRun = false; syncStarted = false; syncUpArmed = false;
+  upAfterJoin = false; upDirect = false;
+  wsKind = WS_NONE; rtcWsUntil = 0; rtcWsKind = 0;
+  netDown = false; netMisses = 0; netUsing = -1;
+  macLinked = false;                   // the Mac was on the network that just went
+  cfgNet = cfgNetHome;
+  if (cfgNet == NET_BT) bleOn();
+  if (screen == S_WEATHER && !wxOk) screen = S_HOME;
+  if (why && *why) flash(why, 1400);
+  Serial.printf("wifi session over: %s\n", why ? why : "");
+}
+
+// A card, not a flash: it stays long enough to read, and a press
+// dismisses it. Two lines of 21.
+static void wsFailCard(const char* a, const char* b) {
+  wake("sync");
+  toastKind = "syncfail";
+  toastText = String(a) + "\n" + b;
+  toastUntil = millis() + 8000; toastFlash = millis(); remShowing = -1;
+}
+
+static bool gamePlaying() { return screen == S_GAMES && gState == GS_PLAY; }
+// Woken by you, with something waiting that arrived while it was
+// asleep. Finding Home and no sign of it is the robot keeping news to
+// itself. A tap sends it away and goes Home, a hold opens it, which is
+// what the popup already means, so this is the popup rather than a
+// screen of its own.
+static void popupOnWake() {
+  if (popOn || awayOn || tmrOn) return;
+  if (!popupSecs()) return;                  // popups are switched off
+  if (!noteN || !notes[0].unread) return;
+  if (notes[0].uid != noteSleptOn) return;   // not one you missed
+  if ((screen == S_GAMES && gState == GS_PLAY) || upState != U_OFF || alertPhase != AL_NONE) return;
+  noteSleptOn = 0;
+  popOn = true;
+  popWoke = false;                           // you are here, so it waits for you
+  popUntil = millis() + popupSecs() * 1000UL;
+}
+
+static void popupShow() {
+  if (awayOn || tmrOn) return;         // still kept in the list
+  if (!noteN || !popupSecs()) return;
+  // Never over a game being played, an update being asked, or the call
+  // to prayer. It still lands in the list.
+  if ((screen == S_GAMES && gState == GS_PLAY) || upState != U_OFF || alertPhase != AL_NONE) return;
+  popWoke = asleep || popWoke;
+  wake("notification");
+  popOn = true;
+  // Asleep, it is a glance: a second, then dark again, unless you
+  // touch it. Awake, it stays for the popup time.
+  popUntil = millis() + (popWoke ? popGlanceMs : popupSecs() * 1000UL);
+}
+static void popupClose(bool open) {
+  popOn = false;
+  if (open) {
+    notes[0].unread = false; notesDirty = true;
+    screen = S_MSG; depth = 2; noteIdx = 0; noteSel = 0;
+    popWoke = false;
+    return;
+  }
+  if (popWoke) { popWoke = false; goSleepQuick(); }
+}
+// Straight to dark, no closing eyes: after a glance nobody is watching.
+static void goSleepQuick() {
+  if (asleep) return;
+  asleep = true;
+  eyes.setIdleMode(OFF); eyes.setAutoblinker(OFF);
+  screenPower(false);
+  sleptAt = millis();
+  nSlept++;
+}
+// The bar on top says who, and from which app; the body is the
+// message. Two solid buttons at the bottom, apart, so what a tap and a
+// hold do can be read at a glance.
+static void noteHeader(const Note& n, const char* right) {
+  const char* who = noteIsCall(n) ? (n.cat == CAT_MISSED ? "Missed call" : n.cat == CAT_VOICE ? "Voicemail" : "Calling")
+                                  : (n.title[0] ? n.title : appShort(n));
+  int room = (SCRW - 6 - (int)strlen(right) * 6 - 6) / 6;
+  char l[24]; snprintf(l, sizeof(l), "%.*s", room > 0 ? (room < 23 ? room : 23) : 0, who);
+  titleBar(l, right);
+}
+static void twoButtons(const char* a, const char* b) {
+  oled.fillRoundRect(0, 53, 62, 11, 3, SSD1306_WHITE);
+  oled.fillRoundRect(66, 53, 62, 11, 3, SSD1306_WHITE);
+  oled.setTextSize(1); oled.setTextColor(SSD1306_BLACK);
+  oled.setCursor((62 - (int)strlen(a) * 6) / 2, 55);      oled.print(a);
+  oled.setCursor(66 + (62 - (int)strlen(b) * 6) / 2, 55); oled.print(b);
+  oled.setTextColor(SSD1306_WHITE);
+}
+static void drawPopup() {
+  oled.clearDisplay();
+  if (!noteN) { popOn = false; return; }
+  const Note& n = notes[0];
+  char app[12]; snprintf(app, sizeof(app), "%.8s", appShort(n));
+  if (noteIsCall(n)) marquee(n.title[0] ? n.title : "unknown", 26, 1);
+  else               fitText(n.msg[0] ? n.msg : "(no text)", 14, 50, n.at);
+  oled.fillRect(0, 0, SCRW, 13, SSD1306_BLACK);      // the frame over the text
+  oled.fillRect(0, 51, SCRW, 13, SSD1306_BLACK);
+  noteHeader(n, app);
+  if (popRinging()) twoButtons("tap:answer", "hold:deny");     // 7.8.1: fits its button
+  else              twoButtons("tap:close", "hold:open");
+  oled.display();
+}
+
+// The list is kept in flash: on Bluetooth deep sleep is every time the
+// phone is away, and a list that emptied every time would be no list.
+// Times are kept as an age, so they survive the clock starting again.
+#define NOTES_PATH "/notes.bin"
+static void saveNotes() {
+  notesDirty = false; notesSavedAt = millis();
+  if (!fsOk) return;
+  File f = LittleFS.open(NOTES_PATH, "w");
+  if (!f) return;
+  uint32_t hdr[3] = { 0x52464E31u, (uint32_t)noteN, (uint32_t)time(nullptr) };
+  f.write((const uint8_t*)hdr, sizeof(hdr));
+  uint32_t now = millis();
+  for (int i = 0; i < noteN; i++) {
+    Note c = notes[i];
+    c.at = now - notes[i].at;                    // age in ms
+    f.write((const uint8_t*)&c, sizeof(c));
+  }
+  f.close();
+}
+static void loadNotes() {
+  if (!fsOk) return;
+  File f = LittleFS.open(NOTES_PATH, "r");
+  if (!f) return;
+  uint32_t hdr[3];
+  if (f.read((uint8_t*)hdr, sizeof(hdr)) == sizeof(hdr) && hdr[0] == 0x52464E31u) {
+    uint32_t tnow = (uint32_t)time(nullptr);
+    uint32_t gone = tnow >= hdr[2] ? (tnow - hdr[2]) : 0;
+    if (gone > 30UL * 86400UL) gone = 30UL * 86400UL;
+    int n = (int)hdr[1];
+    noteN = 0;
+    for (int i = 0; i < n && i < NOTE_MAX; i++) {
+      Note c;
+      if (f.read((uint8_t*)&c, sizeof(c)) != sizeof(c)) break;
+      c.at = millis() - c.at - gone * 1000UL;    // back to this boot's millis
+      notes[noteN++] = c;
+    }
+  }
+  f.close();
+}
+
+// The message in the ordinary font, wrapped at 21 and centred. Only
+// if it is too long for the screen does it fall back to scrolling.
+static void awayText1(const char* t) {
+  int n = wrapInto(t, 21, REM_LN);
+  if (n * 10 > 50) { fitText(t, 2, 50, 0); return; }
+  int y = 2 + (50 - n * 10) / 2;
+  for (int i = 0; i < n; i++) ctr(remLines[i], y + i * 10, 1);
+}
+// Who to get in touch with: the second half of every showing.
+// Small pictures, seven by seven: a person, a handset, an envelope.
+static const uint8_t ICO_PERSON[7] = { 0x1C, 0x3E, 0x3E, 0x1C, 0x00, 0x7F, 0x7F };
+static const uint8_t ICO_PHONE[7]  = { 0x60, 0x70, 0x30, 0x18, 0x0D, 0x07, 0x03 };
+static const uint8_t ICO_MAIL[7]   = { 0x7F, 0x63, 0x55, 0x49, 0x41, 0x7F, 0x00 };
+static void icon7(int x, int y, const uint8_t* rows) {
+  for (int j = 0; j < 7; j++)
+    for (int i = 0; i < 7; i++)
+      if (rows[j] & (0x40 >> i)) oled.drawPixel(x + i, y + j, SSD1306_WHITE);
+}
+// Who to get in touch with: the second half of every showing. A small
+// heading and a line, then one thing to a row with its picture.
+static void drawContact() {
+  oled.clearDisplay();
+  ctr("GET IN TOUCH", 1, 1);
+  oled.drawFastHLine(0, 11, SCRW, SSD1306_WHITE);
+  icon7(4, 17, ICO_PERSON); at(16, 17, OWNER_NAME);
+  icon7(4, 29, ICO_PHONE);  at(16, 29, OWNER_PHONE_SHOW);
+  icon7(4, 41, ICO_MAIL);
+  const char* m = OWNER_MAIL;
+  const char* atp = strchr(m, '@');
+  if (atp) {
+    char user[22]; snprintf(user, sizeof(user), "%.*s", (int)(atp - m), m);
+    at(16, 41, user);
+    at(16, 51, atp);
+  } else at(16, 41, m);
+  oled.display();
+}
+static void drawAway() {
+  // The first half of the time it is lit, the message; the second
+  // half, who to get in touch with.
+  if ((int32_t)(millis() - lastActive) >= (int32_t)(awayShowMs / 2)) { drawContact(); return; }
+  oled.clearDisplay();
+  awayText1(awayText.length() ? awayText.c_str() : "Away");
+  if (fb.ok || timeOk) { loadBits(); ctr(fb.hm, 56, 1); }
+  oled.display();
+}
+static void awayFlush(bool all) {
+  uint32_t now = millis();
+  for (int k = 0; k < AE_N; k++) {
+    if (!aeCount[k] || (!all && now - aeLast[k] < 20000)) continue;
+    char l[24];
+    if (aeCount[k] == 1) snprintf(l, sizeof(l), "%s", AE_NAME[k]);
+    else                 snprintf(l, sizeof(l), "%s x%u", AE_NAME[k], (unsigned)aeCount[k]);
+    tlogAdd(l);
+    aeCount[k] = 0;
+  }
+}
+static void awaySet(bool on, const char* text) {
+  if (text && *text) { awayText = String(text).substring(0, 160); prefs.putString("awayt", awayText); }
+  if (on == awayOn) {
+    if (on) { awayListenUntil = millis() + AWAY_LISTEN_SENT_MS; awayShowMs = AWAY_SENT_SHOW_MS; wake("away"); lastActive = millis(); }
+    return;
+  }
+  awayOn = on;
+  prefs.putBool("away", awayOn);
+  if (on) {
+    tlogAdd("Away on");
+    popOn = false; pgUntil = 0; findUntil = 0; upState = U_OFF;
+    awayListenUntil = millis() + AWAY_LISTEN_SENT_MS;
+    awayShowMs = AWAY_SENT_SHOW_MS;
+    wake("away");
+  } else {
+    awayFlush(true);
+    tlogAdd("Away off");
+    if (awayAuto) { awayAuto = false; prefs.putBool("awaya", false); }
+    awayListenUntil = 0; rtcAwayDeep = 0;
+    screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
+    wake("shortcut");
+    flash("WELCOME BACK", 1200);
+  }
+}
+
+// Off, with only the pad and the accelerometer able to wake it, as the
+// Wake by setting allows. Never returns.
+static void awayDeepArm(bool pause) {
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  if (pause) {                                   // a move just woke it: let it settle
+    rtcAwayDeep = 2;
+    esp_sleep_enable_timer_wakeup(20ULL * 1000000ULL);
+  } else {
+    rtcAwayDeep = 1;
+    rtcAwayCheck = 0;
+    if (awayAuto) {
+      // Every 3 minutes for the first hour, every 5 after: a short look
+      // for the phone, the screen dark, then off again if it is not there.
+      uint32_t tnow = (uint32_t)time(nullptr);
+      if (!rtcAwaySince) rtcAwaySince = tnow;
+      uint32_t chk = (tnow - rtcAwaySince < 3600) ? 180 : 300;
+      esp_sleep_enable_timer_wakeup((uint64_t)chk * 1000000ULL);
+      rtcAwayCheck = 1;
+    }
+    if (touchWakes())
+      esp_deep_sleep_enable_gpio_wakeup(BIT(TOUCH_PIN), touchRest ? ESP_GPIO_WAKEUP_GPIO_LOW
+                                                                  : ESP_GPIO_WAKEUP_GPIO_HIGH);
+    if (motionWakes() && intWired)
+      esp_deep_sleep_enable_gpio_wakeup(BIT(TAP_INT_PIN), ESP_GPIO_WAKEUP_GPIO_HIGH);
+  }
+  esp_deep_sleep_start();
+}
+// Away's eyes: open or close in six frames, about a fifth of a second.
+static void awayEyes(bool open) {
+  for (int i = 0; i <= 5; i++) {
+    int pct = open ? i * 20 : 100 - i * 20;
+    oled.clearDisplay();
+    calmEyes(pct, 0, 30);
+    oled.display();
+    delay(30);
+  }
+  if (open) delay(120);                  // a beat with them open, then the message
+}
+static void awayDeepGo() {
+  awayFlush(true);
+  if (!awayQuietDeep) tlogAdd("Away asleep");
+  awayQuietDeep = false;
+  prefs.putBool("trest", touchRest);
+  const char* tz = getenv("TZ");
+  snprintf(rtcTz, sizeof(rtcTz), "%s", tz ? tz : "");
+  oled.clearDisplay(); oled.display();
+  screenPower(false);
+  bleOff();
+  if (cfgNet == NET_WIFI) { WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF); }
+  if (intWired && adxl) {                        // the same activity watch as tamper
+    wReg(adxl, 0x2E, 0x00);
+    wReg(adxl, 0x24, 6);                         // 375 mg
+    wReg(adxl, 0x27, 0xF0);                      // activity, AC coupled, x y z
+    wReg(adxl, 0x2F, 0x00);                      // to INT1
+    wReg(adxl, 0x2E, 0x10);
+    rReg(adxl, 0x30);
+    delay(20);
+  }
+  Serial.println("away: listening is over, sleeping until touched or moved");
+  awayDeepArm(false);
+}
+// First thing in setup on a wake from Away's sleep: the message for
+// three seconds, written down, and off again. No radio, nothing else.
+static void awayDeepWake(bool timer) {
+  if (rtcTz[0]) { setenv("TZ", rtcTz, 1); tzset(); }
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  prefs.begin("nexus", false);
+  touchRest  = prefs.getBool("trest", false);
+  cfgWakeBy  = constrain(prefs.getInt("wakeby", 0), 0, 2);
+  cfg12h     = prefs.getBool("h12", false);
+  awayText   = prefs.getString("awayt", "Away");
+  cfgBright  = prefs.getInt("bri", cfgBright);
+  awayAuto   = prefs.getBool("awaya", false);
+  intWired   = true;                              // it was, or this wake could not have happened
+  pinMode(TOUCH_PIN, INPUT);
+  pinMode(TAP_INT_PIN, INPUT_PULLDOWN);
+  if (timer) {                                   // the pause after a move is over
+    rReg(0x53, 0x30);
+    delay(5);
+    if (digitalRead(TAP_INT_PIN)) awayDeepArm(true);
+    awayDeepArm(false);
+  }
+  uint64_t st = esp_sleep_get_gpio_wakeup_status();
+  bool moved = (st & BIT(TAP_INT_PIN)) && !(st & BIT(TOUCH_PIN));
+  fsOk = LittleFS.begin(false);
+  tlogAdd(moved ? "Moved (away)" : "Touched (away)");
+  // Any touch shows it, no hold: whoever finds it needs to read it,
+  // and would not know to hold.
+  if (oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR, true, false)) {
+    oled.setTextWrap(false); oled.setTextColor(SSD1306_WHITE);
+    applyBright();
+    awayEyes(true);
+    oled.clearDisplay();
+    awayText1(awayText.c_str());
+    time_t t = time(nullptr);
+    if (t > 1700000000) {
+      struct tm lt; localtime_r(&t, &lt);
+      int h = lt.tm_hour;
+      if (cfg12h) { h %= 12; if (!h) h = 12; }
+      char c[8]; snprintf(c, sizeof(c), cfg12h ? "%d:%02d" : "%02d:%02d", h, lt.tm_min);
+      ctr(c, 56, 1);
+    }
+    oled.display();
+    delay(AWAY_DEEP_SHOW_MS / 2);
+    drawContact();
+    delay(AWAY_DEEP_SHOW_MS / 2);
+    awayEyes(false);
+    oled.clearDisplay(); oled.display();
+    oled.ssd1306_command(SSD1306_DISPLAYOFF);
+  }
+  LittleFS.end();
+  // Do not go back to sleep with the pad still pressed, or it wakes at
+  // once: wait for it to be let go, a few seconds at most.
+  for (int i = 0; i < 50 && digitalRead(TOUCH_PIN) != touchRest; i++) delay(100);
+  rReg(0x53, 0x30);                              // let INT1 go
+  delay(5);
+  if (digitalRead(TAP_INT_PIN) || digitalRead(TOUCH_PIN) != touchRest) awayDeepArm(true);
+  awayDeepArm(false);
+}
+
+static void tmrSet(long secs) {
+  uint32_t now = millis();
+  if (secs <= 0) {                               // taken to nothing: it is done
+    tmrOn = true; tmrDone = true; tmrDoneAt = now; tmrEnd = now;
+    wake("timer");
+    return;
+  }
+  tmrOn = true; tmrDone = false; tmrPinned = false;
+  tmrStart = now; tmrEnd = now + (uint32_t)secs * 1000UL;
+  popOn = false;
+  wake("timer");
+  Serial.printf("timer: %ld s\n", secs);
+}
+static long tmrLeft() {                          // seconds, never below zero
+  long ms = (long)(tmrEnd - millis());
+  return ms > 0 ? (ms + 999) / 1000 : 0;
+}
+static void tmrStop(const char* why) {
+  tmrOn = false; tmrDone = false; tmrPinned = false;
+  screen = S_HOME; depth = 0;
+  wake("timer");
+  if (why) flash(why, 1100);
+}
+// "timer 15", "timer +5", "timer -10". Minutes.
+static bool tmrCommand(const char* c) {
+  if (strncmp(c, "timer", 5) || (c[5] && c[5] != ' ')) return false;
+  const char* q = c + 5;
+  while (*q == ' ') q++;
+  if (!*q) return false;
+  char sign = (*q == '+' || *q == '-') ? *q : 0;
+  if (sign) q++;
+  while (*q == ' ') q++;
+  if (!isdigit((unsigned char)*q)) return false;
+  long m = atol(q);
+  if (m > 600) m = 600;                          // ten hours is plenty
+  if (!sign) { tmrSet(m * 60); return true; }
+  long left = (tmrOn && !tmrDone) ? tmrLeft() : 0;
+  tmrSet(sign == '+' ? left + m * 60 : left - m * 60);
+  return true;
+}
+// The rhythm: over five minutes left, five seconds lit each minute;
+// one to five minutes, five on and fifteen off; the last minute, always.
+// A touch pins it on; another lets it go back to the rhythm.
+static bool tmrWantsScreen() {
+  if (tmrDone || tmrPinned) return true;
+  long left = tmrLeft();
+  if (left <= 60) return true;
+  uint32_t t = (millis() - tmrStart) / 1000;
+  if (left <= 300) return (t % 20) < 5;
+  return (t % 60) < 5;
+}
+static void tmrTouch() {
+  if (tmrDone) { tmrStop(nullptr); return; }     // the flash is seen: done
+  tmrPinned = !tmrPinned;
+}
+static void tmrTick() {
+  if (!tmrOn) return;
+  uint32_t now = millis();
+  if (!tmrDone && (long)(now - tmrEnd) >= 0) {
+    tmrDone = true; tmrDoneAt = now;
+    Serial.println("timer: done");
+  }
+  bool want = tmrWantsScreen();
+  if (want && asleep)   wake("timer");
+  if (!want && !asleep) goSleepQuick();
+}
+static void drawTimer() {
+  oled.clearDisplay();
+  if (tmrDone) {
+    bool b = (millis() / 350) % 2;
+    if (b) oled.fillRect(0, 0, SCRW, SCRH, SSD1306_WHITE);
+    oled.setTextColor(b ? SSD1306_BLACK : SSD1306_WHITE);
+    ctr("TIME'S UP", 18, 2);
+    ctr("touch to stop", 46, 1);
+    oled.setTextColor(SSD1306_WHITE);
+    oled.display();
+    return;
+  }
+  // 7.3: a ring that fills as the time goes, the time inside it, and
+  // what is left and when it ends beside it. Small type, laid out.
+  ringInit();
+  long left = tmrLeft();
+  long total = (long)((tmrEnd - tmrStart) / 1000);
+  char b[16];
+  at(0, 1, "TIMER");
+  if (tmrPinned) oled.fillCircle(36, 4, 2, SSD1306_WHITE);   // held on by a touch
+  if (total >= 3600) snprintf(b, sizeof(b), "%ldh %02ldm", total / 3600, (total / 60) % 60);
+  else               snprintf(b, sizeof(b), "%ld min", (total + 59) / 60);
+  at(SCRW - (int)strlen(b) * 6, 1, b);
+  oled.drawFastHLine(0, 11, SCRW, SSD1306_WHITE);
+  const int cx = 32, cy = 38, r = 23;
+  for (int k = 0; k < 180; k += 4) ringPx(cx, cy, r, k);          // the track, dotted
+  int upto = total > 0 ? (int)(180L * (total - left) / total) : 180;
+  for (int k = 0; k < upto; k++) { ringPx(cx, cy, r, k); ringPx(cx, cy, r - 1, k); ringPx(cx, cy, r - 2, k); }
+  if (left >= 3600) snprintf(b, sizeof(b), "%ldh%02ld", left / 3600, (left / 60) % 60);
+  else              snprintf(b, sizeof(b), "%02ld:%02ld", left / 60, left % 60);
+  at(cx - (int)strlen(b) * 3, cy - 3, b);
+  at(66, 22, "left");
+  fmtDur(left, b, sizeof(b));
+  at(66, 32, b);
+  if (timeOk) {
+    at(66, 46, "ends");
+    fmtClock(time(nullptr) + left, b, sizeof(b));
+    at(66, 56, b);
+  }
+  oled.display();
+}
+
+// A ring, worked out once: 180 points, 2 degrees apart, cos and sin
+// times 1024. The C3 has no floating point unit, so nothing per frame.
+static int16_t ringC[180], ringS[180];
+static bool ringReady = false;
+static void ringInit() {
+  if (ringReady) return;
+  for (int k = 0; k < 180; k++) {
+    float t = (k * 2 - 90) * 3.14159265f / 180.0f;
+    ringC[k] = (int16_t)lroundf(cosf(t) * 1024.0f);
+    ringS[k] = (int16_t)lroundf(sinf(t) * 1024.0f);
+  }
+  ringReady = true;
+}
+static void ringPx(int cx, int cy, int r, int k) {
+  oled.drawPixel(cx + (r * ringC[k] + (ringC[k] >= 0 ? 512 : -512)) / 1024,
+                 cy + (r * ringS[k] + (ringS[k] >= 0 ? 512 : -512)) / 1024, SSD1306_WHITE);
+}
+static void fmtDur(long s, char* b, size_t n) {
+  if (s >= 3600)     snprintf(b, n, "%ldh %02ldm", s / 3600, (s / 60) % 60);
+  else if (s >= 60)  snprintf(b, n, "%ldm %02lds", s / 60, s % 60);
+  else               snprintf(b, n, "%lds", s);
+}
+static void fmtClock(time_t t, char* b, size_t n) {
+  struct tm lt; localtime_r(&t, &lt);
+  if (cfg12h) snprintf(b, n, "%d:%02d %s", lt.tm_hour % 12 ? lt.tm_hour % 12 : 12, lt.tm_min, lt.tm_hour < 12 ? "AM" : "PM");
+  else        snprintf(b, n, "%02d:%02d", lt.tm_hour, lt.tm_min);
+}
+
+// One setting, by the name the page and the apps use. WiFi and
+// Bluetooth both come here (7.4), so they can never disagree.
+static bool cfgApply(const String& k, int v) {
+    if      (k == "bri")  { cfgBright   = constrain(v, 0, 255);           prefs.putInt("bri", cfgBright);   applyBright(); }
+    else if (k == "face") { cfgFace     = constrain(v, 0, FACE_N - 1);    prefs.putInt("face", cfgFace); }
+    else if (k == "slpi") { cfgSleepIdx = constrain(v, 0, SLEEP_N - 1);   prefs.putInt("slpi", cfgSleepIdx); }
+    else if (k == "popi") { cfgPopupIdx = constrain(v, 0, POPUP_N - 1);   prefs.putInt("popi", cfgPopupIdx); }
+    else if (k == "eye")  { cfgEyes     = constrain(v, 0, STYLE_N - 1);   prefs.putInt("eye", cfgEyes); applyEyes(cfgEyes); }
+    // Reachable from the app on purpose. The pad is the only thing
+    // driving this now, so if the pad ever stops there has to be a way
+    // back in that does not involve the pad, and the network is it.
+    else if (k == "knock"){ cfgKnock    = (v != 0);                      prefs.putBool("knock", cfgKnock); }
+    else if (k == "bike") { cfgBike     = (v != 0);                      prefs.putBool("bike", cfgBike); }
+    else if (k == "btpl") { cfgBikeTpl  = constrain(v, 0, BIKE_TPL_N - 1); prefs.putInt("btpl", cfgBikeTpl); }
+    // WiFi is a session, never a home. Asking for it here keeps this
+    // session going until a restart; asking for Bluetooth or Off makes
+    // that home and ends the session once this answer has gone out.
+    else if (k == "net" || k == "offl") {
+                            int want = (k == "offl") ? (v ? NET_OFF : NET_BT) : constrain(v, 0, NET_N - 1);
+                            if (want == NET_WIFI) wsStart(WS_MANUAL);
+                            else {
+                              cfgNetHome = want; prefs.putInt("net", cfgNetHome);
+                              if (cfgNet == NET_WIFI) wsEndWant = true;
+                              else { cfgNet = want; if (want == NET_BT) bleOn(); else bleOff(); }
+                            } }
+    else if (k == "hadj") { cfgHijriAdj = constrain(v, -2, 2);           prefs.putInt("hadj", cfgHijriAdj); }
+    else if (k == "shake"){ cfgBack = v ? BACK_BOTH : BACK_KNOCK;        prefs.putInt("back", cfgBack); }
+    else if (k == "back") { cfgBack = constrain(v, 0, BACK_N - 1);       prefs.putInt("back", cfgBack); }
+    else if (k == "wakeh"){ cfgWakeIdx = constrain(v, 0, WAKE_N - 1);    prefs.putInt("wakeh", cfgWakeIdx); }
+    // Not written to flash. See cfgGesture: it belongs to the Mac.
+    else if (k == "gest") { cfgGesture = (v != 0); if (cfgGesture) wake("gesture"); }
+    else if (k == "gsrc") { cfgGestSrc = constrain(v, 0, GSRC_N - 1); }
+    else if (k == "deepi"){ cfgDeepIdx  = constrain(v, 0, DEEP_N - 1);   prefs.putInt("deepi", cfgDeepIdx); }
+    // Sent in hundredths, because the form only carries whole numbers.
+    else if (k == "bfull"){ battFull    = constrain(v / 100.0f, 3.90f, 4.30f); prefs.putFloat("bfull", battFull); }
+    else if (k == "night") { cfgNight = v != 0; prefs.putBool("night", cfgNight); }
+    else if (k == "plock") { cfgPLock = constrain(v, 0, 3); prefs.putInt("plock", cfgPLock); }
+    else if (k == "blog")  { cfgBlog = v != 0; prefs.putBool("blog", cfgBlog); if (cfgBlog && blog.magic != BLOG_MAGIC) blogReset(); }
+    else if (k == "blogv") { cfgBlogV = constrain(v, 0, 3); prefs.putInt("blogv", cfgBlogV); blogArmed = true; }
+    else if (k == "cap")   { cfgCap = constrain(v, 50, 5000); prefs.putInt("cap", cfgCap); }
+    else if (k == "blogreset") { blogReset(); blogSave(); }
+    else if (k == "bed")   { cfgBed = constrain(v, 0, 1439); prefs.putInt("bed", cfgBed); }
+    else return false;
+  return true;
+}
+
+// The settings the apps show, with /api/state's own names, so the apps
+// read this exactly as they read that. Kept under 512 bytes (the most a
+// Bluetooth value can be): networks go last and stop when it is full.
+static String cfgJson() {
+  String o;
+  o.reserve(512);
+  long dl = dndUntil && (long)(dndUntil - millis()) > 0 ? (long)(dndUntil - millis()) / 1000 : 0;
+  o += "{\"fw\":\"" FW_VERSION "\",\"bri\":" + String(cfgBright) + ",\"face\":" + String(cfgFace) +
+       ",\"slpi\":" + String(cfgSleepIdx) + ",\"popi\":" + String(cfgPopupIdx) +
+       ",\"eye\":" + String(cfgEyes) + ",\"tap\":" + String(cfgTap) +
+       ",\"deepi\":" + String(cfgDeepIdx) + ",\"btpl\":" + String(cfgBikeTpl) +
+       ",\"knock\":" + String(cfgKnock ? "true" : "false") +
+       ",\"shake\":" + String(cfgBack == BACK_BOTH ? "true" : "false") +
+       ",\"bike\":" + String(cfgBike ? "true" : "false") +
+       ",\"follow\":" + String(cfgFollow ? "true" : "false") +
+       ",\"relax\":" + String(relaxOn ? "true" : "false") +
+       ",\"gesture\":" + String(cfgGesture ? "true" : "false") +
+       ",\"deepOff\":" + String(deepOff ? "true" : "false") +
+       ",\"autoUp\":" + String(cfgAutoUp ? "true" : "false") +
+       ",\"turn\":" + String(cfgAutoTurn ? "true" : "false") +
+       ",\"offline\":" + String(cfgNetHome == NET_OFF ? "true" : "false") +
+       ",\"intWired\":" + String(intWired ? "true" : "false") +
+       ",\"night\":" + String(cfgNight ? "true" : "false") +
+       ",\"bed\":" + String(cfgBed) + ",\"npush\":" + String(nightPush) +
+       ",\"dndLeft\":" + String(dl) +
+       ",\"battPct\":" + String(isnan(battV) ? -1 : battPct(battV)) +
+       ",\"battFull\":" + String(battFull, 2) +
+       ",\"netMax\":" + String(NET_MAX) + ",\"nets\":[";
+  for (int i = 0; i < netCount; i++) {
+    String nm = String(netSsid[i]); nm.replace("\\", " "); nm.replace("\"", "'");
+    String one = String(i ? "," : "") + "{\"ssid\":\"" + nm + "\",\"on\":false}";
+    if (o.length() + one.length() + 3 > 510) break;
+    o += one;
+  }
+  o += "]}";
+  return o;
+}
+
+// "!" commands: only from the apps, never a Shortcut, because they reach
+// settings, networks and the pointer. They do what the HTTP calls of the
+// same names do.
+static int remBatch = 0;
+static uint32_t remBatchAt = 0, remBatchSoonest = 0;
+static void appBang(char* c, uint16_t conn) {
+  char* a = c + 1;                                 // after the "!"
+  char* sp = strchr(a, ' ');
+  String verb = sp ? String(a).substring(0, sp - a) : String(a);
+  const char* rest = sp ? sp + 1 : "";
+  if (verb == "cfg") {
+    char k[12] = ""; int v = 0;
+    if (sscanf(rest, "%11s %d", k, &v) == 2) cfgApply(String(k), v);
+  } else if (verb == "relax") {
+    relaxOn = atoi(rest) != 0; relaxUntil = 0;
+    if (relaxOn) { relaxKind = 0; relaxNext = millis() + 30000UL; wake("relax"); }
+  } else if (verb == "follow") {
+    cfgFollow = atoi(rest) != 0;
+    prefs.putBool("follow", cfgFollow);
+    if (cfgFollow) wake("follow"); else curUntil = 0;
+    // a quicker link while the eyes follow, back to the light one after
+    NimBLEServer* sv = NimBLEDevice::getServer();
+    if (sv) sv->updateConnParams(conn, cfgFollow ? 24 : 72, cfgFollow ? 40 : 96, cfgFollow ? 0 : 4, cfgFollow ? 400 : 600);
+  } else if (verb == "dnd") {
+    int mm = constrain(atoi(rest), 0, 480);
+    dndUntil = mm ? millis() + (unsigned long)mm * 60000UL : 0;
+    dndLine = (int)random(DND_N);
+    if (mm) wake("break");
+  } else if (verb == "busy") {
+    int cm = 0, mi = 0, mu = -1;
+    sscanf(rest, "%d %d %d", &cm, &mi, &mu);
+    if ((cm || mi) && !(busyCam || busyMic)) { busyAt = millis(); wake("live"); }
+    busyCam = cm; busyMic = mi;
+    if (mu >= 0) gestMuted = mu != 0;
+  } else if (verb == "tap") {
+    cfgTap = constrain(atoi(rest), 0, TAP_N - 1); prefs.putInt("tap", cfgTap); applyTap();
+  } else if (verb == "deep") {
+    deepOff = atoi(rest) != 0; prefs.putBool("nodeep", deepOff);
+  } else if (verb == "autoup") {
+    cfgAutoUp = atoi(rest) != 0; prefs.putBool("autoup", cfgAutoUp);
+  } else if (verb == "turn") {
+    cfgAutoTurn = atoi(rest) != 0; prefs.putBool("turn", cfgAutoTurn);
+  } else if (verb == "bike") {                     // plate \x1F make \x1F model \x1F owner
+    char* f[4] = { (char*)rest, nullptr, nullptr, nullptr };
+    int k = 1;
+    for (char* p = (char*)rest; *p && k < 4; p++) if (*p == 0x1F) { *p = 0; f[k++] = p + 1; }
+    struct { char* dst; size_t n; const char* pref; } D[] = {
+      { bikePlate, sizeof(bikePlate), "bplate" }, { bikeMake, sizeof(bikeMake), "bmake" },
+      { bikeModel, sizeof(bikeModel), "bmodel" }, { bikeOwner, sizeof(bikeOwner), "bowner" } };
+    for (int i = 0; i < k && i < 4; i++) {
+      if (!f[i] || !*f[i]) continue;
+      snprintf(D[i].dst, D[i].n, "%s", f[i]);
+      prefs.putString(D[i].pref, D[i].dst);
+    }
+  } else if (verb == "net") {                      // add ssid\x1Fpass | del i | up i
+    if (!strncmp(rest, "add ", 4)) {
+      String ss = String(rest + 4), pw = "";
+      int sep = ss.indexOf((char)0x1F);
+      if (sep >= 0) { pw = ss.substring(sep + 1); ss = ss.substring(0, sep); }
+      ss.trim();
+      if (ss.length()) {
+        int at = -1;
+        for (int i = 0; i < netCount; i++) if (ss == netSsid[i]) { at = i; break; }
+        if (at < 0 && netCount < NET_MAX) at = netCount++;
+        if (at >= 0) {
+          strncpy(netSsid[at], ss.c_str(), 32); netSsid[at][32] = 0;
+          strncpy(netPass[at], pw.c_str(), 64); netPass[at][64] = 0;
+          saveNets(); netReload = true;
+          flash("NETWORK SAVED", 1000);
+        } else flash("NETWORKS FULL", 1200);
+      }
+    } else if (!strncmp(rest, "del ", 4)) {
+      int d = atoi(rest + 4);
+      if (d >= 0 && d < netCount) {
+        for (int i = d; i < netCount - 1; i++) { strncpy(netSsid[i], netSsid[i + 1], 33); strncpy(netPass[i], netPass[i + 1], 65); }
+        netCount--; netSsid[netCount][0] = netPass[netCount][0] = 0;
+        saveNets(); netReload = true;
+      }
+    } else if (!strncmp(rest, "up ", 3)) {
+      int u = atoi(rest + 3);
+      if (u > 0 && u < netCount) {
+        char ts[33], tp[65];
+        strncpy(ts, netSsid[u], 33); strncpy(tp, netPass[u], 65);
+        strncpy(netSsid[u], netSsid[u - 1], 33); strncpy(netPass[u], netPass[u - 1], 65);
+        strncpy(netSsid[u - 1], ts, 33); strncpy(netPass[u - 1], tp, 65);
+        saveNets(); netReload = true;
+      }
+    }
+  } else if (verb == "card") {          // slot title \x1F line \x1F line \x1F line \x1F bar
+    int slot = atoi(rest);
+    if (slot < 0 || slot > 2) return;
+    const char* p = strchr(rest, ' ');
+    Card& cd = cards[slot];
+    memset(&cd, 0, sizeof(cd)); cd.bar = -1;
+    if (!p || !p[1]) return;                       // no text: the card is gone
+    char* f[5] = { (char*)p + 1, nullptr, nullptr, nullptr, nullptr };
+    int k = 1;
+    for (char* q = (char*)p + 1; *q && k < 5; q++) if (*q == 0x1F) { *q = 0; f[k++] = q + 1; }
+    snprintf(cd.title, sizeof(cd.title), "%.21s", f[0]);
+    for (int i = 0; i < 3; i++) if (k > i + 1 && f[i + 1]) snprintf(cd.line[i], sizeof(cd.line[i]), "%.23s", f[i + 1]);
+    if (k > 4 && f[4]) cd.bar = (int8_t)constrain(atoi(f[4]), -1, 100);
+    cd.on = true;
+  } else if (verb == "knob") {
+    knobOn = atoi(rest) != 0;
+  } else if (verb == "walk") {
+    walkOn = atoi(rest) != 0;
+  } else if (verb == "bye") {                      // the Mac is going to sleep: not left behind
+    macBye = true;
+  } else if (verb == "dim") {
+    macDim = atoi(rest) != 0; applyBright();
+  } else if (verb == "mute" || verb == "vip") {    // the whole list, \x1F between
+    bool vip = verb == "vip";
+    char tmp[MUTE_N][20]; int n = 0;
+    const char* a = rest;
+    while (*a && n < (vip ? VIP_N : MUTE_N)) {
+      const char* b = strchr(a, 0x1F); size_t L = b ? (size_t)(b - a) : strlen(a);
+      if (L) { snprintf(tmp[n], 20, "%.*s", (int)(L < 19 ? L : 19), a); n++; }
+      if (!b) break; a = b + 1;
+    }
+    if (vip) { vipN = n; for (int i = 0; i < n; i++) memcpy(vipWords[i], tmp[i], 20); listSave("vipw", tmp, n); }
+    else     { mutedN = n; for (int i = 0; i < n; i++) memcpy(mutedApps[i], tmp[i], 20); listSave("mutea", mutedApps, mutedN); }
+  } else if (verb == "pt") {                       // five prayer times, minutes after midnight
+    int v[5];
+    if (sscanf(rest, "%d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4]) == 5) {
+      for (int i = 0; i < 5; i++) prayerMin[i] = constrain(v[i], 0, 1439);
+      struct tm t; if (nowLocal(&t)) prayerDay = t.tm_yday;
+      savePrayer();
+    }
+  } else if (verb == "ota") {
+    if (!strncmp(rest, "begin ", 6)) {
+      uint32_t sz = strtoul(rest + 6, nullptr, 10);
+      if (otaOn) Update.abort();
+      if (sz < 100000 || !Update.begin(sz)) { evtSend("ota err begin"); flash("NO ROOM", 1200); return; }
+      otaOn = true; otaErr = false; otaSize = sz; otaGot = 0; otaLastAt = millis(); otaPctSent = -1;
+      otaConn = conn;
+      NimBLEServer* sv = NimBLEDevice::getServer();
+      if (sv) sv->updateConnParams(conn, 6, 12, 0, 400);   // as fast as the link goes
+      pmSet(false);
+      wake("update");
+      evtSend("ota ready");
+    } else if (!strcmp(rest, "end")) {
+      if (!otaOn) return;
+      if (otaErr || otaGot != otaSize) { otaStop(otaErr ? "write" : "short"); return; }
+      if (!Update.end(true)) { otaOn = false; evtSend("ota err verify"); flash("UPDATE BAD", 1400); return; }
+      otaOn = false;
+      evtSend("ota ok");
+      flash("UPDATED", 900);
+      delay(600);
+      ESP.restart();
+    } else if (!strcmp(rest, "abort")) {
+      otaStop("abort");
+    }
+  } else if (verb == "night") {                    // "!night 60": tonight, an hour later
+    nightPush = constrain(nightPush + constrain(atoi(rest), 0, 240), 0, 360);
+    nightCardUntil = 0;
+    char b[24]; snprintf(b, sizeof(b), "SLEEP AT %02d:%02d", ((cfgBed + nightPush) % 1440) / 60, ((cfgBed + nightPush) % 1440) % 60);
+    flash(b, 1300);
+  } else if (verb == "remclear") {
+    remCount = 0; remIdx = 0; saveRems();
+  } else if (verb == "rem") {                      // wall-seconds done text
+    // The app sends the time as a wall clock (local seconds). The robot's
+    // own clock is either the phone's wall clock (Bluetooth) or real time
+    // with a zone (WiFi); the difference between the two is the offset.
+    unsigned long wall = 0; int done = 0, used = 0;
+    if (sscanf(rest, "%lu %d %n", &wall, &done, &used) >= 2 && used > 0 && wall > 1700000000UL) {
+      time_t now = time(nullptr); struct tm lt; localtime_r(&now, &lt);
+      long off = (long)(utcFromTm(&lt) - now);
+      uint32_t at = (uint32_t)((long)wall - off);
+      String txt = String(rest + used); txt.trim();
+      bool dup = false;
+      for (int k = 0; k < remCount; k++)
+        if (rems[k].at / 60 == at / 60 && txt == rems[k].text) { dup = true; break; }
+      if (!dup && txt.length() && addRem(txt.c_str(), at)) {
+        if (done) rems[remCount - 1].done = true;
+        remBatch++; remBatchAt = millis();
+        if (!done && (!remBatchSoonest || at < remBatchSoonest)) remBatchSoonest = at;
+      }
+    }
+  }
+}
+
+// Lean left or right sends once, then waits to come back to the middle.
+// Holding the pad with the knob on turns tilt into a dial instead: the
+// angle from where the hold began, sent as it changes.
+static void gestTilt() {
+  if (!cfgGesture || !linkN) { leanState = 0; return; }
+  uint32_t now = millis();
+  if (now - knobAt < 80) return;
+  knobAt = now;
+  float tx, ty; tiltRead(tx, ty);
+  if (touchOn && knobOn) {
+    float deg = asinf(constrain(tx, -0.99f, 0.99f)) * 57.3f;
+    if (!knobUsed && fabsf(deg - knobRef) < 6) { if (knobLast == 0) knobRef = deg; }
+    int rel = (int)lroundf(deg - knobRef);
+    if (abs(rel) >= 6) knobUsed = true;
+    if (knobUsed && abs(rel - knobLast) >= 3) {
+      knobLast = rel;
+      char b[16]; snprintf(b, sizeof(b), "kv %d", rel);
+      evtSend(b);
+    }
+    return;
+  }
+  knobLast = 0;
+  if (leanState == 0 && tx > 0.35f)       { leanState = 1;  sendTap("lr"); }
+  else if (leanState == 0 && tx < -0.35f) { leanState = -1; sendTap("ll"); }
+  else if (leanState != 0 && fabsf(tx) < 0.15f) leanState = 0;
+}
+
+// ---- app filter and VIPs ----
+static void listLoad(const char* key, char (*dst)[20], int max, int& n) {
+  n = 0;
+  String v = prefs.getString(key, "");
+  int a = 0;
+  while (a < (int)v.length() && n < max) {
+    int b = v.indexOf((char)0x1F, a); if (b < 0) b = v.length();
+    String one = v.substring(a, b); one.trim();
+    if (one.length()) { snprintf(dst[n], 20, "%s", one.c_str()); n++; }
+    a = b + 1;
+  }
+}
+static void filtersLoad() {
+  listLoad("seena", seenApps, APPS_N, seenN);
+  listLoad("mutea", mutedApps, MUTE_N, mutedN);
+  listLoad("vipw", vipWords, VIP_N, vipN);
+}
+static void listSave(const char* key, char (*src)[20], int n) {
+  String v;
+  for (int i = 0; i < n; i++) { if (i) v += (char)0x1F; v += src[i]; }
+  prefs.putString(key, v);
+}
+static bool hasWord(const char* hay, const char* w) {
+  size_t L = strlen(w); if (!L) return false;
+  for (const char* p = hay; *p; p++) {
+    size_t i = 0;
+    while (i < L && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)w[i])) i++;
+    if (i == L) return true;
+  }
+  return false;
+}
+static bool noteVip(const Note& n) {
+  for (int i = 0; i < vipN; i++)
+    if (hasWord(n.title, vipWords[i]) || hasWord(n.msg, vipWords[i]) || hasWord(n.app, vipWords[i])) return true;
+  return false;
+}
+// Seen once, remembered, so the apps can offer it to switch off.
+static void seenApp(const char* a) {
+  for (int i = 0; i < seenN; i++) if (!strcasecmp(seenApps[i], a)) return;
+  if (seenN == APPS_N) { for (int i = 0; i < APPS_N - 1; i++) memcpy(seenApps[i], seenApps[i + 1], 20); seenN--; }
+  snprintf(seenApps[seenN++], 20, "%s", a);
+  listSave("seena", seenApps, seenN);
+}
+// False: dropped, never stored or shown. A VIP always comes through.
+static bool noteAllowed(const Note& n) {
+  const char* a = appShort(n);
+  seenApp(a);
+  if (noteVip(n)) return true;
+  for (int i = 0; i < mutedN; i++) if (!strcasecmp(mutedApps[i], a)) return false;
+  return true;
+}
+static String lstJson() {
+  String o = "{\"apps\":[";
+  for (int i = 0; i < seenN; i++) { if (i) o += ","; o += "\""; o += seenApps[i]; o += "\""; }
+  o += "],\"muted\":[";
+  for (int i = 0; i < mutedN; i++) { if (i) o += ","; o += "\""; o += mutedApps[i]; o += "\""; }
+  o += "],\"vip\":[";
+  for (int i = 0; i < vipN; i++) { if (i) o += ","; o += "\""; o += vipWords[i]; o += "\""; }
+  o += "]}";
+  if (o.length() > 510) o = o.substring(0, 500) + "]}";
+  return o;
+}
+
+// ---- a call ringing on the popup: tap answers, hold declines ----
+static bool popRinging() {
+  if (!noteN) return false;
+  const Note& n = notes[0];
+  return n.cat == CAT_CALL && n.uid < 0x40000000UL && ancsState == ANCS_READY && millis() - n.at < 60000UL;
+}
+
+// ---- the Mac screen ----
+static int macItems(int* idx) {        // what a hold can tick off: pinned, then the three
+  int k = 0;
+  if (cards[2].on && cards[2].line[0][0]) idx[k++] = 0;
+  if (cards[1].on) for (int i = 0; i < 3; i++) if (cards[1].line[i][0]) idx[k++] = i + 1;
+  return k;
+}
+static void drawMac() {
+  oled.clearDisplay();
+  char tb[8]; clockStr(tb, sizeof(tb), false);
+  if (depth == 0) {
+    titleBar("MAC", tb);
+    int y = 14;
+    if (cards[2].on && cards[2].line[0][0]) { char b[24]; snprintf(b, sizeof(b), "> %.19s", cards[2].line[0]); at(0, y, b); y += 12; }
+    if (cards[1].on) for (int i = 0; i < 3 && y <= 38; i++) if (cards[1].line[i][0]) {
+      char b[24]; snprintf(b, sizeof(b), "o %.19s", cards[1].line[i]); at(0, y, b); y += 12; }
+    if (y == 14 && !cards[0].on) ctr("nothing from the Mac", 30, 1);
+    if (cards[0].on && cards[0].line[0][0]) {
+      oled.drawFastHLine(0, 51, SCRW, SSD1306_WHITE);
+      ctr(cards[0].line[0], 54, 1);
+    }
+  } else {
+    int idx[4]; int k = macItems(idx);
+    titleBar("DONE?", tb);
+    if (!k) { ctr("nothing to tick off", 30, 1); oled.display(); return; }
+    if (macSel >= k) macSel = 0;
+    for (int r = 0; r < k; r++) {
+      int y = 14 + r * 12;
+      const char* t = idx[r] == 0 ? cards[2].line[0] : cards[1].line[idx[r] - 1];
+      if (r == macSel) { oled.fillRect(0, y - 2, SCRW, 12, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
+      char b[24]; snprintf(b, sizeof(b), "%s%.19s", idx[r] == 0 ? "> " : "o ", t);
+      at(0, y, b); oled.setTextColor(SSD1306_WHITE);
+    }
+  }
+  oled.display();
+}
+static bool cardsAny() { return cards[0].on || cards[1].on || cards[2].on; }
+
+// ---- Mac left behind ----
+static void drawWalk() {
+  oled.clearDisplay();
+  bool on = (millis() / 500) % 2;
+  if (on) oled.drawRoundRect(0, 0, SCRW, SCRH, 6, SSD1306_WHITE);
+  ctr("YOUR MAC", 12, 2);
+  ctr("is left behind", 36, 1);
+  ctr("touch to dismiss", 52, 1);
+  oled.display();
+}
+
+// ---- update over Bluetooth ----
+static void drawBleOta() {
+  oled.clearDisplay();
+  titleBarC("UPDATE");
+  ctr("from your Mac", 16, 1);
+  int pct = otaSize ? (int)((uint64_t)otaGot * 100 / otaSize) : 0;
+  oled.drawRoundRect(8, 30, 112, 10, 3, SSD1306_WHITE);
+  oled.fillRoundRect(10, 32, (108 * pct) / 100, 6, 2, SSD1306_WHITE);
+  char b[8]; snprintf(b, sizeof(b), "%d%%", pct);
+  ctr(b, 46, 1);
+  oled.display();
+}
+static void otaStop(const char* why) {
+  if (otaOn) Update.abort();
+  otaOn = false;
+  char b[32]; snprintf(b, sizeof(b), "ota err %s", why); evtSend(b);
+  Serial.printf("ota over bluetooth stopped: %s\n", why);
+  flash("UPDATE STOPPED", 1400);
+}
+
+// An icon in the current colour, at 1x or 2x.
+static void uiIcon(int x, int y, const uint8_t* ic, int scale, uint16_t col) {
+  for (int j = 0; j < 8; j++)
+    for (int i = 0; i < 8; i++)
+      if (ic[j] & (0x80 >> i)) oled.fillRect(x + i * scale, y + j * scale, scale, scale, col);
+}
+// The scrollbar: a 2 px track, the thumb as long as the share in view.
+static void uiScroll(int first, int total) {
+  if (total <= UI_ROWS) return;
+  const int top = UI_BAR_H + 2, h = SCRH - top - 1;
+  int th = max(6, h * UI_ROWS / total);
+  int ty = top + (h - th) * first / (total - UI_ROWS);
+  oled.drawFastVLine(SCRW - 1, top, h, SSD1306_WHITE);
+  oled.fillRect(SCRW - 2, ty, 2, th, SSD1306_WHITE);
+}
+// The first row in view, keeping the chosen one inside the window.
+static int uiFirst(int sel, int total) {
+  int first = sel > UI_ROWS - 1 ? sel - (UI_ROWS - 1) : 0;
+  if (first > total - UI_ROWS) first = total - UI_ROWS;
+  return first < 0 ? 0 : first;
+}
+// One row: icon (or none), label, value right-aligned, chosen or not.
+static void uiRow(int r, const uint8_t* ic, const char* label, const char* value, bool on, bool scrolled) {
+  int y = UI_ROW_Y + r * UI_ROW_H;
+  uint16_t fg = on ? SSD1306_BLACK : SSD1306_WHITE;
+  if (on) oled.fillRoundRect(1, y - 2, SCRW - 2 - (scrolled ? 3 : 0), UI_ROW_H, 2, SSD1306_WHITE);
+  int tx = UI_PAD + 1;
+  if (ic) { uiIcon(UI_PAD + 1, y, ic, 1, fg); tx = UI_TEXT_X + 1; }
+  oled.setTextColor(fg);
+  int room = (SCRW - tx - UI_PAD - (scrolled ? 5 : 0)) / 6;
+  int vlen = value && *value ? (int)strlen(value) : 0;
+  char b[22]; snprintf(b, sizeof(b), "%.*s", max(0, room - (vlen ? vlen + 1 : 0)), label);
+  at(tx, y, b);
+  if (vlen) at(SCRW - UI_PAD - (scrolled ? 5 : 0) - vlen * 6, y, value);
+  oled.setTextColor(SSD1306_WHITE);
+}
+
+// ---- the hubs (state and kinds are with the design rules, at the top) ----
+static bool isHub(int s) { return s == S_TODAY || s == S_FHUB || s == S_CALM; }
+static int hubItems(int s, HubIt* o) {
+  int n = 0;
+  if (s == S_TODAY) {
+    o[n++] = { HI_SCREEN, (uint8_t)S_MSG, IC_BELL, "Notifications" };
+    o[n++] = { HI_SCREEN, (uint8_t)S_REMIND, IC_CHECK, "Reminders" };
+    if (cardsAny()) o[n++] = { HI_SCREEN, (uint8_t)S_FOCUS, IC_MAC, "Mac" };
+    if (screenOn_(S_WEATHER)) o[n++] = { HI_SCREEN, (uint8_t)S_WEATHER, IC_SUN, "Weather" };
+    if (cfgBike) o[n++] = { HI_SCREEN, (uint8_t)S_BIKE, IC_CAR, "Vehicle" };
+  } else if (s == S_FHUB) {
+    o[n++] = { HI_SCREEN, (uint8_t)S_PRAYER, IC_MOON, "Prayer times" };
+    o[n++] = { HI_FAITH, F_ZIKR, IC_BEADS, "Zikr" };
+    o[n++] = { HI_ADHKAR, 0, IC_DAWN, "Adhkar" };
+    o[n++] = { HI_FAITH, F_QURAN, IC_BOOK, "Quran" };
+    o[n++] = { HI_FAITH, F_NAMES, IC_STAR, "99 Names" };
+    o[n++] = { HI_PSET, 0, IC_SLIDE, "Prayer settings" };
+  } else if (s == S_CALM) {
+    o[n++] = { HI_RELAX, 0, IC_LEAF, "Relax" };
+    o[n++] = { HI_SCREEN, (uint8_t)S_READS, IC_PAGE, "Short reads" };
+    o[n++] = { HI_SCREEN, (uint8_t)S_GAMES, IC_PAD, "Games" };
+  }
+  return n;
+}
+static int hubCount(int s) { HubIt t[8]; return hubItems(s, t); }
+static const uint8_t* hubIcon(int s) {
+  return s == S_TODAY ? IC_BELL : s == S_FHUB ? IC_MOON : s == S_CALM ? IC_LEAF : IC_SLIDE;
+}
+static bool prayerSoon(int mins) {
+  if (!prayerOk) return false;
+  struct tm t; if (!nowLocal(&t)) return false;
+  int now = t.tm_hour * 60 + t.tm_min;
+  for (int i = 0; i < 5; i++) {
+    int p = prayerAt(i); if (p < 0) continue;
+    int d = p - now; if (d < 0) d += 1440;
+    if (d <= mins) return true;
+  }
+  return false;
+}
+// A value for a menu row: the count or the reading that matters.
+static void hubValue(const HubIt& it, char* v, size_t n) {
+  v[0] = 0;
+  if (it.kind != HI_SCREEN) return;
+  if (it.a == S_MSG && noteUnread()) snprintf(v, n, "%d", noteUnread());
+  else if (it.a == S_REMIND) { int k = 0; for (int i = 0; i < remCount; i++) if (!rems[i].done) k++; if (k) snprintf(v, n, "%d", k); }
+  else if (it.a == S_WEATHER && wxOk) snprintf(v, n, "%dC", (int)lroundf(wTemp));
+}
+
+// The front of a hub (and of Settings): the icon twice the size, two
+// lines of what is inside, and the hint. Same places on every hub.
+static void uiHubCard(const char* name, const uint8_t* ic, const char* l1, const char* l2) {
+  oled.clearDisplay();
+  bar(name);
+  const int iy = UI_BAR_H + (UI_HINT_Y - UI_BAR_H - 16) / 2;        // centred in the space above the hint
+  uiIcon(UI_PAD + 5, iy, ic, 2, SSD1306_WHITE);
+  const int tx = UI_PAD + 5 + 16 + 8;
+  char b[18];
+  bool two = l2 && *l2;
+  // the text block (8 px a line, 2 px between) centred on the 16 px icon
+  int ty = two ? iy - 1 : iy + 4;
+  snprintf(b, sizeof(b), "%.15s", l1); at(tx, ty, b);
+  if (two) { snprintf(b, sizeof(b), "%.15s", l2); at(tx, ty + 10, b); }
+  ctr("hold to open", UI_HINT_Y, 1);
+  oled.display();
+}
+static void drawHub() {
+  char l1[24] = "", l2[24] = "";
+  const char* nm = S_NAME[screen];
+  if (depth == 0) {
+    if (screen == S_TODAY) {
+      int u = noteUnread();
+      if (u) snprintf(l1, sizeof(l1), "%d new", u); else snprintf(l1, sizeof(l1), "All read");
+      int k = 0; for (int i = 0; i < remCount; i++) if (!rems[i].done) k++;
+      if (k) snprintf(l2, sizeof(l2), "%d reminder%s", k, k == 1 ? "" : "s");
+      else if (wxOk) snprintf(l2, sizeof(l2), "%dC outside", (int)lroundf(wTemp));
+    } else if (screen == S_FHUB) {
+      struct tm t;
+      if (prayerOk && nowLocal(&t)) {
+        int now = t.tm_hour * 60 + t.tm_min, i = nextPrayer(now), p = prayerAt(i);
+        int d = p - now; if (d < 0) d += 1440;
+        snprintf(l1, sizeof(l1), "%s %02d:%02d", PRAYERS[i], p / 60, p % 60);
+        if (d >= 60) snprintf(l2, sizeof(l2), "in %dh %02dm", d / 60, d % 60);
+        else         snprintf(l2, sizeof(l2), "in %d min", d);
+      } else { snprintf(l1, sizeof(l1), "Zikr, Quran"); snprintf(l2, sizeof(l2), "and adhkar"); }
+    } else {
+      snprintf(l1, sizeof(l1), "Relax, reads"); snprintf(l2, sizeof(l2), "and %d games", G_COUNT);
+    }
+    uiHubCard(nm, hubIcon(screen), l1, l2);
+    return;
+  }
+  // the menu
+  HubIt it[8]; int n = hubItems(screen, it);
+  if (hubSel >= n) hubSel = 0;
+  oled.clearDisplay();
+  char cnt[24]; snprintf(cnt, sizeof(cnt), "%d/%d", hubSel + 1, n);
+  titleBar(nm, cnt);
+  int first = uiFirst(hubSel, n);
+  bool sc = n > UI_ROWS;
+  for (int r = 0; r < UI_ROWS && first + r < n; r++) {
+    char v[16]; hubValue(it[first + r], v, sizeof(v));
+    uiRow(r, it[first + r].icon, it[first + r].name, v, first + r == hubSel, sc);
+  }
+  uiScroll(first, n);
+  oled.display();
+}
+
+// The four hub items that are a list, and nothing else, open the list.
+//
+// Choosing Notifications and then having to open Notifications is a
+// step that buys nothing, because there is nothing else on that
+// screen. Weather, Vehicle, Prayer times and Mac are a screen rather
+// than a list, so they stay where they were. An empty list is still
+// its summary: there is nothing to open, and "nothing yet" is better
+// read on the screen that says it.
+static bool hubOpensList(int s) {
+  if (s == S_MSG)    return noteN > 0;
+  if (s == S_REMIND) return remCount > 0;
+  return s == S_READS || s == S_GAMES;
+}
+
+// Into a hub's item. hubEntry is the depth it begins at, so "back" from
+// there returns to the hub's menu rather than wandering further out.
+static void hubEnter(int hubScr, int sel) {
+  HubIt it[8]; int n = hubItems(hubScr, it);
+  if (!n) return;
+  if (sel < 0 || sel >= n) sel = 0;
+  hubSel = sel; inHub = hubScr;
+  const HubIt& x = it[sel];
+  itemIdx = 0; subIdx = 0;
+  switch (x.kind) {
+    case HI_SCREEN:
+      screen = x.a;
+      if (hubOpensList(x.a)) { depth = 1; hubEntry = 1; }
+      else                   { depth = 0; hubEntry = 0; }
+      break;
+    case HI_FAITH:
+      screen = S_FAITH; depth = 2; itemIdx = x.a; hubEntry = 2;
+      if (x.a == F_ZIKR) zikrReset();
+      break;
+    case HI_ADHKAR: {
+      struct tm t; int h = nowLocal(&t) ? t.tm_hour : 8;
+      screen = S_FAITH; depth = 2; itemIdx = (h >= 3 && h < 15) ? F_MORNING : F_EVENING; hubEntry = 2;
+      break;
+    }
+    case HI_RELAX:
+      relaxOn = true; relaxKind = 0; relaxNext = millis() + 30000UL;
+      relaxUntil = millis() + RELAX_RQ_MS;
+      wake("relax");
+      break;
+    case HI_PSET:
+      screen = S_SETTINGS; depth = 1; setGrp = SG_FAITHSET; itemIdx = SG_ROWS[SG_FAITHSET][0]; hubEntry = 1;
+      break;
+  }
+}
+
+// The night ends a quarter of an hour before Fajr (or at 05:00 with no
+// prayer times), so the Fajr alert is never slept through.
+// Awake: 90 to 120 ms, may skip 4 (about half a second). Dark: 120 to
+// 150 ms, may skip 12 (under two seconds, Apple's limit). The radio then
+// wakes roughly once every two seconds instead of twice a second.
+static void idleRhythm() {
+  static bool was = false;
+  bool idle = asleep && !cfgFollow && !otaOn;
+  if (idle == was) return;
+  was = idle;
+  NimBLEServer* sv = NimBLEDevice::getServer();
+  if (!sv || !btUp) return;
+  for (int i = 0; i < linkN; i++) {
+    if (!links[i].authed) continue;
+    if (idle) sv->updateConnParams(links[i].h, 96, 120, 12, 600);
+    else      sv->updateConnParams(links[i].h, 72, 96, 4, 600);
+  }
+}
+static int nightEnd() {
+  if (prayerOk) { int f = prayerAt(0) - 15; return f < 0 ? f + 1440 : f; }
+  return 5 * 60;
+}
+static bool nightNow(int nowMin) {
+  int bed = (cfgBed + nightPush) % 1440, end = nightEnd();
+  if (bed == end) return false;
+  return bed < end ? (nowMin >= bed && nowMin < end) : (nowMin >= bed || nowMin < end);
+}
+static long secsToNightEnd() {
+  struct tm t; if (!nowLocal(&t)) return -1;
+  int now = t.tm_hour * 60 + t.tm_min;
+  int d = nightEnd() - now; if (d <= 0) d += 1440;
+  return (long)d * 60 - t.tm_sec;
+}
+static void drawNightCard() {
+  oled.clearDisplay();
+  titleBarC("NIGHT SLEEP");
+  long left = ((long)nightCardUntil - (long)millis()) / 1000 + 1;
+  char b[22]; snprintf(b, sizeof(b), "in %ld s", left < 0 ? 0 : left);
+  ctr(b, 18, 1);
+  ctr("tap: an hour later", 34, 1);
+  ctr("hold: sleep now", 46, 1);
+  oled.display();
+}
+// Asleep with the screen dark and nothing going on, at night: a card for
+// ten seconds, then deep sleep until just before Fajr.
+static void nightTick() {
+  static uint32_t lastCheck = 0;
+  if (!cfgNight || !timeOk) return;
+  uint32_t now = millis();
+  struct tm t;
+  if (nightCardUntil) {
+    if ((int32_t)(now - nightCardUntil) >= 0) { nightCardUntil = 0; nightGo(); }
+    return;
+  }
+  if (now - lastCheck < 15000) return;
+  lastCheck = now;
+  if (!nowLocal(&t)) return;
+  int m = t.tm_hour * 60 + t.tm_min;
+  // The push is for tonight: it is forgotten in the hour after the night ends.
+  if (nightPush && !nightNow(m) && (m - nightEnd() + 1440) % 1440 < 60) nightPush = 0;
+  if (!nightNow(m) || !asleep) return;
+  if (tmrOn || awayOn || relaxOn || otaOn || rescueAP || cfgNet != NET_BT || upState != U_OFF) return;
+  nightCardUntil = now + 10000;
+  wake("night");
+}
+static void nightGo() {
+  nightDeep = true;
+  int e = nightEnd();
+  oled.clearDisplay();
+  ctr("Good night", 20, 1);
+  char b[22]; snprintf(b, sizeof(b), "awake at %02d:%02d", e / 60, e % 60);
+  ctr(b, 34, 1);
+  oled.display();
+  delay(1500);
+  deepAuto = false;
+  goDeep();
+}
+
+static void blogReset() {
+  memset(&blog, 0, sizeof(blog));
+  blog.magic = BLOG_MAGIC;
+  blog.start = timeOk ? (uint32_t)time(nullptr) : 0;
+  blog.v0 = isnan(battV) ? 0 : battV;
+  blog.pct0 = isnan(battV) ? 0 : battPct(battV);
+}
+static void blogSave() {
+  if (cfgBlog && blog.magic == BLOG_MAGIC) prefs.putBytes("blog", &blog, sizeof(blog));
+}
+// At start: after a deep sleep the RTC copy is current and the sleep is
+// added; after anything else the flash copy is, and it was a restart.
+static void blogBoot(bool fromDeep) {
+  if (fromDeep && blog.magic == BLOG_MAGIC) {
+    uint32_t now = (uint32_t)time(nullptr);
+    if (rtcDeepAt && now > rtcDeepAt && now - rtcDeepAt < 7UL * 86400UL) blog.sDeep += now - rtcDeepAt;
+  } else {
+    BLog b;
+    if (prefs.getBytes("blog", &b, sizeof(b)) == sizeof(b) && b.magic == BLOG_MAGIC) blog = b;
+    else blogReset();
+    if (!fromDeep) blog.restarts++;
+  }
+  rtcDeepAt = 0;
+}
+// Every pass of the loop: the time since the last one goes to the state
+// it was spent in. Light sleep keeps the clock running, so the sleeping
+// itself lands here on the next pass.
+static void blogTick() {
+  static uint32_t last = 0, ms[5] = { 0 }, saveAt = 0, vAt = 0;
+  uint32_t now = millis();
+  if (!last) { last = now; saveAt = now; return; }
+  uint32_t dt = now - last; last = now;
+  if (!cfgBlog || blog.magic != BLOG_MAGIC) return;
+  int k = (cfgNet == NET_WIFI || rescueAP) ? 4 : !asleep ? 0 : (pmMode == 1 ? 2 : 1);
+  ms[k] += dt;
+  uint32_t* sec[5] = { &blog.sOn, &blog.sDark, &blog.sLight, &blog.sDeep, &blog.sWifi };
+  if (ms[k] >= 1000) { *sec[k] += ms[k] / 1000; ms[k] %= 1000; }
+  // Full: the voltage you chose. Not again until it has fallen 0.10 V,
+  // so a robot left on the charger does not wipe its log over and over.
+  if (now - vAt > 5000 && !isnan(battV)) {
+    vAt = now;
+    float thr = BLOG_V[constrain(cfgBlogV, 0, 3)];
+    if (blogArmed && battV >= thr - 0.005f) { blogReset(); blogArmed = false; blogSave(); Serial.println("battery log: full, a new cycle"); }
+    else if (!blogArmed && battV < thr - 0.10f) blogArmed = true;
+  }
+  if (now - saveAt > 30UL * 60000UL) { saveAt = now; blogSave(); }
+}
+static float blogMah(int k) {
+  uint32_t secs[5] = { blog.sOn, blog.sDark, blog.sLight, blog.sDeep, blog.sWifi };
+  return secs[k] / 3600.0f * BLOG_MA[k];
+}
+static void fmtHM(uint32_t s, char* b, size_t n) { snprintf(b, n, "%lu:%02lu", (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60)); }
+
+// The view: tap moves down the list, hold starts a new cycle, back leaves.
+static void drawBattUse() {
+  oled.clearDisplay();
+  titleBar("BATTERY USE", "mAh");
+  const char* lab[9] = { "Screen", "Dark", "Light", "Deep", "WiFi", "Wakes", "Restarts", "Used", "Since" };
+  const int NROWS = 9;                   // not N: RoboEyes owns N
+  int sel = constrain(subIdx, 0, NROWS - 1);
+  int first = uiFirst(sel, NROWS);
+  for (int r = 0; r < UI_ROWS && first + r < NROWS; r++) {
+    int i = first + r, y = UI_ROW_Y + r * UI_ROW_H;
+    char t[16] = "", m[16] = "";
+    if (i < 5) {
+      uint32_t secs[5] = { blog.sOn, blog.sDark, blog.sLight, blog.sDeep, blog.sWifi };
+      fmtHM(secs[i], t, sizeof(t));
+      snprintf(m, sizeof(m), "%d", (int)lroundf(blogMah(i)));
+    } else if (i == 5) snprintf(t, sizeof(t), "%lu", (unsigned long)blog.wakes);
+    else if (i == 6) snprintf(t, sizeof(t), "%lu", (unsigned long)blog.restarts);
+    else if (i == 7) {
+      int now = isnan(battV) ? blog.pct0 : battPct(battV);
+      int d = constrain((int)blog.pct0 - now, 0, 100);   // a percentage, so at most three digits
+      snprintf(t, sizeof(t), "-%d%%", d);
+      snprintf(m, sizeof(m), "%d", d * cfgCap / 100);
+    } else {
+      if (blog.start) { time_t st = blog.start; struct tm lt; localtime_r(&st, &lt); snprintf(t, sizeof(t), "%02d:%02d", lt.tm_hour, lt.tm_min); }
+      else snprintf(t, sizeof(t), "--:--");
+      if (blog.v0 > 0) snprintf(m, sizeof(m), "%.2f", blog.v0);
+    }
+    bool on = (i == sel);
+    if (on) oled.fillRoundRect(1, y - 2, SCRW - 2 - 3, UI_ROW_H, 2, SSD1306_WHITE);
+    oled.setTextColor(on ? SSD1306_BLACK : SSD1306_WHITE);
+    at(UI_PAD + 1, y, lab[i]);
+    at(84 - (int)strlen(t) * 6, y, t);                                   // the time column ends at 84
+    if (m[0]) at(SCRW - UI_PAD - 5 - (int)strlen(m) * 6, y, m);           // mAh, clear of the scrollbar
+    oled.setTextColor(SSD1306_WHITE);
+  }
+  uiScroll(first, NROWS);
+  oled.display();
+}
+
+// Locked: dark, quiet for the set minutes since a real touch, and
+// nothing running that wants the screen.
+static bool pocketLocked() {
+  if (!cfgPLock || !asleep) return false;
+  if (tmrOn || relaxOn || cfgFollow || awayOn || otaOn) return false;
+  return millis() - lastUserAt > (uint32_t)PLOCK_MIN[constrain(cfgPLock, 0, 3)] * 60000UL;
+}
+static uint32_t unlockMs() { uint32_t w = WAKE_OPTS[cfgWakeIdx]; return w ? w : 1000; }
+// While a finger is down on a locked robot: dark for the first second,
+// then a thin bar that fills; full, and it wakes. Let go early and it is
+// dark again at once.
+static void pocketTick() {
+  if (!unlocking) return;
+  uint32_t now = millis(), held = now - unlockAt;
+  if (!touchOn) {                                   // let go before the end
+    unlocking = false;
+    if (unlockShown) { unlockShown = false; oled.clearDisplay(); oled.display(); screenPower(false); }
+    return;
+  }
+  if (held >= unlockMs()) {
+    unlocking = false; unlockShown = false;
+    lastUserAt = now;
+    wake("unlock");
+    return;
+  }
+  if (held >= 1000) {
+    if (!unlockShown) { unlockShown = true; screenPower(true); }
+    uint32_t span = unlockMs() > 1000 ? unlockMs() - 1000 : 1;
+    int w = (int)((uint64_t)(held - 1000) * 60 / span);
+    oled.clearDisplay();
+    oled.drawRoundRect(SCRW / 2 - 32, SCRH - 6, 64, 4, 2, SSD1306_WHITE);
+    if (w > 0) oled.fillRoundRect(SCRW / 2 - 31, SCRH - 5, min(w, 62), 2, 1, SSD1306_WHITE);
+    oled.display();
+  }
+}
+
+static void syncBegin() {
+  if (!wsStart(WS_SYNC)) return;
+  syncRun = true; syncStarted = false; syncStoryDone = false; syncUpArmed = false;
+  syncAt = millis();
+  flash("SYNCING", 1500);
+}
+
+
+// Everything a session needs, once a pass.
+static void serviceWs() {
+  uint32_t now = millis();
+
+  // Commands from the phone that move the radios, a moment after they
+  // arrived so the reply to the phone has gone out first.
+  if (rqPend && now - rqPendAt > 700) {
+    int c = rqPend; rqPend = RQ_NONE;
+    switch (c) {
+      case RQ_SYNC:    syncBegin(); break;
+      case RQ_UPDATE:  startHotspot(); break;   // 7.4.1: "update" opens the hotspot
+      case RQ_WIFI:    if (wsStart(WS_MANUAL)) flash("WIFI UNTIL RESTART", 1500); break;
+      case RQ_HOTSPOT: startHotspot(); break;
+      case RQ_TAMPER:  tamperArm(); break;
+      case RQ_DEEP:    wantDeep = true; break;
+      case RQ_REBOOT:  ESP.restart(); break;
+    }
+    // 6.6: the command above may have just started a session and
+    // stamped it with a time later than the one read at the top. Read
+    // it again, or "now - started" goes below zero, wraps round to
+    // forty-nine days, and the session is ended as idle in the same
+    // pass that began it. That is why config from a Shortcut showed
+    // the hotspot card with no hotspot behind it, and why a sync or
+    // an update sent from a Shortcut stopped at once.
+    now = millis();
+  }
+
+  if (wsEndWant) { wsEndWant = false; wsEnd("BLUETOOTH"); return; }
+  if (cfgNet != NET_WIFI || wsKind == WS_NONE) return;
+
+  // Nothing to join. Say so and go home.
+  if (netDown && !rescueAP) {
+    bool wasUpd = upAfterJoin;
+    bool wasSync = syncRun;
+    wsEnd("");
+    if (wasSync || wsKind == WS_NONE) wsFailCard("No saved WiFi nearby", "Back on Bluetooth");
+    if (wasUpd) { upState = U_FAIL; upMsg = "No WiFi found"; upQuick = true; }
+    return;
+  }
+
+  if (online()) {
+    if (upAfterJoin) {
+      upAfterJoin = false;
+      if (upDirect) { upDirect = false; upQuick = true; wantOtaLatest = true; upState = U_LOOK; }
+      else          { upQuick = false; upState = U_MENU; upPick = 0; upMsg = ""; }
+      wake("update");
+    }
+    if (syncRun && !syncStarted) {
+      syncStarted = true;
+      wantTime = true; wantWx = true; wantPrayerNow = true;
+      // 7.4.1: a sync no longer looks for releases; updates are from a file
+    }
+  }
+
+  // The sync's look for an update: a newer one is asked about, the
+  // same one is said nothing about.
+  if (syncUpArmed && !wantOtaLatest) {
+    if (upState == U_ASK) {
+      syncUpArmed = false; upQuick = true; askSince = now;
+      wake("update");
+    } else if (upState == U_NONE || upState == U_FAIL) {
+      syncUpArmed = false; upState = U_OFF;
+    }
+  }
+  if (upState == U_ASK && askSince && now - askSince > WS_ASK_MS) { upState = U_OFF; askSince = 0; }
+  if (upState != U_ASK) askSince = 0;
+
+  if (syncRun && syncStarted && !wantTime && !wantWx && !wantPrayerNow &&
+      !wantOtaLatest && !netBusy && !syncUpArmed && upState == U_OFF && !storyBusy) {
+    if (!syncStoryDone) {
+      syncStoryDone = true;
+      // A new short read, if there is a key to write one with. This
+      // holds the loop for the length of the call, which is why it is
+      // the last thing and says so on the screen.
+      if (cfgKey.length()) {
+        oled.clearDisplay(); bar("SYNC"); ctr("Writing a read", 30, 1); oled.display();
+        fetchStory(false);
+      }
+      return;
+    }
+    syncRun = false;
+    lastSyncAt = (uint32_t)time(nullptr);
+    prefs.putUInt("lsync", lastSyncAt);
+    if (wsKind == WS_SYNC) wsEnd("SYNC DONE");
+    else flash("SYNC DONE", 1200);
+    return;
+  }
+  if (syncRun && now - syncAt > WS_SYNC_MS && upState != U_ASK) {
+    syncRun = false;
+    if (wsKind == WS_SYNC) {
+      bool on = online();
+      wsEnd(on ? "SYNC PARTLY DONE" : "");
+      if (!on) wsFailCard("No saved WiFi nearby", "Back on Bluetooth");
+      return;
+    }
+  }
+
+  if (wsKind == WS_UPDATE) {
+    if (upState != U_OFF) wsSawUp = true;
+    else if (wsSawUp) { wsEnd(""); return; }
+    else if (now - wsStartMs > 20000) { wsEnd(""); return; }
+  }
+  if (wsKind == WS_MANUAL && rtcWsUntil && !syncRun && !netBusy && upState == U_OFF &&
+      (uint32_t)time(nullptr) > rtcWsUntil) {
+    wsEnd("WIFI OFF");
+    return;
+  }
+  if (wsKind == WS_HOTSPOT) {
+    if (WiFi.softAPgetStationNum() > 0) wsLastUse = now;
+    if (now - wsLastUse > WS_HOTSPOT_IDLE_MS) { wsEnd("HOTSPOT OFF"); return; }
+  }
+}
+
+// ---- weather, kept ----
+static void saveWx() {
+  char b[96];
+  snprintf(b, sizeof(b), "%.1f|%.0f|%.1f|%d|%lu|%s", wTemp, wHum, wWind, wCode,
+           (unsigned long)wxAt, wCity);
+  prefs.putString("wx", b);
+}
+static void loadWx() {
+  String s = prefs.getString("wx", "");
+  if (!s.length()) return;
+  float t = NAN, h = NAN, w = NAN; int c = -1; unsigned long a = 0; char city[16] = "";
+  int got = sscanf(s.c_str(), "%f|%f|%f|%d|%lu|%15[^\n]", &t, &h, &w, &c, &a, city);
+  if (got < 5) return;
+  wTemp = t; wHum = h; wWind = w; wCode = c; wxAt = a;
+  if (city[0]) { strncpy(wCity, city, sizeof(wCity) - 1); wCity[sizeof(wCity) - 1] = 0; }
+  wxOk = !isnan(wTemp);
+}
+
+// ================================================================
+//  RAFIQ, FROM A SHORTCUT ON THE PHONE
+// ================================================================
+//  A Shortcut posts a notification. If it comes from the Shortcuts app
+//  and says RAFIQ in its title, its subtitle or the start of its text,
+//  the rest is read as commands, one to a line, or as a weather report.
+//  Only the Shortcuts app counts, because Rafiq is also somebody's
+//  name, and a message from him must never be taken as an order.
+//
+//  Commands run only if the notification is fresh and has never run
+//  before, because iOS hands old notifications over again after a
+//  restart and a reconnect. Weather is always taken: it is harmless.
+static const char* rqSkip(const char* s) {
+  while (*s == ' ' || *s == '\n' || *s == '\r' || *s == '\t') s++;
+  return s;
+}
+static bool rqTagged(const char* s) {
+  s = rqSkip(s);
+  if (strncasecmp(s, "RAFIQ", 5)) return false;
+  char c = s[5];
+  return c == 0 || c == ':' || c == ' ' || c == '\n' || c == '\r' || c == '-';
+}
+static const char* rqAfterTag(const char* s) {
+  s = rqSkip(s);
+  if (!strncasecmp(s, "RAFIQ", 5)) {
+    s += 5;
+    while (*s == ':' || *s == ' ' || *s == '-' || *s == '\n' || *s == '\r') s++;
+  }
+  return s;
+}
+// Shortcuts posts from more than one process: the app itself
+// (com.apple.shortcuts), the old Workflow id, and the background runner
+// that automations and widgets use (com.apple.WorkflowKit...). 6.0
+// only knew the first, so commands from an automation arrived as an
+// ordinary notification titled RAFIQ and did nothing.
+static bool rqFromShortcuts(const char* app) {
+  char l[40]; int n = 0;
+  for (const char* p = app; *p && n < 39; p++) l[n++] = tolower((unsigned char)*p);
+  l[n] = 0;
+  return strstr(l, "shortcut") || strstr(l, "workflow");
+}
+static bool rafiqTagged(const Note& n) {
+  return rqTagged(n.title) || rqTagged(stSub) || rqTagged(stMsg);
+}
+static bool rafiqIs(const Note& n) {
+  return rqFromShortcuts(n.app) && rafiqTagged(n);
+}
+
+// "yyyyMMddTHHmmSS", the phone's own wall clock. Compared with ours as
+// two wall clocks, which is right in either time model.
+static bool rqFresh(const char* d) {
+  if (strlen(d) < 15 || d[8] != 'T' || !timeOk) return true;   // run once decides alone
+  for (int i = 0; i < 15; i++) if (i != 8 && (d[i] < '0' || d[i] > '9')) return true;
+  auto num = [&](int at, int len) { int v = 0; for (int i = 0; i < len; i++) v = v * 10 + (d[at + i] - '0'); return v; };
+  struct tm t = {};
+  t.tm_year = num(0, 4) - 1900; t.tm_mon = num(4, 2) - 1; t.tm_mday = num(6, 2);
+  t.tm_hour = num(9, 2); t.tm_min = num(11, 2); t.tm_sec = num(13, 2);
+  time_t now = time(nullptr); struct tm lt; localtime_r(&now, &lt);
+  long age = (long)(utcFromTm(&lt) - utcFromTm(&t));
+  return age > -300 && age <= 120;                 // a little clock skew allowed
+}
+
+uint32_t rqSeen[8];
+bool     rqSeenLoaded = false;
+static uint32_t rqFnv(const char* s, uint32_t h) {
+  while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+  return h;
+}
+static bool rqRanBefore(uint32_t h) {
+  if (!rqSeenLoaded) {
+    memset(rqSeen, 0, sizeof(rqSeen));
+    if (prefs.isKey("rqseen")) prefs.getBytes("rqseen", rqSeen, sizeof(rqSeen));
+    rqSeenLoaded = true;
+  }
+  for (int i = 0; i < 8; i++) if (rqSeen[i] == h) return true;
+  return false;
+}
+static void rqRemember(uint32_t h) {
+  memmove(rqSeen + 1, rqSeen, sizeof(uint32_t) * 7);
+  rqSeen[0] = h;
+  prefs.putBytes("rqseen", rqSeen, sizeof(rqSeen));
+}
+
+// Weather, in whatever words the Shortcut used:
+//   temp=24;cond=Sunny;hum=60
+//   Temp: 21°C (H: 25°C, L: 18°C)  Condition: Mostly Cloudy  Humidity: 88%
+static int wxCodeFromWords(const char* w) {
+  char l[48]; int n = 0;
+  for (const char* p = w; *p && n < 47; p++) l[n++] = tolower((unsigned char)*p);
+  l[n] = 0;
+  if (strstr(l, "thunder") || strstr(l, "storm")) return 95;
+  if (strstr(l, "snow") || strstr(l, "sleet") || strstr(l, "flurr") || strstr(l, "hail")) return 71;
+  if (strstr(l, "drizzle")) return 51;
+  if (strstr(l, "shower")) return 80;
+  if (strstr(l, "rain")) return 61;
+  if (strstr(l, "fog") || strstr(l, "mist") || strstr(l, "haze") || strstr(l, "smok") || strstr(l, "dust")) return 45;
+  if (strstr(l, "overcast") || strstr(l, "mostly cloudy")) return 3;
+  if (strstr(l, "partly") || strstr(l, "mostly sunny") || strstr(l, "mostly clear")) return 2;
+  if (strstr(l, "cloud")) return 3;
+  if (strstr(l, "clear") || strstr(l, "sunny") || strstr(l, "fair")) return 0;
+  return -1;
+}
+static bool rqNum(const char* v, float& out) {
+  while (*v && !isdigit((unsigned char)*v) && *v != '-' && *v != '.') v++;
+  if (!*v) return false;
+  char* e; out = strtof(v, &e);
+  return e != v;
+}
+static int rqWeather(const char* text) {
+  int got = 0;
+  float t = NAN, h = NAN, w = NAN; int code = -9; char city[16] = "";
+  const char* s = text;
+  while (*s) {
+    const char* e = s;
+    while (*e && !strchr("\n;,()|", *e)) e++;
+    char seg[64]; int L = e - s; if (L > 63) L = 63;
+    memcpy(seg, s, L); seg[L] = 0;
+    s = *e ? e + 1 : e;
+    char* sep = strpbrk(seg, ":=");
+    if (!sep) continue;
+    *sep = 0;
+    char key[24]; int k = 0;
+    for (char* p = seg; *p && k < 23; p++) {
+      char c = tolower((unsigned char)*p);
+      if (c == ' ' && (k == 0 || key[k - 1] == ' ')) continue;
+      key[k++] = c;
+    }
+    while (k && key[k - 1] == ' ') k--;
+    key[k] = 0;
+    const char* val = sep + 1;
+    while (*val == ' ') val++;
+    float f;
+    bool fahr = strstr(val, "F") && !strstr(val, "C");
+    if (!strcmp(key, "temp") || !strcmp(key, "temperature")) {
+      if (rqNum(val, f)) { t = fahr ? (f - 32) * 5 / 9 : f; got++; }
+    } else if (!strcmp(key, "hum") || !strcmp(key, "humidity")) {
+      if (rqNum(val, f)) { h = f; got++; }
+    } else if (!strcmp(key, "wind") || !strcmp(key, "wind speed")) {
+      if (rqNum(val, f)) { w = strstr(val, "mph") ? f * 1.609f : f; got++; }
+    } else if (!strcmp(key, "cond") || !strcmp(key, "condition") || !strcmp(key, "weather")) {
+      int c = wxCodeFromWords(val);
+      if (c >= 0) { code = c; got++; }
+    } else if (!strcmp(key, "loc") || !strcmp(key, "location") || !strcmp(key, "city")) {
+      snprintf(city, sizeof(city), "%s", val);
+      for (char* p = city; *p; p++) if (*p == '\r') *p = 0;
+      got++;
+    }
+  }
+  if (!got) return 0;
+  // A report with no temperature keeps the one we had; anything it
+  // does say replaces what was there, and anything it does not say
+  // is cleared rather than left looking current.
+  if (!isnan(t)) { wTemp = t; wHum = h; wWind = w; }
+  if (code != -9) wCode = code;
+  if (city[0]) { strncpy(wCity, city, sizeof(wCity) - 1); wCity[sizeof(wCity) - 1] = 0; }
+  wxOk = !isnan(wTemp);
+  wxAt = (uint32_t)time(nullptr);
+  wxDirty = true;
+  Serial.printf("weather from the phone: %.1fC code %d %s\n", wTemp, wCode, wCity);
+  return got;
+}
+
+static void rqStatus() {
+  char sy[16];
+  uint32_t tnow = (uint32_t)time(nullptr);
+  if (lastSyncAt && tnow >= lastSyncAt) {
+    uint32_t a = (tnow - lastSyncAt) / 60;
+    if (a < 60)        snprintf(sy, sizeof(sy), "%lum ago", (unsigned long)a);
+    else if (a < 2880) snprintf(sy, sizeof(sy), "%luh ago", (unsigned long)(a / 60));
+    else               snprintf(sy, sizeof(sy), "%lud ago", (unsigned long)(a / 1440));
+  } else snprintf(sy, sizeof(sy), "never");
+  // Two lines of 21, which is what the card shows.
+  char b[64];
+  // "BT no radio 100%" is the longest first line; the second only
+  // runs past 21 with both flags on and a two digit age, and then it
+  // loses the end of "quiet", not anything that matters.
+  snprintf(b, sizeof(b), "BT %.8s %d%% %s\nsync %s %.10s",
+           btShort(), isnan(battV) ? 0 : battPct(battV), pmAvail ? "LS" : "",
+           sy, lastReset);
+  toastKind = "rafiq"; toastText = b;
+  toastUntil = millis() + 9000; toastFlash = millis(); remShowing = -1;
+}
+
+static void rqRemind(const char* s) {
+  while (*s == ' ' || *s == ':') s++;
+  int h, m;
+  if (!timeOk) { flash("NO CLOCK YET", 1500); return; }
+  if (sscanf(s, "%d:%d", &h, &m) != 2 || h < 0 || h > 23 || m < 0 || m > 59) {
+    flash("REMIND HH:MM WHAT", 1600); return;
+  }
+  while (*s && *s != ' ') s++;
+  while (*s == ' ') s++;
+  if (!*s) s = "Reminder";
+  time_t now = time(nullptr);
+  struct tm lt; localtime_r(&now, &lt);
+  lt.tm_hour = h; lt.tm_min = m; lt.tm_sec = 0;
+  time_t at = mktime(&lt);
+  if (at <= now) at += 86400;                       // already gone today
+  if (addRem(s, (uint32_t)at)) { sortRems(); saveRems(); remAddedCard(1, (uint32_t)at); }
+  else flash("REMINDERS FULL", 1300);
+}
+
+// One line, one command. 1 if it was one, 0 if not.
+static int rqCommand(const char* raw) {
+  char c[48]; int n = 0;
+  for (const char* p = raw; *p && n < 47; p++) {
+    char ch = tolower((unsigned char)*p);
+    if (ch == '.' || ch == '!' || ch == '\r') continue;
+    if (ch == ' ' && (n == 0 || c[n - 1] == ' ')) continue;
+    c[n++] = ch;
+  }
+  while (n && c[n - 1] == ' ') n--;
+  c[n] = 0;
+  if (!n) return 0;
+  uint32_t now = millis();
+  auto is  = [&](const char* w) { return !strcmp(c, w); };
+  auto pre = [&](const char* w) { size_t L = strlen(w); return !strncmp(c, w, L) && (c[L] == ' ' || c[L] == 0); };
+
+  if (tmrCommand(c)) { }
+  else if (is("sync") || is("sync now")) rqPend = RQ_SYNC;
+  else if (is("update") || is("check update") || is("software update")) rqPend = RQ_UPDATE;
+  else if (is("wifi") || is("wi-fi") || is("wifi on")) rqPend = RQ_WIFI;
+  else if (is("bluetooth") || is("bt")) flash("ON BLUETOOTH", 1200);
+  else if (is("config") || is("config-robo") || is("config robo") || is("hotspot")) rqPend = RQ_HOTSPOT;
+  else if (is("guard on") || is("guard off")) {
+    cfgPGuard = is("guard on"); prefs.putBool("guard", cfgPGuard);
+    pgFired = false; pgUntil = 0;
+    flash(cfgPGuard ? "GUARD ON" : "GUARD OFF", 1200);
+  }
+  else if (is("tamper on") || is("tamper")) rqPend = RQ_TAMPER;
+  else if (is("find") || is("find me") || is("where are you")) findUntil = now + 20000;
+  else if (is("night later") || is("night +1")) {                   // 7.7
+    nightPush = constrain(nightPush + 60, 0, 360); nightCardUntil = 0;
+    flash("AN HOUR LATER", 1200);
+  }
+  else if (is("relax") || is("relax on")) {
+    relaxOn = true; relaxKind = 0; relaxNext = now + 30000UL;
+    relaxUntil = now + RELAX_RQ_MS;    // three minutes, then sleep
+  }
+  else if (is("zikr") || is("dhikr") || is("tasbih")) {
+    screen = S_FAITH; depth = 2; itemIdx = F_ZIKR; subIdx = 0;
+    zikrReset();
+  }
+  else if (pre("bright") || pre("brightness")) {
+    const char* q = strchr(c, ' ');
+    int pct = q ? atoi(q) : 0;
+    if (pct <= 0) return 0;
+    cfgBright = constrain(pct * 255 / 100, 26, 255);
+    prefs.putInt("bri", cfgBright); applyBright();
+    flash("BRIGHTNESS SET", 900);
+  }
+  else if (pre("face")) {
+    int f = atoi(c + 4);
+    if (f < 1) return 0;
+    cfgFace = constrain(f - 1, 0, FACE_N - 1); prefs.putInt("face", cfgFace);
+    screen = S_HOME; depth = 0;
+  }
+  else if (is("notifications on") || is("notification on") || is("popups on") || is("quiet off")) {
+    cfgQuiet = false; prefs.putBool("quiet", false); flash("NOTIFICATIONS ON", 1200);
+  }
+  else if (is("notifications off") || is("notification off") || is("popups off") ||
+           is("quiet") || is("quiet on") || is("silent")) {
+    cfgQuiet = true; prefs.putBool("quiet", true); flash("NOTIFICATIONS QUIET", 1200);
+  }
+  else if (is("home")) { screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; }
+  else if (is("wake touch") || is("wake by touch")) { cfgWakeBy = 1; prefs.putInt("wakeby", 1); flash("WAKE BY TOUCH", 1200); }
+  else if (is("wake move") || is("wake shake") || is("wake by move") || is("wake by shake") || is("wake motion")) {
+    cfgWakeBy = 2; prefs.putInt("wakeby", 2); flash("WAKE BY MOVE", 1200);
+  }
+  else if (is("wake both") || is("wake by both") || is("wake all")) { cfgWakeBy = 0; prefs.putInt("wakeby", 0); flash("WAKE BY BOTH", 1200); }
+  else if (is("wake by")) {
+    cfgWakeBy = (cfgWakeBy + 1) % 3; prefs.putInt("wakeby", cfgWakeBy);
+    flash(cfgWakeBy == 1 ? "WAKE BY TOUCH" : cfgWakeBy == 2 ? "WAKE BY MOVE" : "WAKE BY BOTH", 1200);
+  }
+  else if (is("sleep")) goSleep();
+  else if (is("off") || is("deep sleep") || is("power off")) rqPend = RQ_DEEP;
+  else if (is("reboot") || is("restart")) rqPend = RQ_REBOOT;
+  else if (is("status")) rqStatus();
+  else if (is("prayer refresh") || is("prayers refresh") || is("refresh prayer")) {
+    prayerWanted = true; rqPend = RQ_SYNC;
+  }
+  else if (pre("prayer")) {
+    const char* q = c + 7;
+    const char* names[5] = { "fajr", "dhuhr", "asr", "maghrib", "isha" };
+    int which = -1, L = 0;
+    for (int i = 0; i < 5 && which < 0; i++) {
+      L = strlen(names[i]);
+      if (!strncmp(q, names[i], L)) which = i;
+    }
+    if (which < 0 && !strncmp(q, "zuhr", 4)) { which = 1; L = 4; }
+    if (which < 0) return 0;
+    prayerAdj[which] = constrain(atoi(q + L), -60, 60);
+    saveAdj();
+    char m[22]; snprintf(m, sizeof(m), "%s %+d MIN", PRAYERS[which], prayerAdj[which]);
+    flash(m, 1400);
+  }
+  else return 0;
+  if (rqPend) rqPendAt = now;
+  return 1;
+}
+
+static void rafiqPayload(const char* p, bool fresh) {
+  // The first word decides whether the rest belongs to it.
+  char first[16]; int n = 0;
+  for (const char* q = p; *q && *q != '\n' && *q != ':' && *q != ' ' && n < 15; q++)
+    first[n++] = tolower((unsigned char)*q);
+  first[n] = 0;
+
+  // Away: the rest of the text is the message. Away on its own turns it
+  // on with the last message. While away, only home and away are heard.
+  if (!strcmp(first, "away")) {
+    if (!fresh) return;
+    awayAuto = false; prefs.putBool("awaya", false);   // sent by hand: only home ends it
+    const char* t = p + n;
+    bool colon = false;
+    while (*t == ':' || *t == ' ' || *t == '-') { if (*t == ':') colon = true; t++; }
+    // "Away message: ..." and "Away msg ..." mean the same: message and
+    // msg are a label, not what you want shown. Only as a whole word,
+    // and only when it reads as a label: followed by a colon or a dash,
+    // or straight after "away" with no colon. "Away: Messages go to
+    // Sara" keeps every word.
+    int L = !strncasecmp(t, "message", 7) ? 7 : !strncasecmp(t, "msg", 3) ? 3 : 0;
+    if (L && (t[L] == ':' || t[L] == '-' || t[L] == ' ' || !t[L])) {
+      const char* q = t + L;
+      while (*q == ' ') q++;
+      if (*q == ':' || *q == '-' || !colon) t = q;
+    }
+    while (*t == ':' || *t == ' ' || *t == '-') t++;
+    String m = String(t); m.replace("\r", ""); m.trim();
+    awaySet(true, m.c_str());
+    return;
+  }
+  if (tmrOn && !awayOn) {
+    if (!fresh) return;
+    char ln[48]; int k = 0;
+    for (const char* q = p; *q && *q != '\n' && k < 47; q++) {
+      char ch = tolower((unsigned char)*q);
+      if (ch == '.' || ch == '!' || ch == '\r') continue;
+      ln[k++] = ch;
+    }
+    ln[k] = 0;
+    while (k && ln[k - 1] == ' ') ln[--k] = 0;
+    if (!strcmp(ln, "home")) tmrStop("TIMER STOPPED");
+    else tmrCommand(ln);
+    return;
+  }
+  if (awayOn) {
+    char fc[16]; strcpy(fc, first);                // "Home." and "home!" count too
+    size_t L = strlen(fc);
+    while (L && (fc[L - 1] == '.' || fc[L - 1] == '!')) fc[--L] = 0;
+    if (fresh && !strcmp(fc, "home")) awaySet(false, nullptr);
+    return;
+  }
+
+  if (!strcmp(first, "msg") || !strcmp(first, "message") || !strcmp(first, "say")) {
+    if (!fresh) return;
+    const char* t = p + n;
+    while (*t == ':' || *t == ' ') t++;
+    String m = String(t); m.replace("\n", " "); m.replace("\r", ""); m.trim();
+    if (!m.length()) return;
+    message = m.substring(0, 84);
+    prefs.putString("msg", message);
+    Note pn = {};
+    pn.uid = (uint32_t)millis() | 0x80000000UL;    // never an ANCS id
+    pn.unread = true;
+    strncpy(pn.app,   "Rafiq.shortcut", sizeof(pn.app) - 1);
+    strncpy(pn.title, "From your phone", sizeof(pn.title) - 1);
+    strncpy(pn.msg,   message.c_str(), sizeof(pn.msg) - 1);
+    addNote(pn);
+    popGlanceMs = 3000;                  // something you sent: three seconds, not one
+    if (popupSecs()) popupShow();
+    else { wake("message"); screen = S_MSG; depth = 2; noteIdx = 0; }
+    popGlanceMs = 1000;
+    return;
+  }
+  if (!strcmp(first, "remind")) {
+    if (!fresh) return;
+    wake("reminder");
+    rqRemind(p + n);
+    return;
+  }
+
+  // Line by line. A line with no colon or equals sign is a command, so
+  // anything with one in it is waking the screen; a report alone is not.
+  bool cmdish = false;
+  for (const char* q = p; *q; ) {
+    const char* e = q; while (*e && *e != '\n' && *e != ';') e++;
+    bool has = false, any = false;
+    for (const char* r = q; r < e; r++) { if (*r == ':' || *r == '=') has = true; if (*r > ' ') any = true; }
+    if (any && !has) cmdish = true;
+    q = *e ? e + 1 : e;
+  }
+  if (fresh && cmdish) wake("shortcut");
+
+  String wx;
+  bool did = false;
+  for (const char* q = p; *q; ) {
+    const char* e = q; while (*e && *e != '\n' && *e != ';') e++;
+    char ln[96]; int L = e - q; if (L > 95) L = 95;
+    memcpy(ln, q, L); ln[L] = 0;
+    q = *e ? e + 1 : e;
+    if (fresh && rqCommand(ln)) { did = true; continue; }
+    wx += ln; wx += '\n';
+  }
+  if (wx.length() && rqWeather(wx.c_str())) {
+    did = true;
+    if (!asleep) flash("WEATHER UPDATED", 1000);
+  }
+  if (!did && fresh) { wake("shortcut"); flash("RAFIQ?", 1200); }
+}
+
+static void rafiqNote(const Note& n) {
+  // Shortcuts notifications usually cannot be cleared by an accessory,
+  // but asking costs nothing and some versions of iOS allow it.
+  ancsAction(n.uid, 1);
+  const char* p = rqAfterTag(stMsg);
+  if (!*p) p = rqAfterTag(stSub);
+  bool fresh = rqFresh(stDate);
+  if (fresh) {
+    uint32_t h = stDate[0] ? rqFnv(p, rqFnv("|", rqFnv(stDate, 2166136261u)))
+                           : rqFnv(p, 2166136261u ^ n.uid);
+    if (rqRanBefore(h)) fresh = false;
+    else rqRemember(h);
+  }
+  Serial.printf("rafiq%s: %s\n", fresh ? "" : " (old, data only)", p);
+  rafiqPayload(p, fresh);
+}
+
+// ================================================================
+//  THE PHONE GUARD
+// ================================================================
+//  Linked and strong is fine. Weak for six seconds, or gone for four,
+//  and it calls out. It does not call again until the phone is back.
+static void pgFire(const char* why) {
+  if (awayOn) return;
+  pgFired = true; pgWhy = why;
+  pgUntil = millis() + PG_SHOW_MS;
+  wake("guard");
+  Serial.printf("guard: %s\n", why);
+}
+static void pgTick() {
+  uint32_t now = millis();
+  if (!cfgPGuard || cfgNet != NET_BT || !btUp) {
+    pgEver = false; pgLostAt = 0; pgWeakSince = 0; pgRssi = 0;
+    return;
+  }
+  bool linked = (btConn != 0xFFFF && btStage == BT_BONDED);
+  if (linked) {
+    pgEver = true; pgLostAt = 0;
+    if (now - pgRssiAt >= 2000) {
+      pgRssiAt = now;
+      int8_t r = 0;
+      if (ble_gap_conn_rssi(btConn, &r) == 0 && r < 0)
+        pgRssi = (pgRssi == 0) ? r : pgRssi * 0.7f + r * 0.3f;
+    }
+    if (pgRssi != 0 && pgRssi < PG_WEAK_DBM) { if (!pgWeakSince) pgWeakSince = now; }
+    else pgWeakSince = 0;
+    if (pgFired && (pgRssi == 0 || pgRssi > PG_OK_DBM)) {
+      pgFired = false;
+      if (pgUntil) { pgUntil = 0; flash("THERE YOU ARE", 1200); }
+    }
+    if (!pgFired && pgWeakSince && now - pgWeakSince > PG_WEAK_MS) pgFire("Phone is far away");
+  } else if (pgEver) {
+    pgRssi = 0; pgWeakSince = 0;
+    if (!pgLostAt) pgLostAt = now;
+    if (!pgFired && now - pgLostAt > PG_LOST_MS) pgFire("Phone is gone");
+  }
+}
+
+static void drawGuard() {
+  oled.clearDisplay();
+  bool b = (millis() / 450) % 2;
+  uint16_t fg = b ? SSD1306_BLACK : SSD1306_WHITE;
+  if (b) oled.fillRect(0, 0, SCRW, SCRH, SSD1306_WHITE);
+  // two eyes, brows down at the middle: worried
+  oled.fillRoundRect(30, 8, 24, 18, 6, fg);
+  oled.fillRoundRect(74, 8, 24, 18, 6, fg);
+  uint16_t bg = b ? SSD1306_WHITE : SSD1306_BLACK;
+  oled.fillTriangle(30, 6, 54, 6, 30, 14, bg);
+  oled.fillTriangle(98, 6, 74, 6, 98, 14, bg);
+  oled.setTextColor(fg);
+  ctr("WAIT FOR ME", 34, 1);
+  ctr(pgWhy, 48, 1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.display();
+}
+
+static void drawFind() {
+  oled.clearDisplay();
+  bool b = (millis() / 300) % 2;
+  if (b) oled.fillRect(0, 0, SCRW, SCRH, SSD1306_WHITE);
+  oled.setTextColor(b ? SSD1306_BLACK : SSD1306_WHITE);
+  ctr("I'M HERE", 18, 2);
+  ctr("press to stop", 46, 1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.display();
+}
+
+// ================================================================
+//  TAMPER
+// ================================================================
+//  Ten seconds to change your mind, then dark and quiet: no screen, no
+//  radio, and every move written down with the time. With the INT1
+//  wire it lies in deep sleep and the accelerometer wakes it; without
+//  it, it watches from light sleep five times a second. Only a real
+//  restart (power, or the reset button) ends it.
+static void tlogAdd(const char* what) {
+  if (!fsOk) return;
+  char ln[40];
+  time_t t = time(nullptr);
+  struct tm lt; localtime_r(&t, &lt);
+  if (t > 1700000000) snprintf(ln, sizeof(ln), "%02d/%02d %02d:%02d %s\n",
+                               lt.tm_mday, lt.tm_mon + 1, lt.tm_hour, lt.tm_min, what);
+  else                snprintf(ln, sizeof(ln), "--/-- --:-- %s\n", what);
+  File f = LittleFS.open(TLOG_PATH, "a");
+  if (!f) return;
+  size_t sz = f.size();
+  f.print(ln);
+  f.close();
+  if (sz > TLOG_MAX) {                         // keep the newer half
+    File r = LittleFS.open(TLOG_PATH, "r");
+    if (!r) return;
+    String all = r.readString(); r.close();
+    int cut = all.indexOf('\n', all.length() / 2);
+    if (cut > 0) {
+      File w = LittleFS.open(TLOG_PATH, "w");
+      if (w) { w.print(all.substring(cut + 1)); w.close(); }
+    }
+  }
+}
+static void tlogLoad() {
+  tlN = 0; tlSel = 0;
+  if (!fsOk) return;
+  File f = LittleFS.open(TLOG_PATH, "r");
+  if (!f) return;
+  // A ring of the last TL_N lines, then turned round, newest first.
+  char ring[TL_N][24]; int cnt = 0;
+  while (f.available()) {
+    String l = f.readStringUntil('\n'); l.trim();
+    if (!l.length()) continue;
+    snprintf(ring[cnt % TL_N], 24, "%s", l.c_str());
+    cnt++;
+  }
+  f.close();
+  int have = cnt < TL_N ? cnt : TL_N;
+  for (int i = 0; i < have; i++) snprintf(tlLines[i], 24, "%s", ring[(cnt - 1 - i) % TL_N]);
+  tlN = have;
+}
+static const char* tlLabel(int i, char* b, size_t n) {
+  if (i >= tlN) snprintf(b, n, "Clear all");
+  else          snprintf(b, n, "%s", tlLines[i]);
+  return b;
+}
+static void drawTlog() {
+  char r[8]; snprintf(r, sizeof(r), "%d", tlN);
+  drawList("TAMPER LOG", r, tlN + 1, tlSel, tlLabel);
+}
+// Remove the k-th newest line, as the list shows them.
+static void tlogDelete(int k) {
+  if (!fsOk) return;
+  File f = LittleFS.open(TLOG_PATH, "r");
+  if (!f) return;
+  String all = f.readString(); f.close();
+  int total = 0;
+  for (unsigned i = 0; i < all.length(); i++) if (all[i] == '\n') total++;
+  int target = total - 1 - k, line = 0;
+  String out;
+  int start = 0;
+  for (unsigned i = 0; i < all.length(); i++) {
+    if (all[i] != '\n') continue;
+    if (line != target) out += all.substring(start, i + 1);
+    line++; start = i + 1;
+  }
+  File w = LittleFS.open(TLOG_PATH, "w");
+  if (w) { w.print(out); w.close(); }
+}
+static void drawTamperCount() {
+  oled.clearDisplay();
+  titleBarC("TAMPER ALARM");
+  long left = ((long)TAMPER_COUNT_MS - (long)(millis() - tamperCountAt) + 999) / 1000;
+  if (left < 0) left = 0;
+  char b[8]; snprintf(b, sizeof(b), "%ld", left);
+  ctr(b, 18, 3);
+  ctr("press to cancel", 52, 1);
+  oled.display();
+}
+static void tamperArm() {
+  if (!fsOk) { flash("NO FILESYSTEM", 1200); return; }
+  wake("tamper");
+  tamperCountAt = millis();
+  if (!tamperCountAt) tamperCountAt = 1;
+}
+
+#define ADXL_A 0x53
+static void tamperDeep(bool pause) {
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  if (pause) {                                  // let a move finish before listening again
+    rtcTamper = 2;
+    esp_sleep_enable_timer_wakeup(30ULL * 1000000ULL);
+  } else {
+    rtcTamper = 1;
+    esp_deep_sleep_enable_gpio_wakeup(BIT(TAP_INT_PIN), ESP_GPIO_WAKEUP_GPIO_HIGH);
+  }
+  esp_deep_sleep_start();
+}
+// Called first thing in setup, armed and woken. Never returns.
+static void tamperWake(bool moved) {
+  if (rtcTz[0]) { setenv("TZ", rtcTz, 1); tzset(); }
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  if (moved) {
+    fsOk = LittleFS.begin(false);
+    tlogAdd("Moved");
+    LittleFS.end();
+    rReg(ADXL_A, 0x30);
+    tamperDeep(true);
+  }
+  pinMode(TAP_INT_PIN, INPUT_PULLDOWN);
+  rReg(ADXL_A, 0x30);                           // reading INT_SOURCE lets INT1 go
+  delay(5);
+  if (digitalRead(TAP_INT_PIN)) tamperDeep(true);   // still moving
+  tamperDeep(false);
+}
+static void tamperGo() {
+  tlogAdd("Armed");
+  prefs.putBool("tamper", true);
+  const char* tz = getenv("TZ");
+  snprintf(rtcTz, sizeof(rtcTz), "%s", tz ? tz : "");
+  oled.clearDisplay(); oled.display();
+  screenPower(false);
+  bleOff();
+  if (cfgNet == NET_WIFI) { WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF); }
+  cfgNet = NET_OFF;
+  Serial.println("tamper: armed");
+  if (intWired && adxl) {
+    wReg(adxl, 0x2E, 0x00);                     // nothing while it changes
+    wReg(adxl, 0x24, 6);                        // THRESH_ACT, 375 mg
+    wReg(adxl, 0x27, 0xF0);                     // activity, AC coupled, x y z
+    wReg(adxl, 0x2F, 0x00);                     // everything to INT1
+    wReg(adxl, 0x2E, 0x10);                     // activity only
+    rReg(adxl, 0x30);
+    delay(20);
+    tamperDeep(false);                          // never returns
+  }
+  // No wire: watch from here, five times a second, in light sleep.
+  if (pmAvail) {
+    esp_pm_config_t c = {};
+    c.max_freq_mhz = 80; c.min_freq_mhz = 40; c.light_sleep_enable = true;
+    esp_pm_configure(&c);
+  }
+  readSensors();
+  float bx = ax, by = ay, bz = az;
+  uint32_t lastMove = 0, lastTouch = 0;
+  rtcTamper = 0;                                // nothing to resume from deep sleep
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(200));
+    readSensors();
+    uint32_t now = millis();
+    float d = fabsf(ax - bx) + fabsf(ay - by) + fabsf(az - bz);
+    if (d > 0.25f) {
+      if (!lastMove || now - lastMove > 30000) { tlogAdd("Moved"); lastMove = now; }
+      bx = ax; by = ay; bz = az;
+    }
+    if (digitalRead(TOUCH_PIN) != touchRest) {
+      if (!lastTouch || now - lastTouch > 30000) { tlogAdd("Touched"); lastTouch = now; }
+    }
+  }
+}
+static void serviceTamper() {
+  if (tamperCountAt && millis() - tamperCountAt >= TAMPER_COUNT_MS) {
+    tamperCountAt = 0;
+    tamperGo();
   }
 }
 
@@ -10093,6 +13428,18 @@ void setup() {
   esp_sleep_wakeup_cause_t woke_ = esp_sleep_get_wakeup_cause();
   bool fromDeep = (woke_ == ESP_SLEEP_WAKEUP_GPIO || woke_ == ESP_SLEEP_WAKEUP_TIMER);
   Serial.begin(115200);
+  // Armed for tamper: a wake is either something moving it or the end
+  // of the pause after one. Either way it is written down and it goes
+  // straight back. Nothing else runs, and this never returns.
+  if (rtcTamper && (woke_ == ESP_SLEEP_WAKEUP_GPIO || woke_ == ESP_SLEEP_WAKEUP_TIMER))
+    tamperWake(woke_ == ESP_SLEEP_WAKEUP_GPIO);
+  // Asleep in Away: show the message, write it down, back off. Never
+  // returns, and never reaches the radio.
+  if (rtcAwayDeep && woke_ == ESP_SLEEP_WAKEUP_TIMER && rtcAwayCheck) awayCheckBoot = true;
+  else if (rtcAwayDeep && (woke_ == ESP_SLEEP_WAKEUP_GPIO || woke_ == ESP_SLEEP_WAKEUP_TIMER))
+    awayDeepWake(woke_ == ESP_SLEEP_WAKEUP_TIMER);
+  rtcAwayCheck = 0;
+  rtcAwayDeep = 0;
   // Before the serial port settles, before anything is read and long
   // before anything is powered. A touch that was not meant costs this
   // much and nothing else.
@@ -10100,6 +13447,8 @@ void setup() {
   delay(300);
 
   prefs.begin("nexus", false);
+  pmInit();                            // says whether light sleep is on offer
+  bool awayBoot = prefs.getBool("away", false);   // Away: no start-up screens at all
   cBoot = prefs.getUInt("boots", 0) + 1;
   prefs.putUInt("boots", cBoot);
 
@@ -10111,6 +13460,15 @@ void setup() {
     esp_reset_reason_t rr = esp_reset_reason();
     bool crashed = (rr == ESP_RST_PANIC   || rr == ESP_RST_INT_WDT ||
                     rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT);
+    // 6.0.1: a restart nobody asked for is said on the screen at boot,
+    // and kept for RAFIQ status, so "it rebooted" can be told apart
+    // from "it went to sleep and woke up".
+    lastReset = rr == ESP_RST_POWERON ? "power on" : rr == ESP_RST_DEEPSLEEP ? "sleep wake"
+              : rr == ESP_RST_SW ? "restart" : rr == ESP_RST_PANIC ? "crash"
+              : (rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT) ? "watchdog"
+              : rr == ESP_RST_BROWNOUT ? "low power" : rr == ESP_RST_EXT ? "reset pin" : "other";
+    if (crashed)                  bootNote = rr == ESP_RST_PANIC ? "RESTARTED: CRASH" : "RESTARTED: WATCHDOG";
+    else if (rr == ESP_RST_BROWNOUT) bootNote = "RESTARTED: LOW POWER";
     int crashes = prefs.getInt("panics", 0);
     if (crashed) { crashes++; prefs.putInt("panics", crashes); }
     else if (crashes)         prefs.putInt("panics", 0);
@@ -10137,7 +13495,7 @@ void setup() {
   cfgLock     = prefs.getBool("lock", false) && cfgTok.length();
   cfgFollow   = prefs.getBool("follow", false);
   cfgTap      = constrain(prefs.getInt("tap", TAP_MED), 0, TAP_N - 1);
-  cfgAutoUp   = prefs.getBool("autoup", false);
+  cfgAutoUp   = false;                 // 7.4.1: never fetches releases by itself
   cfgKnock    = prefs.getBool("knock", false);   // the pad drives this now
   cfgHijriAdj = constrain(prefs.getInt("hadj", 0), -2, 2);
   // Carried over from the old on/off. Off meant off; anything else
@@ -10147,6 +13505,31 @@ void setup() {
     cfgNet = prefs.getBool("offl", false) ? NET_OFF : NET_WIFI;
     prefs.putInt("net", cfgNet);
   }
+  // 6.0: Bluetooth is home and WiFi is never kept. A robot coming up
+  // from 5.x on WiFi moves to Bluetooth once, here, and anything that
+  // ever writes WiFi as home again is corrected the same way.
+  if (!prefs.getBool("netv6", false)) prefs.putBool("netv6", true);
+  if (cfgNet == NET_WIFI) { cfgNet = NET_BT; prefs.putInt("net", cfgNet); }
+  cfgNetHome = cfgNet;
+  cfgPGuard  = prefs.getBool("guard", false);
+  cfgHoldIdx = constrain(prefs.getInt("holdi", 1), 0, HOLD_N - 1);
+  cfg12h     = prefs.getBool("h12", false);
+  cfgWakeBy  = constrain(prefs.getInt("wakeby", 0), 0, 2);
+  cfgMulti    = prefs.getBool("multi", false);
+  cfgAutoAway = prefs.getBool("autoaway", true);
+  cfgNight    = prefs.getBool("night", false);
+  cfgBed      = constrain(prefs.getInt("bed", 23 * 60), 0, 1439);
+  awayAuto    = prefs.getBool("awaya", false);
+  devLoad();
+  filtersLoad();                       // 7.5
+  cfgBlog  = prefs.getBool("blog", true);
+  cfgPLock = constrain(prefs.getInt("plock", 2), 0, 3);
+  lastUserAt = millis();
+  cfgBlogV = constrain(prefs.getInt("blogv", 1), 0, 3);
+  cfgCap   = constrain(prefs.getInt("cap", 350), 50, 5000);
+  blogBoot(fromDeep);                  // 7.8
+  cfgQuiet   = prefs.getBool("quiet", false);
+  lastSyncAt = prefs.getUInt("lsync", 0);
   cfgWakeIdx  = constrain(prefs.getInt("wakeh", 2), 0, WAKE_N - 1);
   cfgBike     = prefs.getBool("bike", false);
   cfgBikeTpl  = constrain(prefs.getInt("btpl", 0), 0, BIKE_TPL_N - 1);
@@ -10180,6 +13563,7 @@ void setup() {
     wCity[sizeof(wCity) - 1] = 0;
   }
   loadTasks();
+  loadWx();
   loadRems();
   loadPrayer();
   loadAdj();
@@ -10198,6 +13582,12 @@ void setup() {
 
   fsOk = LittleFS.begin(true);                 // format it once if it is blank
   if (!fsOk) Serial.println("no filesystem");
+  // Any real start ends a tamper watch. Deep sleep wakes never get
+  // here while it is armed, so arriving here at all is the disarm.
+  bool tamperWas = prefs.getBool("tamper", false);
+  rtcTamper = 0;
+  if (tamperWas) { prefs.putBool("tamper", false); tlogAdd("Disarmed"); }
+  loadNotes();
   loadShelf();
 
   // A first guess at resting, so it is right from the first second
@@ -10259,7 +13649,7 @@ void setup() {
   // sensor sweep, the name card and the how-to card. The eyes opening
   // is not an introduction, it is the robot waking up, and leaving it
   // out made coming back from a touch look like a fault.
-  animWake();
+  if (!fromDeep && !awayBoot) animWake(1200);   // from sleep or in Away: no ceremony
   startSensors();
   applyFallInt();
   applyTap();
@@ -10269,7 +13659,7 @@ void setup() {
   applyTap();
   deepOff = prefs.getBool("nodeep", false);
   Serial.printf("INT1 %s\n", intWired ? "wired, it can switch off" : "not wired, screen off only");
-  if (!fromDeep) animSenses(1500);
+  if (!fromDeep && !awayBoot) animSenses(700);
 
   // Off means off, from here and not from a few lines later. Setting
   // the mode at all brings the radio up, so when you have said stay
@@ -10288,7 +13678,7 @@ void setup() {
   // on its own, which is the case where saying nothing is right.
   {
     struct tm t0;
-    if (getLocalTime(&t0, 0) && t0.tm_year > 123) {   // past 2023, so it is real
+    if (nowLocal(&t0) && t0.tm_year > 123) {   // past 2023, so it is real
       timeOk = true;
       clockSrc = "kept through sleep";
       Serial.println("clock survived: reminders and prayer times still stand");
@@ -10296,27 +13686,43 @@ void setup() {
   }
 
   loadNets();
-  // Safe mode is WiFi and nothing else. Gesture mode is already off
-  // at boot and only the Mac turns it on, so the radio is the whole
-  // of it: whatever was wrong can be fixed over the air from here.
+  // Manual WiFi carries on through deep sleep and ends on anything
+  // else. The deadline lives in RTC memory, which a real restart
+  // clears, so this is the whole of that rule.
+  {
+    bool keep = (esp_reset_reason() == ESP_RST_DEEPSLEEP) && rtcWsKind == WS_MANUAL &&
+                rtcWsUntil && (uint32_t)time(nullptr) < rtcWsUntil;
+    if (keep) { cfgNet = NET_WIFI; wsKind = WS_MANUAL; wsStartMs = wsLastUse = millis();
+                Serial.println("manual wifi carries on through the sleep"); }
+    else      { rtcWsUntil = 0; rtcWsKind = 0; }
+  }
+  bool needHotspot = false;
+  // Safe mode is WiFi and nothing else, for this start only. With no
+  // network saved it is the hotspot, so there is always a way in.
   if (safeMode) {
-    cfgNet = NET_WIFI;
-    prefs.putInt("net", cfgNet);
     prefs.putInt("btry2", 0);
+    if (netCount) { cfgNet = NET_WIFI; wsKind = WS_MANUAL; wsStartMs = wsLastUse = millis(); }
+    else          { cfgNet = NET_OFF; needHotspot = true; }
     flash("SAFE MODE", 1500);
-    flash("ON WIFI, UPDATE ME", 1800);
+    flash("UPDATE ME", 1800);
   }
   // Did the last attempt at Bluetooth come back? If the note is still
   // there, it did not, and the robot is not going to try it again on
   // its own. WiFi, and a word on the screen about why.
+  // 7.4: only a crash is a failed start. Power off and on, the reset
+  // button, a restart or a deep-sleep wake are not, and used to add up
+  // until WiFi came on by itself. And a real failure no longer turns
+  // WiFi on: WiFi is only ever on because it was asked for.
+  {
+    esp_reset_reason_t r = esp_reset_reason();
+    bool crash = (r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT);
+    if (!crash) prefs.putInt("btry2", 0);
+  }
   if (cfgNet == NET_BT && prefs.getInt("btry2", 0) >= BT_GIVE_UP) {
     prefs.putInt("btry2", 0);
-    cfgNet = NET_WIFI;
-    prefs.putInt("net", cfgNet);
     btFellBack = true;
-    Serial.printf("bluetooth failed %d starts running: back on WiFi\n", BT_GIVE_UP);
-    flash("BLUETOOTH FAILED", 1400);
-    flash("BACK ON WIFI", 1200);
+    Serial.printf("bluetooth crashed %d starts running: trying again, no WiFi\n", BT_GIVE_UP);
+    flash("BLUETOOTH RESTARTED", 1400);
   }
   if (cfgOffline) {
     WiFi.persistent(false);
@@ -10360,9 +13766,13 @@ void setup() {
       restingFace(timeOk ? "Clock set" : "Clock still coming", 700);
       nameCard();
     }
-  } else if (!fromDeep && !cfgOffline) {
+  } else if (!fromDeep && !cfgOffline && !awayBoot) {
     offlineWelcome();
   }
+  if (needHotspot) startHotspot();
+  if (tamperWas) flash("TAMPER OFF, SEE LOG", 1800);
+  if (bootNote) flash(bootNote, 2500);
+  Serial.printf("last reset: %s, light sleep: %s\n", lastReset, pmAvail ? "yes" : "no");
 
   eyes.setAutoblinker(ON, 7, 5);      // a blink now and then, not a flutter
   eyes.setIdleMode(ON, 5, 4);
@@ -10372,19 +13782,19 @@ void setup() {
   // Not shown when it was only switched off: you know how to knock by
   // the second time you pick it up.
   oled.clearDisplay();
-  if (!fromDeep) {
+  if (!fromDeep && !awayBoot) {
     // What the pad does, because the pad is how it is driven. It used
     // to list what one to four knocks meant, which is a feature that
     // is off unless you ask for it.
+    // The controls as they are since 6.1: a tap moves on, a hold opens,
+    // a longer hold goes back, four seconds switches off.
     titleBarC("HOW TO USE ME");
-    at(8,  16, "1  next");
-    at(8,  28, "2  back");
-    at(66, 16, "hold  open");
-    at(66, 28, "5s  home");
+    ctr("tap: next  hold: open", 16, 1);
+    ctr("long: back  4s: off", 28, 1);
     oled.drawFastHLine(8, 40, 112, SSD1306_WHITE);
     ctr("Touch the pad", 48, 1);
   }
-  if (!fromDeep) {
+  if (!fromDeep && !awayBoot) {
     oled.display();
     holdCard(2000);                    // a knock ends it, and it never dawdles
   }
@@ -10404,9 +13814,35 @@ void setup() {
   if (fromDeep) {
     wokeForAlarm = (woke_ == ESP_SLEEP_WAKEUP_TIMER);
     wokeBy = wokeForAlarm ? "prayer" : "picked up";
+    if ((wokeForAlarm && rtcWakeCheck) || awayCheckBoot) {   // only looking for the phone
+      wokeForAlarm = false; wokeBy = "check";
+      checkWake = true;
+    }
     Serial.printf("back from being off (%s)\n", wokeBy.c_str());
   }
-  drawHome();                          // on screen before anything can block
+  if (!fromDeep) rtcAwaySince = 0;
+  rtcWakeCheck = 0;
+  awayOn   = prefs.getBool("away", false);
+  awayText = prefs.getString("awayt", "");
+  if (awayOn && !checkWake) {
+    // Switched off and on: eyes, the message for three seconds, then
+    // two minutes of Bluetooth in the background for a RAFIQ home.
+    awayListenUntil = millis() + AWAY_LISTEN_RESTART_MS;
+    awayShowMs = AWAY_RESTART_SHOW_MS;
+    awayEyes(true);                    // the eyes open, then the message
+    lastActive = millis(); lastDraw = 0;
+    tlogAdd("Away: restarted");
+    Serial.println("away: restarted, listening for two minutes");
+  }
+  if (checkWake) {
+    // Dark, listening, for twenty seconds. The loop decides: the phone
+    // came back and it stays linked, or it is off again.
+    asleep = true; sleptAt = millis();
+    screenPower(false);
+    checkUntil = millis() + CHECK_WINDOW_MS;
+  } else {
+    drawHome();                        // on screen before anything can block
+  }
 
   // These all started at zero, so the first pass through loop() fired
   // every one of them back to back: weather, then prayer, then a story.
@@ -10438,6 +13874,17 @@ void loop() {
   web.handleClient();
   unsigned long now = millis();
 
+  // Keep a note of the time while it is trustworthy, for the screen
+  // that comes up before the clock has landed.
+  {
+    static uint32_t lgAt = 0;
+    if (timeOk && (!lgAt || now - lgAt > 60000UL)) {
+      lgAt = now;
+      time_t e = time(nullptr);
+      if (e > 1735689600L) lastGoodEpoch = e;      // after 2025, so it is real
+    }
+  }
+
   // Up this long with the radio running is survival. Tear the note up
   // so a later unplug is not read as a crash.
   if (btNoteOut && now - btNoteAt > BT_PROVEN_MS) {
@@ -10445,7 +13892,62 @@ void loop() {
     Serial.println("bluetooth: held, the count is clear");
   }
   btTick();                            // the phone's clock and notifications
-  if (now - lastPoll >= 45) { lastPoll = now; input(); }
+  appTick();                           // 7.2: what the Rafiq app sent
+  if (screen == S_HOME) inHub = -1;    // 7.6: Home forgets which hub you were in
+  linkTick();                          // 7.3: who stays connected, and who is the phone
+  nightTick();                         // 7.7: bedtime
+  blogTick();                          // 7.8: where the battery goes
+  pocketTick();                        // 7.9: holding to unlock
+  idleRhythm();                        // 7.7: a slower link while the screen is dark
+  gestTilt();                          // 7.5: lean and the tilt knob, for the Mac
+  if (remBatch && millis() - remBatchAt > 800) {
+    sortRems(); saveRems();
+    if (remIdx > remCount) remIdx = remCount;
+    remAddedCard(remBatch, remBatchSoonest);
+    remBatch = 0; remBatchSoonest = 0;
+  }
+  // 7.3: the phone gone two minutes, nothing else connected: Away, by
+  // itself. It ends by itself too, when anything Rafiq knows comes back.
+  if (cfgAutoAway && !awayOn && cfgNet == NET_BT && btUp && btEverLinked && !tmrOn &&
+      linkN == 0 && btDropAt && (int32_t)(millis() - btDropAt) > (int32_t)AUTO_AWAY_MS) {
+    tlogAdd("Auto away: phone gone");
+    awaySet(true, nullptr);
+    awayAuto = true; prefs.putBool("awaya", true);
+    awayListenUntil = millis() + 4000;   // the message once, then off
+    awayShowMs = 3000;
+  }
+  if (awayOn && awayAuto && anyLinked()) {
+    tlogAdd("Auto away: phone back");
+    awaySet(false, nullptr);
+  }
+  serviceWs();                         // WiFi sessions, syncs, commands waiting
+  if (btNews) {
+    uint8_t k = btNews; btNews = 0;
+    if (!asleep && cfgNet == NET_BT) { banText = k == 1 ? "iPhone connected" : "iPhone disconnected"; banUntil = millis() + 1100; }
+  }
+  pgTick();                            // the phone guard
+  serviceTamper();
+  // 6.4: these run asleep as well as awake.
+  tmrTick();
+  awayFlush(false);
+  if (awayOn && awayListenUntil && (int32_t)(now - awayListenUntil) > 0) awayDeepGo();
+  if (phoneHeld()) rtcAwaySince = 0;   // the phone is here: the checking schedule starts over
+  if (checkWake) {
+    if (phoneHeld() || anyLinked()) { checkWake = false; Serial.println("check: phone is back, staying linked"); }
+    else if (now > checkUntil) {
+      checkWake = false;
+      if (awayOn) { awayQuietDeep = true; awayDeepGo(); }   // still away: back to Away's sleep
+      else        { deepAuto = true; goDeep(); }
+    }
+  }
+  if (wxDirty) { wxDirty = false; saveWx(); }
+
+  // Light sleep, between passes of this loop, whenever the screen is
+  // dark on Bluetooth. The phone stays linked through it. Not with a
+  // cable in, because the USB port does not survive it.
+  bool lsNow = asleep && pmAvail && cfgNet == NET_BT && !usb_serial_jtag_is_connected();
+  pmSet(lsNow);
+  if (now - lastPoll >= (lsNow ? 100UL : 45UL)) { lastPoll = now; input(); }
   readBattery();                       // every twenty seconds, it decides
   serviceSession();
   servicePrayerAlert();
@@ -10493,7 +13995,7 @@ void loop() {
     if ((long)(now - nextWx) >= 0) { nextWx = now + 900000UL; wantWx = true; }
 
     struct tm t;
-    bool haveDay = timeOk && getLocalTime(&t, 0);
+    bool haveDay = timeOk && nowLocal(&t);
     // They barely move week to week, and refetching daily meant losing
     // them whenever the network was down. Keep what is in flash; refresh
     // when asked, or once every fiftieth boot.
@@ -10662,13 +14164,28 @@ void loop() {
   // screen going dark and the robot switching off are the same moment.
   // On the network it keeps the two apart, because dropping the Mac
   // mid sentence to save a little current is a poor trade.
-  uint32_t wait = offlineNow() ? 0 : deepAfterMs();
+  //
+  // 6.0: on Bluetooth with a core that can light sleep, a linked phone
+  // is somebody listening as well, so it stays dark and linked rather
+  // than switching off. A minute after the phone goes, it switches off
+  // as before. A sync, the hotspot or an update in progress hold it up.
+  bool btWait = pmAvail && cfgNet == NET_BT && btUp;
+  uint32_t wait = btWait ? BT_DEEP_GRACE_MS : (offlineNow() ? 0 : deepAfterMs());
+  uint32_t since = sleptAt;
+  if (btWait && btDropAt && (int32_t)(btDropAt - sleptAt) > 0) since = btDropAt;
   if (!deepOff && !cfgGesture && (offlineNow() || deepAfterMs()) && asleep && !sessionRunning() &&
-      !macLinked && (now - sleptAt) > wait && upState == U_OFF && !storyBusy) {
+      !macLinked && !phoneHeld() && !pgUntil && !syncRun && !rqPend && !tamperCountAt &&
+      (wsKind == WS_NONE || wsKind == WS_MANUAL) &&
+      (now - since) > wait && upState == U_OFF && !storyBusy && !awayOn && !checkWake && !tmrOn) {
+    deepAuto = true;
     goDeep();
   }
 
-  if (asleep) { delay(6); return; }
+  if (asleep) { delay(lsNow ? 50 : 6); return; }
+
+  // 7.1: the sensor and knock tests are about moving it, so while one
+  // is open the screen holds itself, as a game does.
+  if (screen == S_SETTINGS && depth == 2 && (itemIdx == C_ACCEL || tapTesting)) lastActive = now;
 
   // the counter paces itself, and holds the screen while it runs
   if (screen == S_FAITH && depth == 2 && itemIdx == F_ZIKR) {
@@ -10714,6 +14231,80 @@ void loop() {
     if (now - lastDraw >= 60) { lastDraw = now; drawPrayerAlert(); }
     delay(2);
     return;
+  }
+
+  if (tmrOn && !awayOn && !asleep) {
+    lastActive = now;
+    if (now - lastDraw >= (tmrDone ? 120UL : 250UL)) { lastDraw = now; drawTimer(); }
+    delay(5); return;
+  }
+  if (awayOn && !asleep) {
+    if ((int32_t)(millis() - lastActive) > (int32_t)awayShowMs) {
+      awayShowMs = AWAY_SHOW_MS;
+      awayEyes(false);                   // eyes close, then dark
+      goSleepQuick();
+      return;
+    }
+    if (now - lastDraw >= 100) { lastDraw = now; drawAway(); }
+    delay(5); return;
+  }
+  if (glanceUntil && now > glanceUntil) {
+    glanceUntil = 0;
+    if (!popOn && !pgUntil && !findUntil && upState == U_OFF && alertPhase == AL_NONE) goSleepQuick();
+  }
+  if (banUntil && now > banUntil) banUntil = 0;
+  if (banUntil) {
+    if (now - lastDraw >= 100) { lastDraw = now; oled.clearDisplay(); ctr(banText, 28, 1); oled.display(); }
+    delay(2); return;
+  }
+  if (popOn && now > popUntil) popupClose(false);
+  if (popOn) {
+    lastActive = now;
+    if (now - lastDraw >= 100) { lastDraw = now; drawPopup(); }
+    delay(2); return;
+  }
+  if (notesDirty && now - notesSavedAt > 3000) saveNotes();
+
+  // 6.0's cards, below the call to prayer and above everything else.
+  if (tamperCountAt) {
+    lastActive = now;
+    if (now - lastDraw >= 100) { lastDraw = now; drawTamperCount(); }
+    delay(2); return;
+  }
+  // 7.5: an update arriving over Bluetooth owns the screen
+  if (otaOn) {
+    lastActive = now;
+    if (otaErr) otaStop("link");
+    else if ((int32_t)(now - otaLastAt) > 20000) otaStop("timeout");
+    else {
+      int pct = otaSize ? (int)((uint64_t)otaGot * 100 / otaSize) : 0;
+      if (pct / 5 != otaPctSent / 5) { otaPctSent = pct; char b[12]; snprintf(b, sizeof(b), "ota %d", pct); evtSend(b); }
+      if (now - lastDraw >= 250) { lastDraw = now; drawBleOta(); }
+      delay(2); return;
+    }
+  }
+  if (nightCardUntil) {
+    lastActive = now;
+    if (now - lastDraw >= 200) { lastDraw = now; drawNightCard(); }
+    delay(2); return;                                  // the card owns the screen
+  }
+  if (walkUntil && now > walkUntil) walkUntil = 0;
+  if (walkUntil) {
+    lastActive = now;
+    if (now - lastDraw >= 120) { lastDraw = now; drawWalk(); }
+    delay(2); return;
+  }
+  if (pgUntil && now > pgUntil) pgUntil = 0;
+  if (pgUntil) {
+    lastActive = now;
+    if (now - lastDraw >= 120) { lastDraw = now; drawGuard(); }
+    delay(2); return;
+  }
+  if (findUntil && now > findUntil) findUntil = 0;
+  if (findUntil) {
+    lastActive = now;
+    if (now - lastDraw >= 120) { lastDraw = now; drawFind(); }
+    delay(2); return;
   }
 
   // What the Mac asked for. The call to prayer is checked above this
@@ -10775,6 +14366,11 @@ void loop() {
     delay(2); return;
   }
   if (canvasUntil && now >= canvasUntil) canvasUntil = 0;
+  if (relaxOn && relaxUntil && (long)(now - relaxUntil) >= 0) {
+    relaxOn = false; relaxUntil = 0;
+    goSleep();
+    return;
+  }
   if (relaxOn) {
     lastActive = now;
     if ((long)(now - relaxNext) >= 0) { relaxKind = (relaxKind + 1) % 3; relaxNext = now + 30000UL; }
@@ -10818,12 +14414,9 @@ void loop() {
     // the ring. A hundred and ten milliseconds apart, which is what
     // the blinking was. Drawing one or the other fixes it and saves
     // a frame.
-    // Before everything, including the hold overlay: while the
-    // hotspot is up there is nothing else to look at.
-    if (apLock) { drawHotspot(); delay(2); return; }
     if (sleepArmed) { drawHoldTier(now); oled.display(); delay(2); return; }
     switch (screen) {
-      case S_FOCUS:    drawFocus();    break;
+      case S_FOCUS:    drawMac();      break;   // 7.5
       case S_WEATHER:  drawWeather();  break;
       case S_MSG:      drawMessage();  break;
       case S_PRAYER:   drawPrayer();   break;
@@ -10834,6 +14427,7 @@ void loop() {
       case S_BIKE:     drawBike();      break;
       case S_REMIND:   drawReminders(); break;
       case S_SYSTEM:   drawSystem();   break;
+      case S_TODAY: case S_FHUB: case S_CALM: drawHub(); break;   // 7.6
       default:         drawHome();     break;
     }
   }

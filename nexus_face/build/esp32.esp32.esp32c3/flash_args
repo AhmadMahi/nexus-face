@@ -1,5 +1,0 @@
---flash-mode dio --flash-freq 80m --flash-size 4MB
-0x0 nexus_face.ino.bootloader.bin
-0x8000 nexus_face.ino.partitions.bin
-0xe000 boot_app0.bin
-0x10000 nexus_face.ino.bin
