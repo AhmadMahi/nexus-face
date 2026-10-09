@@ -2,10 +2,3 @@ out/
 *.bin
 *.elf
 .DS_Store
-# Build output and generated test artefacts. The map alone is 16 MB and
-# nothing reads it out of the repository.
-nexus_face/build/
-tools/v6/t
-tools/v6/fw_funcs.inc
-tools/v6/screens.png
-tools/v6/icons.json

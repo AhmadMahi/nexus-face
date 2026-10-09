@@ -316,7 +316,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "7.10.0"
+#define FW_VERSION "7.10.1"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -11883,7 +11883,11 @@ static void appBang(char* c, uint16_t conn) {
     if (cfgFollow) wake("follow"); else curUntil = 0;
     // a quicker link while the eyes follow, back to the light one after
     NimBLEServer* sv = NimBLEDevice::getServer();
-    if (sv) sv->updateConnParams(conn, cfgFollow ? 24 : 72, cfgFollow ? 40 : 96, cfgFollow ? 0 : 4, cfgFollow ? 400 : 600);
+    // The timeout stays at 6 s in both. Four seconds was outside the
+    // window Apple allows, so the whole request was refused and Follow
+    // ran at the ordinary rhythm, which is the thing it most needs not
+    // to do.
+    if (sv) sv->updateConnParams(conn, cfgFollow ? 24 : 72, cfgFollow ? 40 : 96, cfgFollow ? 0 : 4, 600);
   } else if (verb == "dnd") {
     int mm = constrain(atoi(rest), 0, 480);
     dndUntil = mm ? millis() + (unsigned long)mm * 60000UL : 0;
@@ -11997,7 +12001,14 @@ static void appBang(char* c, uint16_t conn) {
       otaOn = true; otaErr = false; otaSize = sz; otaGot = 0; otaLastAt = millis(); otaPctSent = -1;
       otaConn = conn;
       NimBLEServer* sv = NimBLEDevice::getServer();
-      if (sv) sv->updateConnParams(conn, 6, 12, 0, 400);   // as fast as the link goes
+      // 15 to 30 ms, never skipping. Not 7.5 to 15: Apple requires the
+      // minimum to be at least 15 ms AND a multiple of 15 ms, with the
+      // maximum at least 15 ms above it, and a request that breaks any
+      // of that is simply refused. The refusal is silent, so the link
+      // stayed at the ordinary 90 to 120 ms with a latency of 4, which
+      // is why sending 1.5 MB took as long as it did while the hotspot,
+      // on WiFi, finished in moments.
+      if (sv) sv->updateConnParams(conn, 12, 24, 0, 600);
       pmSet(false);
       wake("update");
       evtSend("ota ready");
@@ -12203,6 +12214,11 @@ static void drawBleOta() {
 static void otaStop(const char* why) {
   if (otaOn) Update.abort();
   otaOn = false;
+  // Put the ordinary rhythm back; the fast one is for sending bytes.
+  {
+    NimBLEServer* sv = NimBLEDevice::getServer();
+    if (sv && otaConn != 0xFFFF) sv->updateConnParams(otaConn, 72, 96, 4, 600);
+  }
   char b[32]; snprintf(b, sizeof(b), "ota err %s", why); evtSend(b);
   Serial.printf("ota over bluetooth stopped: %s\n", why);
   flash("UPDATE STOPPED", 1400);
@@ -12407,7 +12423,13 @@ static void hubEnter(int hubScr, int sel) {
 // wakes roughly once every two seconds instead of twice a second.
 static void idleRhythm() {
   static bool was = false;
-  bool idle = asleep && !cfgFollow && !otaOn;
+  // Never during an update. The update asks for the quickest rhythm
+  // the link will take, and this would put it straight back to the
+  // ordinary one: the update wakes the robot, waking flips idle, and
+  // flipping idle is exactly what this watches for. The fast request
+  // was being undone a moment after it was made.
+  if (otaOn) { was = false; return; }
+  bool idle = asleep && !cfgFollow;
   if (idle == was) return;
   was = idle;
   NimBLEServer* sv = NimBLEDevice::getServer();

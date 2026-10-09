@@ -13,15 +13,7 @@ python3 extract_rafiq.py utcFromTm rqSkip rqTagged rqAfterTag rafiqIs rqFresh rq
 g++ -std=gnu++17 -w -o t test_rafiq.cpp && ./t
 ```
 
-## Running the checks (7.10)
-
-```
-zsh run_tests.sh                 # 125 host tests; the function list lives here,
-                                 # not in the block above, which is the 6.0 one
-python3 geniconsjson.py          # icons.json, straight from the .ino's IC_* table
-python3 ui_check.py              # every screen measured; 0 problems expected
-```
-
-`icons.json`, `fw_funcs.inc`, `t` and `screens.png` are all generated and are
-not kept in the repository. The icon table used to be a hand-kept copy, which
-is a layout checker drawing yesterday's icons.
+`conn_check.py` reads every `updateConnParams` call out of the `.ino` and
+measures it against Apple's rules. A central refuses a request that breaks
+them and says nothing, so the link simply stays slow; that is how sending
+firmware over Bluetooth ran at the ordinary rhythm for so long.
