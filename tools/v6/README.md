@@ -17,3 +17,9 @@ g++ -std=gnu++17 -w -o t test_rafiq.cpp && ./t
 measures it against Apple's rules. A central refuses a request that breaks
 them and says nothing, so the link simply stays slow; that is how sending
 firmware over Bluetooth ran at the ordinary rhythm for so long.
+
+`pm_check.py` asks whether the core this will build against is the patched one.
+Without the patch `esp_pm_configure` fails, `pmAvail` is false, `phoneHeld()`
+returns false whatever is connected, and the robot deep-sleeps the moment the
+screen darkens and never light-sleeps. It builds and runs either way, which is
+how three releases went out on a stock core. Run it before any release build.
