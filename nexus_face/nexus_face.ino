@@ -316,7 +316,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "7.11.1"
+#define FW_VERSION "7.12.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -1819,6 +1819,15 @@ static void phoneFix() {
 }
 // Is one of the links a Mac? macLinked is the old WiFi answer and says
 // nothing about Bluetooth, which is where a Mac actually lives now.
+// A story is being sent on this link, so it was put on the quick
+// rhythm. Put the ordinary one back when it is over, however it ended.
+uint16_t rdConn = 0xFFFF;
+static void rdRhythmBack() {
+  NimBLEServer* sv = NimBLEDevice::getServer();
+  if (sv && rdConn != 0xFFFF) sv->updateConnParams(rdConn, 72, 96, 4, 600);
+  rdConn = 0xFFFF;
+}
+
 static bool macOnBle() {
   for (int i = 0; i < linkN; i++) if (links[i].authed && linkIsMac(i)) return true;
   return false;
@@ -11950,6 +11959,15 @@ static void appBang(char* c, uint16_t conn) {
     if (!strcmp(rest, "begin")) {
       rdRx = ""; rdRxOn = true;
       storyState = "Receiving";
+      // A story is twenty or so pieces and every one of them is a round
+      // trip, so at the resting rhythm of 90 to 120 ms it takes most of
+      // a minute. The same quick rhythm the update asks for, and within
+      // Apple's rules so it is actually granted.
+      {
+        NimBLEServer* sv = NimBLEDevice::getServer();
+        if (sv && conn != 0xFFFF) sv->updateConnParams(conn, 12, 24, 0, 600);
+      }
+      rdConn = conn;
       evtSend("read ok");
     } else if (!strncmp(rest, "+ ", 2)) {
       if (!rdRxOn) return;
@@ -11973,14 +11991,21 @@ static void appBang(char* c, uint16_t conn) {
         evtSend(b);
         storyState = "Came through short";
         rdRx = "";
+        rdRhythmBack();
         return;
       }
       addRead(rdRx);
       rdRx = "";
       loadShelf();
+      rdRhythmBack();
+      // Say so. A story arriving with nothing on the screen is a story
+      // you do not know you have.
+      storyState = "Ready";
+      flash("NEW STORY", 1200);
       evtSend("read done");
     } else if (!strcmp(rest, "abort")) {
       rdRxOn = false; rdRx = "";
+      rdRhythmBack();
     }
   } else if (verb == "ota") {
     if (!strncmp(rest, "begin ", 6)) {
