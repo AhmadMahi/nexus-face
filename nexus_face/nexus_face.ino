@@ -316,7 +316,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "7.10.1"
+#define FW_VERSION "7.11.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -612,6 +612,8 @@ char vipWords[VIP_N][20];  int vipN = 0;
 // ---- updates over Bluetooth ----
 volatile bool otaOn = false, otaErr = false;
 volatile uint32_t otaSize = 0, otaGot = 0, otaLastAt = 0;
+String   rdRx;                         // a story arriving from the Mac
+bool     rdRxOn = false;
 uint16_t otaConn = 0xFFFF;
 int otaPctSent = -1;
 extern bool cfgGesture, cfgFollow;     // both declared with gestures, further down
@@ -1815,6 +1817,13 @@ static void phoneFix() {
     return;
   }
 }
+// Is one of the links a Mac? macLinked is the old WiFi answer and says
+// nothing about Bluetooth, which is where a Mac actually lives now.
+static bool macOnBle() {
+  for (int i = 0; i < linkN; i++) if (links[i].authed && linkIsMac(i)) return true;
+  return false;
+}
+
 static bool anyLinked() {
   for (int i = 0; i < linkN; i++) if (links[i].authed) return true;
   return false;
@@ -1996,7 +2005,7 @@ class RqChrCb : public NimBLECharacteristicCallbacks {
     long tl = (tmrOn && !tmrDone) ? (long)(tmrEnd - millis()) / 1000 : 0;
     if (tl < 0) tl = 0;
     snprintf(b, sizeof(b),
-             "fw=%s;bat=%d;away=%d;timer=%ld;unread=%d;quiet=%d;guard=%d;wake=%d;h12=%d;clock=%d;rxc=%u;rxn=%u;relax=%d;follow=%d;gest=%d;knob=%d;walk=%d;v=%.2f;ls=%d;lon=%lu;ldk=%lu;lls=%lu;ldp=%lu;lwf=%lu;lwk=%lu;lrs=%lu;lst=%lu;lp0=%d;last=%s",
+             "fw=%s;bat=%d;away=%d;timer=%ld;unread=%d;quiet=%d;guard=%d;wake=%d;h12=%d;clock=%d;rxc=%u;rxn=%u;relax=%d;follow=%d;gest=%d;knob=%d;walk=%d;v=%.2f;ls=%d;lon=%lu;ldk=%lu;lls=%lu;ldp=%lu;lwf=%lu;lwk=%lu;lrs=%lu;lst=%lu;lp0=%d;rds=%d;last=%s",
              FW_VERSION, isnan(battV) ? -1 : battPct(battV), awayOn ? 1 : 0, tl,
              noteUnread(), cfgQuiet ? 1 : 0, cfgPGuard ? 1 : 0, cfgWakeBy, cfg12h ? 1 : 0,
              timeOk ? 1 : 0, (unsigned)appRxCmd, (unsigned)appRxNote,
@@ -2004,7 +2013,8 @@ class RqChrCb : public NimBLECharacteristicCallbacks {
              isnan(battV) ? 0.0f : battV, pmMode == 1 ? 1 : 0,
              (unsigned long)blog.sOn, (unsigned long)blog.sDark, (unsigned long)blog.sLight,
              (unsigned long)blog.sDeep, (unsigned long)blog.sWifi, (unsigned long)blog.wakes,
-             (unsigned long)blog.restarts, (unsigned long)blog.start, (int)blog.pct0, appLast);
+             (unsigned long)blog.restarts, (unsigned long)blog.start, (int)blog.pct0,
+             readCount, appLast);
     c->setValue((const uint8_t*)b, strlen(b));
   }
  private:
@@ -4049,7 +4059,8 @@ static void drawReads() {
     if (readCount) snprintf(l, sizeof(l), "%d on the shelf", readCount);
     else           snprintf(l, sizeof(l), "%s", storyState.c_str());
     ctr(l, 45, 1);
-    ctr(readCount ? "Hold to open" : "Hold to fetch some", 55, 1);
+    ctr(readCount ? "Hold to open" : macLinked ? "Hold to ask the Mac"
+                                                : "Needs the Mac", 55, 1);
     oled.display();
     return;
   }
@@ -4059,8 +4070,8 @@ static void drawReads() {
       oled.clearDisplay();
       titleBar("SHORT READS", "");
       ctr(storyState.c_str(), 24, 1);
-      ctr(cfgKey.length() ? "Hold to write" : "Add a key on the page", 40, 1);
-      ctr(cfgKey.length() ? "a new one" : "", 50, 1);
+      ctr(macLinked ? "Hold to ask the Mac" : "Needs the Mac", 40, 1);
+      ctr(macLinked ? "for a new one" : "to write them", 50, 1);
       oled.display();
       return;
     }
@@ -7257,90 +7268,20 @@ static void addRead(const String& textIn) {
 }
 
 // ================================================================
-//  WRITING A NEW ONE  (OpenAI, gpt-4o-mini)
+//  WHERE A READ COMES FROM
 // ================================================================
-static const char* STORY_PROMPT =
-  "Write a warm, romantic short story of about 900 words in simple English. "
-  "Give the characters Muslim names such as Ayaan, Zaynab, Bilal, Maryam, Idris, "
-  "Safiya, Yusuf, Aisha, Hamza or Khadija. Keep it tender and respectful, the kind "
-  "of story that ends happily. Set it somewhere ordinary and real. Begin with a "
-  "short line of five or six words that works as a title, then a blank line, then "
-  "the story. Plain prose only: no headings, no markdown, no lists.";
-
-static bool fetchStory(bool showProgress) {
-  if (!cfgKey.length()) { storyState = "No API key"; return false; }
-  if (!online())        { storyState = "No network"; return false; }
-
-  storyBusy = true;
-  if (showProgress) drawReads();
-
-  WiFiClientSecure c; c.setInsecure();
-  HTTPClient h;
-  h.setConnectTimeout(12000); h.setTimeout(30000);
-  if (!h.begin(c, "https://api.openai.com/v1/chat/completions")) {
-    storyBusy = false; storyState = "Cannot reach OpenAI"; return false;
-  }
-  h.addHeader("Content-Type", "application/json");
-  h.addHeader("Authorization", "Bearer " + cfgKey);
-
-  JsonDocument req;
-  req["model"] = "gpt-4o-mini";
-  req["max_tokens"] = 1800;
-  req["temperature"] = 1.0;
-  JsonObject m = req["messages"].add<JsonObject>();
-  m["role"] = "user";
-  m["content"] = STORY_PROMPT;
-  String body;
-  serializeJson(req, body);
-
-  int code = h.POST(body);
-  if (code != 200) {
-    String err = h.getString();
-    h.end();
-    storyBusy = false;
-    storyState = (code == 401) ? "Key rejected"
-               : (code == 429) ? "rate limited"
-               : ("openai " + String(code));
-    Serial.println("story failed " + String(code) + " " + err.substring(0, 200));
-    return false;
-  }
-
-  // Read the body through getString(), which unpicks chunked transfer
-  // encoding for us. Handing getStream() straight to ArduinoJson feeds it
-  // the raw chunk length markers, and it fails every time.
-  String reply = h.getString();
-  h.end();
-
-  JsonDocument filter;
-  filter["choices"][0]["message"]["content"] = true;
-  JsonDocument doc;
-  DeserializationError e = deserializeJson(doc, reply, DeserializationOption::Filter(filter));
-  if (e) {
-    storyBusy = false;
-    storyState = String("Parse: ") + e.c_str();
-    Serial.println("story parse failed: " + String(e.c_str()));
-    return false;
-  }
-
-  String text = doc["choices"][0]["message"]["content"] | "";
-  if (text.length() < 200) { storyBusy = false; storyState = "Reply was too short"; return false; }
-
-  addRead(text);
-  storyBusy = false;
-  return true;
-}
-
-// Four knocks on the shelf: write one now and show it, then keep
-// filling the rest quietly while you read.
+//  The Mac. It holds the key, it has the network, and it can be told
+//  what to write without a firmware update. The robot used to call
+//  OpenAI itself over WiFi, which meant the radio coming up for a
+//  story and the key living on the device; both are gone.
+//
+// Asking the Mac for one. The robot no longer writes its own: the key
+// and the fetching live on the Mac, which has the network anyway, and
+// this way the radio never has to come up for a story.
 static void refillShelf() {
-  if (!cfgKey.length()) { storyState = "No API key"; return; }
-  if (!online())        { storyState = "No network"; return; }
-  if (fetchStory(true)) {
-    openRead(0);
-    itemIdx = 0;
-    refillWant = READS_MAX - readCount;
-    nextRefill = millis() + 4000;
-  }
+  if (!macLinked) { storyState = "Needs the Mac"; return; }
+  evtSend("want read");
+  storyState = "Asked the Mac";
 }
 
 static void setStory(const String& text) {
@@ -11993,6 +11934,54 @@ static void appBang(char* c, uint16_t conn) {
       struct tm t; if (nowLocal(&t)) prayerDay = t.tm_yday;
       savePrayer();
     }
+  } else if (verb == "read") {
+    // A story from the Mac, in pieces.
+    //
+    // Up to 6000 characters will not fit in one write, so it arrives as
+    // begin, a run of chunks, then end with the length. The length is
+    // the point: the queue here is four deep and the chunks could in
+    // principle outrun it, and a story that lost a piece in the middle
+    // would be saved looking perfectly fine. If the count does not
+    // match, nothing is stored and the Mac is told what arrived.
+    //
+    // 0x1E stands in for a newline. The Mac turns real control
+    // characters into spaces before sending, which would flatten the
+    // blank line that separates the title from the story.
+    if (!strcmp(rest, "begin")) {
+      rdRx = ""; rdRxOn = true;
+      storyState = "Receiving";
+      evtSend("read ok");
+    } else if (!strncmp(rest, "+ ", 2)) {
+      if (!rdRxOn) return;
+      // Fenced with bars by the Mac, because the thing that cleans a
+      // command there also trims its ends, and a piece that happened to
+      // finish on a space would arrive a character short.
+      const char* q = rest + 2;
+      size_t n = strlen(q);
+      if (n < 2 || q[0] != '|' || q[n - 1] != '|') { evtSend("read ok"); return; }
+      for (size_t i = 1; i + 1 < n; i++) {
+        if (rdRx.length() >= STORY_MAX_CHARS) break;
+        rdRx += (q[i] == 0x1E) ? '\n' : q[i];
+      }
+      evtSend("read ok");
+    } else if (!strncmp(rest, "end ", 4)) {
+      if (!rdRxOn) return;
+      rdRxOn = false;
+      uint32_t want = strtoul(rest + 4, nullptr, 10);
+      if (want != rdRx.length()) {
+        char b[32]; snprintf(b, sizeof(b), "read err %u", (unsigned)rdRx.length());
+        evtSend(b);
+        storyState = "Came through short";
+        rdRx = "";
+        return;
+      }
+      addRead(rdRx);
+      rdRx = "";
+      loadShelf();
+      evtSend("read done");
+    } else if (!strcmp(rest, "abort")) {
+      rdRxOn = false; rdRx = "";
+    }
   } else if (verb == "ota") {
     if (!strncmp(rest, "begin ", 6)) {
       uint32_t sz = strtoul(rest + 6, nullptr, 10);
@@ -12645,7 +12634,18 @@ static void serviceWs() {
   if (rqPend && now - rqPendAt > 700) {
     int c = rqPend; rqPend = RQ_NONE;
     switch (c) {
-      case RQ_SYNC:    syncBegin(); break;
+      case RQ_SYNC:
+        // A Mac on Bluetooth can fetch the weather, the prayer times and
+        // a story and send them across, so asking it costs nothing and
+        // the WiFi radio stays off. That was the whole point of moving
+        // this work to the Mac; bringing WiFi up to do it anyway undid
+        // it. WiFi is still the fallback when there is no Mac.
+        if (macOnBle()) {
+          evtSend("want sky");
+          evtSend("want read");
+          flash("ASKING THE MAC", 1400);
+        } else syncBegin();
+        break;
       case RQ_UPDATE:  startHotspot(); break;   // 7.4.1: "update" opens the hotspot
       case RQ_WIFI:    if (wsStart(WS_MANUAL)) flash("WIFI UNTIL RESTART", 1500); break;
       case RQ_HOTSPOT: startHotspot(); break;
@@ -12710,9 +12710,9 @@ static void serviceWs() {
       // A new short read, if there is a key to write one with. This
       // holds the loop for the length of the call, which is why it is
       // the last thing and says so on the screen.
-      if (cfgKey.length()) {
-        oled.clearDisplay(); bar("SYNC"); ctr("Writing a read", 30, 1); oled.display();
-        fetchStory(false);
+      if (macLinked && readCount < READS_MAX) {
+        oled.clearDisplay(); bar("SYNC"); ctr("Asking for a read", 30, 1); oled.display();
+        evtSend("want read");
       }
       return;
     }
@@ -14032,17 +14032,9 @@ void loop() {
     // the shelf the reader draws from. It stays on this loop, where
     // nothing can be halfway through reading that, and only runs while
     // asleep so it cannot freeze a screen you are looking at.
-    if (asleep && (long)(now - nextStory) >= 0 && cfgKey.length() &&
-        !storyBusy && readCount < READS_MAX) {
-      nextStory = now + 21600000UL;
-      fetchStory(false);
-    }
-    if (refillWant > 0 && !storyBusy && cfgKey.length() &&
-        (long)(now - nextRefill) >= 0 && asleep) {
-      refillWant--;
-      nextRefill = now + 5000;
-      fetchStory(false);                       // quietly, while you are elsewhere
-    }
+    // Nothing here any more. How often a read arrives is the Mac's
+    // business now, and it knows when it last sent one; the robot
+    // asking on a timer of its own would only ask twice.
   }
 
   // Looking for itself once a day, and putting on whatever it finds.
