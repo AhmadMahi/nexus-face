@@ -1,5 +1,7 @@
 # RAFIQ
 
+<img src="docs/rafiq.png" alt="Rafiq, yellow and red, on a keyring" width="300" align="right">
+
 *rafiq* is Arabic for companion. A desk companion built on an ESP32-C3. It has a face, it knows the time,
 the weather and the prayer times, it keeps a shelf of short reads, and it
 carries the Quran, the 99 Names and the morning and evening adhkar in its
@@ -191,9 +193,12 @@ Board ESP32-C3, partition scheme **Minimal SPIFFS (1.9MB APP with OTA)**.
 The OTA slot and the 128 kB filesystem both depend on it.
 
 Libraries: Adafruit GFX, Adafruit SSD1306, FluxGarage RoboEyes, ArduinoJson.
+NimBLE-Arduino 2.5.1, not 3.x.
 
 Wiring, all on one I2C bus: SDA GPIO8, SCL GPIO9. OLED 0x3C, ADXL345 0x53,
-MPU6050 0x68.
+MPU6050 0x68. GPIO5 is the touch pad, GPIO4 the accelerometer interrupt,
+GPIO1 the battery divider. The diagram, the reason for each pin, and the two
+things that catch people out are in **[WIRING.md](WIRING.md)**.
 
 ## Updating
 

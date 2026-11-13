@@ -1,0 +1,153 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 800" width="1100" height="800"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <style>
+    .card  { fill:#ffffff; stroke:#c4ccd4; stroke-width:1.5; }
+    .board { fill:#243447; stroke:#121b25; stroke-width:2; }
+    .t     { fill:#1b1f24; font-size:14px; }
+    .tb    { fill:#1b1f24; font-size:17px; font-weight:600; }
+    .tw    { fill:#ffffff; font-size:14px; }
+    .twb   { fill:#ffffff; font-size:19px; font-weight:600; }
+    .sub   { fill:#5b6672; font-size:13px; }
+    .subw  { fill:#9fb2c6; font-size:13px; }
+    .title { fill:#1b1f24; font-size:25px; font-weight:700; }
+    .w     { fill:none; stroke-width:3; stroke-linecap:round; stroke-linejoin:round; }
+    .rail  { fill:none; stroke-width:5; stroke-linecap:round; }
+    .pad   { stroke:#121b25; stroke-width:1.4; }
+    .small { fill:#5b6672; font-size:12px; }
+  </style>
+
+  <rect x="0" y="0" width="1100" height="800" fill="#f7f8fa"/>
+  <text class="title" x="40" y="48">RAFIQ wiring: ESP32-C3</text>
+  <text class="sub"   x="40" y="72">One I2C bus at 400 kHz, two GPIOs and one ADC. The firmware drives nothing else. Crossing lines are not joined; a filled dot is a join.</text>
+
+  <!-- ===================== wires (under the cards) ===================== -->
+  <!-- left: I2C and the interrupt -->
+  <path class="w" stroke="#e8a33d" d="M317 200 H385 V480 H317"/>
+  <path class="w" stroke="#e8a33d" d="M385 300 H426"/>
+  <path class="w" stroke="#4a90d9" d="M317 228 H405 V508 H317"/>
+  <path class="w" stroke="#4a90d9" d="M405 340 H426"/>
+  <path class="w" stroke="#5aa469" d="M317 536 H415 V400 H426"/>
+  <!-- left: power down to the rails -->
+  <path class="w" stroke="#e05252" d="M317 256 H330 V672"/>
+  <path class="w" stroke="#e05252" d="M317 564 H330"/>
+  <path class="w" stroke="#6b7785" d="M317 284 H350 V712"/>
+  <path class="w" stroke="#6b7785" d="M317 592 H350"/>
+  <!-- right: touch pad and the divider -->
+  <path class="w" stroke="#9b59b6" d="M783 250 H690 V300 H674"/>
+  <path class="w" stroke="#d98c3a" d="M783 520 H712 V380 H674"/>
+  <path class="w" stroke="#e05252" d="M783 470 H734 V636 H606 V504"/>
+  <path class="w" stroke="#e05252" d="M1047 200 H1062 V672"/>
+  <path class="w" stroke="#6b7785" d="M1047 228 H1080 V712"/>
+  <path class="w" stroke="#6b7785" d="M1047 592 H1080"/>
+  <!-- board power down to the rails -->
+  <path class="w" stroke="#e05252" d="M486 504 V672"/>
+  <path class="w" stroke="#6b7785" d="M546 504 V712"/>
+  <!-- the two rails -->
+  <path class="rail" stroke="#e05252" d="M120 672 H1062"/>
+  <path class="rail" stroke="#6b7785" d="M120 712 H1080"/>
+  <text class="t" x="110" y="677" text-anchor="end">3V3</text>
+  <text class="t" x="110" y="717" text-anchor="end">GND</text>
+  <!-- joins -->
+  <circle cx="385" cy="300" r="4.5" fill="#e8a33d"/>
+  <circle cx="405" cy="340" r="4.5" fill="#4a90d9"/>
+  <circle cx="330" cy="564" r="4.5" fill="#e05252"/>
+  <circle cx="350" cy="592" r="4.5" fill="#6b7785"/>
+  <circle cx="1080" cy="592" r="4.5" fill="#6b7785"/>
+  <circle cx="330" cy="672" r="5" fill="#e05252"/>
+  <circle cx="486" cy="672" r="5" fill="#e05252"/>
+  <circle cx="1062" cy="672" r="5" fill="#e05252"/>
+  <circle cx="350" cy="712" r="5" fill="#6b7785"/>
+  <circle cx="546" cy="712" r="5" fill="#6b7785"/>
+  <circle cx="1080" cy="712" r="5" fill="#6b7785"/>
+
+  <!-- ===================== the board ===================== -->
+  <rect class="board" x="440" y="150" width="220" height="340" rx="10"/>
+  <text class="twb"  x="550" y="186" text-anchor="middle">ESP32-C3</text>
+  <text class="subw" x="550" y="207" text-anchor="middle">GPIO 1, 4, 5, 8, 9</text>
+  <rect x="490" y="224" width="120" height="26" rx="4" fill="#111a24"/>
+  <text class="subw" x="550" y="242" text-anchor="middle">USB-C</text>
+
+  <rect class="pad" x="426" y="292" width="14" height="16" rx="2" fill="#e8a33d"/>
+  <text class="tw" x="450" y="305">GPIO8  SDA</text>
+  <rect class="pad" x="426" y="332" width="14" height="16" rx="2" fill="#4a90d9"/>
+  <text class="tw" x="450" y="345">GPIO9  SCL</text>
+  <rect class="pad" x="426" y="392" width="14" height="16" rx="2" fill="#5aa469"/>
+  <text class="tw" x="450" y="405">GPIO4  INT</text>
+
+  <rect class="pad" x="660" y="292" width="14" height="16" rx="2" fill="#9b59b6"/>
+  <text class="tw" x="650" y="305" text-anchor="end">TOUCH  GPIO5</text>
+  <rect class="pad" x="660" y="372" width="14" height="16" rx="2" fill="#d98c3a"/>
+  <text class="tw" x="650" y="385" text-anchor="end">ADC  GPIO1</text>
+
+  <rect class="pad" x="478" y="490" width="16" height="14" rx="2" fill="#e05252"/>
+  <rect class="pad" x="538" y="490" width="16" height="14" rx="2" fill="#6b7785"/>
+  <rect class="pad" x="598" y="490" width="16" height="14" rx="2" fill="#e05252"/>
+  <text class="subw" x="486" y="480" text-anchor="middle">3V3</text>
+  <text class="subw" x="546" y="480" text-anchor="middle">GND</text>
+  <text class="subw" x="606" y="480" text-anchor="middle">PWR</text>
+
+  <!-- ===================== OLED ===================== -->
+  <rect class="card" x="60" y="120" width="250" height="200" rx="8"/>
+  <text class="tb"  x="78" y="152">SSD1306 OLED</text>
+  <text class="sub" x="78" y="174">128 x 64, I2C, address 0x3C</text>
+  <rect class="pad" x="303" y="192" width="14" height="16" rx="2" fill="#e8a33d"/>
+  <text class="t" x="296" y="205" text-anchor="end">SDA</text>
+  <rect class="pad" x="303" y="220" width="14" height="16" rx="2" fill="#4a90d9"/>
+  <text class="t" x="296" y="233" text-anchor="end">SCL</text>
+  <rect class="pad" x="303" y="248" width="14" height="16" rx="2" fill="#e05252"/>
+  <text class="t" x="296" y="261" text-anchor="end">VCC</text>
+  <rect class="pad" x="303" y="276" width="14" height="16" rx="2" fill="#6b7785"/>
+  <text class="t" x="296" y="289" text-anchor="end">GND</text>
+
+  <!-- ===================== ADXL345 ===================== -->
+  <rect class="card" x="60" y="380" width="250" height="240" rx="8"/>
+  <text class="tb"  x="78" y="412">ADXL345</text>
+  <text class="sub" x="78" y="434">I2C, address 0x53 or 0x1D</text>
+  <text class="sub" x="78" y="452">knocks, tilt, free fall</text>
+  <rect class="pad" x="303" y="472" width="14" height="16" rx="2" fill="#e8a33d"/>
+  <text class="t" x="296" y="485" text-anchor="end">SDA</text>
+  <rect class="pad" x="303" y="500" width="14" height="16" rx="2" fill="#4a90d9"/>
+  <text class="t" x="296" y="513" text-anchor="end">SCL</text>
+  <rect class="pad" x="303" y="528" width="14" height="16" rx="2" fill="#5aa469"/>
+  <text class="t" x="296" y="541" text-anchor="end">INT1</text>
+  <rect class="pad" x="303" y="556" width="14" height="16" rx="2" fill="#e05252"/>
+  <text class="t" x="296" y="569" text-anchor="end">VCC</text>
+  <rect class="pad" x="303" y="584" width="14" height="16" rx="2" fill="#6b7785"/>
+  <text class="t" x="296" y="597" text-anchor="end">GND</text>
+
+  <!-- ===================== TTP223 ===================== -->
+  <rect class="card" x="790" y="120" width="250" height="170" rx="8"/>
+  <text class="tb"  x="808" y="152">TTP223 touch pad</text>
+  <text class="sub" x="808" y="174">a knock, a hold, a count of taps</text>
+  <text class="sub" x="808" y="192">either jumper setting works</text>
+  <rect class="pad" x="1033" y="192" width="14" height="16" rx="2" fill="#e05252"/>
+  <text class="t" x="1026" y="205" text-anchor="end">VCC</text>
+  <rect class="pad" x="1033" y="220" width="14" height="16" rx="2" fill="#6b7785"/>
+  <text class="t" x="1026" y="233" text-anchor="end">GND</text>
+  <rect class="pad" x="783" y="242" width="14" height="16" rx="2" fill="#9b59b6"/>
+  <text class="t" x="804" y="255">OUT</text>
+
+  <!-- ===================== battery ===================== -->
+  <rect class="card" x="790" y="380" width="250" height="240" rx="8"/>
+  <text class="tb"  x="808" y="412">LiPo and the divider</text>
+  <text class="sub" x="808" y="434">charger and switch are your own</text>
+  <rect class="pad" x="783" y="462" width="14" height="16" rx="2" fill="#e05252"/>
+  <text class="t" x="804" y="458">PACK +</text>
+  <rect class="pad" x="783" y="512" width="14" height="16" rx="2" fill="#d98c3a"/>
+  <text class="t" x="804" y="508">to GPIO1</text>
+  <rect class="pad" x="1033" y="584" width="14" height="16" rx="2" fill="#6b7785"/>
+  <text class="t" x="1026" y="580" text-anchor="end">GND</text>
+  <!-- the divider itself -->
+  <path class="w" stroke="#1b1f24" stroke-width="2.5" d="M797 470 H900 V486"/>
+  <rect x="887" y="486" width="26" height="34" rx="3" fill="#ffffff" stroke="#1b1f24" stroke-width="2.5"/>
+  <path class="w" stroke="#1b1f24" stroke-width="2.5" d="M900 520 V534"/>
+  <rect x="887" y="534" width="26" height="34" rx="3" fill="#ffffff" stroke="#1b1f24" stroke-width="2.5"/>
+  <path class="w" stroke="#1b1f24" stroke-width="2.5" d="M900 568 V592 H1033"/>
+  <path class="w" stroke="#d98c3a" d="M797 520 H900"/>
+  <circle cx="900" cy="520" r="4.5" fill="#1b1f24"/>
+  <text class="small" x="925" y="510">200K</text>
+  <text class="small" x="925" y="558">200K</text>
+  <text class="small" x="808" y="610">GPIO1 sees half the pack voltage</text>
+
+  <text class="small" x="40" y="762">GPIO4 is the only optional wire. Without it the robot still works, but it never sleeps deeper than a dark screen. It probes the pin at boot.</text>
+</svg>

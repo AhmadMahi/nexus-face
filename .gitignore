@@ -2,3 +2,4 @@ out/
 *.bin
 *.elf
 .DS_Store
+build/

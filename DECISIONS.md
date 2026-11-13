@@ -115,9 +115,9 @@ scripts are history (they show what each version changed and why).
 ### 3.4 Android app
 Plain Java against `android.jar` API 33 (minSdk 26, targetSdk 33). Build with
 `aapt`, `javac -source 8`, `dalvik-exchange` (dx), `zipalign`, `apksigner`;
-see `android/RafiqAndroid/BUILD.md`. **Keep `rafiq.keystore`** (password
-`rafiq123`): every update must be signed with it or Android refuses to install
-over the old app. Keep the keystore private.
+see `android/RafiqAndroid/BUILD.md`. **Keep `rafiq.keystore`**: every update
+must be signed with it or Android refuses to install over the old app. Keep
+the keystore and its password out of this repository.
 
 ---
 
