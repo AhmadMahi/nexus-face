@@ -316,7 +316,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "7.12.0"
+#define FW_VERSION "7.13.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -437,6 +437,76 @@ static bool offlineNow() { return cfgOffline || netDown; }
 //             minutes after the last phone leaves it.
 extern bool wxOk;                      // declared with the weather, further down
 int cfgNetHome = NET_BT;
+
+// ---------------- what the radio and the processor are for ----------------
+//
+//  Always: the link stays up, so notifications arrive the moment they
+//  are sent and the Mac can talk whenever it likes. That is what the
+//  robot has always done and it is the reason the battery goes.
+//
+//  Smart: the radio comes up, takes the time, and goes away again. No
+//  notifications, because nothing is listening for them, and about a
+//  day later it comes back for a few seconds to take the time again,
+//  since a C3 has no crystal and the clock drifts.
+//
+//  Switching notifications off from a Shortcut moves it to Smart, and
+//  switching them back on moves it to Always, because a robot told not
+//  to show notifications has no other reason to hold a link open.
+enum { BTM_ALWAYS = 0, BTM_SMART, BTM_N };
+const char* BTM_NAME[BTM_N] = { "always on", "smart" };
+int cfgBtMode = BTM_ALWAYS;
+
+//  The processor. Auto is what the firmware has always done: 160 MHz
+//  awake, and the power manager drops it when there is nothing to do.
+//  The fixed speeds are for when you would rather decide yourself.
+enum { CPU_AUTO = 0, CPU_80, CPU_160, CPU_240, CPU_N };
+const char* CPU_NAME[CPU_N] = { "auto", "80 MHz", "160 MHz", "240 MHz" };
+const int   CPU_MHZ[CPU_N]  = { 160, 80, 160, 240 };
+int cfgCpu = CPU_AUTO;
+
+//  The ADXL's own sampling. 100 Hz has been the setting since 7.7; 25
+//  is enough to notice a knock or a lift and costs less. The register
+//  values are BW_RATE with the low power bit set.
+enum { AR_LOW = 0, AR_NORMAL, AR_N };
+const char* AR_NAME[AR_N]  = { "25 Hz", "100 Hz" };
+const uint8_t AR_REG[AR_N] = { 0x18, 0x1A };
+int cfgARate = AR_NORMAL;
+
+//  Keyring mode. The robot stops being a robot and becomes a thing on
+//  your keys: no radios at all, the slowest processor it has, and a
+//  card when somebody picks it up. It survives being switched off and
+//  on, which is the whole point of it, so there are exactly two ways
+//  out and both are in the first thirty seconds after power: a "home"
+//  from a Shortcut, or a four second hold on the pad. The hold is
+//  there because a lock whose only key is a phone is a lock you will
+//  one day be the wrong side of, with the case glued shut.
+enum { KC_CONTACT = 0, KC_DONTTOUCH, KC_HANDSOME, KC_LOST, KC_KEYRING,
+       KC_SLEEPY, KEYCARD_N };
+const char* KEYCARD_NAME[KEYCARD_N] =
+  { "contact", "don't touch", "handsome", "lost", "keyring", "sleepy" };
+bool cfgKeyring = false;
+int  cfgKeyCard = 0;
+//  The window after power in which it will listen to be let out, and
+//  how long a card stays up when somebody disturbs it.
+#define KEY_WINDOW_MS 30000UL
+#define KEY_CARD_MS    3000UL
+//  Picked up again and again: the fourth time inside this it says so.
+#define KEY_DIZZY_MS   4000UL
+#define KEY_DIZZY_N         3
+bool     keyOut = false;        // let out during the window
+uint32_t keyCardUntil = 0, keyLastPoke = 0;
+int      keyPokes = 0;
+bool     keyDizzy = false;
+
+//  Smart mode's radio window: when it opened, when the clock is next
+//  due, and when to try again on a boot where the clock is not set and
+//  time(nullptr) means nothing yet.
+#define SMART_WINDOW_MS 45000UL      // long enough to connect and read
+#define SMART_EVERY_S   86400L       // a day
+#define SMART_EVERY_MS  86400000UL
+#define SMART_RETRY_MS   3600000UL   // nobody answered: try in an hour
+uint32_t smartOnAt = 0, smartRetryAt = 0;
+time_t   smartNext = 0;
 const char* lastReset = "";
 const char* bootNote = nullptr;
 volatile uint8_t btNews = 0;
@@ -847,6 +917,14 @@ static void awaySet(bool on, const char* text);
 static void wsFailCard(const char* a, const char* b);
 static bool rafiqTagged(const Note& n);
 static void pmSet(bool idle);
+static void applyCpu();
+static void applyARate();
+static void applyBtMode(bool announce);
+static bool keyringNow();
+static void drawKeyCard();
+static void keyPoke();
+static void keyLetOut(const char* why);
+static bool keyTick();
 static bool phoneHeld();
 static void pgTick();
 static void tlogAdd(const char* what);
@@ -1046,7 +1124,8 @@ enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
        C_AUTOUP, C_RESET, C_REBOOT, C_ABOUT,
        C_GUARD, C_TAMPER, C_TLOG, C_HOLD, C_CLOCK, C_WAKEBY,
        C_MULTI, C_DEV1, C_DEV2, C_AUTOAWAY, C_NIGHT, C_BED,
-       C_BLOG, C_BVIEW, C_BRESET, C_PLOCK, C_COUNT };
+       C_BLOG, C_BVIEW, C_BRESET, C_PLOCK,
+       C_BTMODE, C_CPU, C_ARATE, C_KEYRING, C_KEYCARD, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
     "Eye style", "Prayer times", "Hijri shift", "Network", "Vehicle",
@@ -1056,7 +1135,8 @@ const char* C_NAME[C_COUNT] =
     "Reset settings", "Reboot", "About",
     "Phone guard", "Tamper alarm", "Tamper log", "Hold time", "Clock", "Wake by",
     "Multi-link", "Primary", "Second", "Auto away", "Night sleep", "Bedtime",
-    "Battery log", "Battery use", "New log at", "Pocket lock" };
+    "Battery log", "Battery use", "New log at", "Pocket lock",
+    "Bluetooth", "Processor", "Motion sensor", "Keyring mode", "Card" };
 
 // ---------------- settings, in groups ----------------
 //
@@ -1084,16 +1164,16 @@ enum { SG_DISPLAY = 0, SG_TOUCH, SG_CONN, SG_SAFE, SG_BATT, SG_SYSTEM, SG_COUNT,
 const char* SG_NAME[SG_ALL] = { "Display", "Touch and motion", "Connections",
                                 "Away and safety", "Battery", "System", "Prayer settings" };
 
-#define SG_MAX 8
+#define SG_MAX 9
 #define SG_END 0xFF
 const uint8_t SG_ROWS[SG_ALL][SG_MAX] = {
-  { C_BRIGHT,   C_FACE,  C_CLOCK, C_SLEEP,  C_POPUP,  C_TURN,   C_EYES,  C_BIKE },
-  { C_WAKEBY,   C_PLOCK, C_WAKEH, C_HOLD,   C_SHAKE,  C_KNOCK,  C_TAP,   C_ACCEL },
-  { C_MODE,     C_MULTI, C_DEV1,  C_DEV2,   C_PAIR,   C_HOTSPOT, SG_END, SG_END },
-  { C_AUTOAWAY, C_GUARD, C_TAMPER, C_TLOG,  SG_END,   SG_END,   SG_END,  SG_END },
-  { C_BVIEW,    C_BLOG,  C_BRESET, C_BATT,  C_DEEP,   C_NIGHT,  C_BED,   SG_END },
-  { C_UPDATE,   C_RESET, C_REBOOT, C_ABOUT, SG_END,   SG_END,   SG_END,  SG_END },
-  { C_PRAYER,   C_HIJRI, SG_END,  SG_END,   SG_END,   SG_END,   SG_END,  SG_END },
+  { C_BRIGHT,   C_FACE,  C_CLOCK, C_SLEEP,  C_POPUP,  C_TURN,   C_EYES,  C_BIKE,   SG_END },
+  { C_WAKEBY,   C_PLOCK, C_WAKEH, C_HOLD,   C_SHAKE,  C_KNOCK,  C_TAP,   C_ACCEL,  C_ARATE },
+  { C_MODE,     C_BTMODE, C_MULTI, C_DEV1,  C_DEV2,   C_PAIR,   C_HOTSPOT, SG_END, SG_END },
+  { C_AUTOAWAY, C_GUARD, C_TAMPER, C_TLOG,  C_KEYRING, C_KEYCARD, SG_END,  SG_END,  SG_END },
+  { C_BVIEW,    C_BLOG,  C_BRESET, C_BATT,  C_DEEP,   C_CPU,    C_NIGHT,  C_BED,   SG_END },
+  { C_UPDATE,   C_RESET, C_REBOOT, C_ABOUT, SG_END,   SG_END,   SG_END,  SG_END,   SG_END },
+  { C_PRAYER,   C_HIJRI, SG_END,  SG_END,   SG_END,   SG_END,   SG_END,  SG_END,   SG_END },
 };
 static int sgLen(int g) {
   int n = 0; while (n < SG_MAX && SG_ROWS[g][n] != SG_END) n++; return n;
@@ -1353,6 +1433,13 @@ unsigned long nextStory = 0;
 char cfgName[16] = "Ahmed";
 const char* GREET[] = { "Salam", "Hello", "Assalam", "Hi", "Good to see you" };
 const int GREET_N = sizeof(GREET) / sizeof(GREET[0]);
+//  0 rotates through them, as it always has. 1 and up pin one of them,
+//  for when you would rather it said the same thing every time.
+int cfgGreet = 0;
+static const char* greetWord() {
+  int g = constrain(cfgGreet, 0, GREET_N);
+  return g ? GREET[g - 1] : GREET[(millis() / 11000UL) % GREET_N];
+}
 const char* IDLE_LINES[] = {
   "touch to begin",   "everything still works", "reads, faith, games",
   "no network needed", "hold to go in",         "still here" };
@@ -2582,6 +2669,181 @@ static bool online() { return WiFi.status() == WL_CONNECTED; }
 static inline void wReg(uint8_t a, uint8_t r, uint8_t v) {
   Wire.beginTransmission(a); Wire.write(r); Wire.write(v); Wire.endTransmission();
 }
+
+// Keyring mode is on, and it has not been let out since this boot.
+static bool keyringNow() { return cfgKeyring && !keyOut; }
+
+// The processor. Auto leaves it exactly as it was: the power manager
+// decides, or 160 MHz on a core without one.
+static void applyCpu() {
+  int c = constrain(cfgCpu, 0, CPU_N - 1);
+  if (c == CPU_AUTO) {
+    if (pmAvail) pmSet(false); else setCpuFrequencyMhz(160);
+    return;
+  }
+  setCpuFrequencyMhz(CPU_MHZ[c]);
+}
+
+// Which radio behaviour is wanted, applied now.
+static void applyBtMode(bool announce) {
+  if (cfgNet != NET_BT) { if (announce) flash("NOT ON BLUETOOTH", 1200); return; }
+  smartOnAt = 0;
+  if (cfgBtMode == BTM_SMART) {
+    smartRetryAt = 0; smartNext = 0;        // due now: take the time, then go
+    if (announce) flash("BLUETOOTH SMART", 1300);
+  } else {
+    if (!btUp) bleOn();
+    if (announce) flash("BLUETOOTH ALWAYS ON", 1300);
+  }
+}
+
+// What it says when somebody picks it up.
+//
+// Six of them, chosen in Settings, and one more that arrives on its
+// own when the same somebody will not leave it alone. Every line is
+// kept under twenty characters so none of it reaches the edge.
+static void drawKeyCard() {
+  oled.clearDisplay();
+  if (keyDizzy) {
+    ctr("Stop it", 12, 2);
+    ctr("I am getting dizzy", 40, 1);
+    oled.display();
+    return;
+  }
+  switch (constrain(cfgKeyCard, 0, KEYCARD_N - 1)) {
+    case KC_DONTTOUCH:
+      ctr("Do not touch me", 20, 1);
+      ctr("I am very busy", 36, 1);
+      break;
+    case KC_HANDSOME:
+      ctr("Oh, hello", 12, 2);
+      ctr("and who are you?", 40, 1);
+      break;
+    case KC_LOST:
+      ctr("Lost?", 12, 2);
+      ctr(OWNER_PHONE_SHOW, 34, 1);
+      ctr("that is my human", 50, 1);
+      break;
+    case KC_KEYRING:
+      ctr("Just a keyring", 20, 1);
+      ctr("nothing to see", 36, 1);
+      break;
+    case KC_SLEEPY:
+      ctr("Shhh", 12, 2);
+      ctr("I am asleep", 40, 1);
+      break;
+    default:
+      ctr(OWNER_NAME, 12, 2);
+      ctr(OWNER_PHONE_SHOW, 32, 1);
+      ctr("if found, call me", 48, 1);
+      break;
+  }
+  oled.display();
+}
+
+// Keyring mode's whole life.
+//
+// The first thirty seconds after power are ordinary: the screen works,
+// the radio is up, and both ways out are open. "home" from a Shortcut
+// lets it out, and so does a four second hold on the pad. After that
+// the radios go, the processor drops to 80 MHz and the screen stays
+// dark until somebody disturbs it, and then it shows a card and goes
+// dark again.
+uint32_t keyBootAt = 0;
+bool     keyShut = false;
+
+// Somebody picked it up, touched it or shook it.
+static void keyPoke() {
+  uint32_t now = millis();
+  if (now - keyLastPoke < KEY_DIZZY_MS) keyPokes++; else keyPokes = 1;
+  keyLastPoke = now;
+  keyDizzy = (keyPokes > KEY_DIZZY_N);
+  keyCardUntil = now + KEY_CARD_MS;
+  if (asleep) wake("keyring");
+}
+
+// Out of keyring mode, by whichever route.
+static void keyLetOut(const char* why) {
+  cfgKeyring = false; prefs.putBool("keyring", false);
+  keyOut = true; keyShut = false; keyCardUntil = 0; keyPokes = 0; keyDizzy = false;
+  applyCpu(); applyARate(); applyBtMode(false);
+  Serial.printf("keyring: let out by %s\n", why);
+  flash("BACK TO NORMAL", 1400);
+}
+
+// True when it has taken the loop and nothing else should run.
+static bool keyTick() {
+  if (!keyringNow()) return false;
+  uint32_t now = millis();
+  if (!keyBootAt) keyBootAt = now ? now : 1;
+
+  // The window. Everything behaves normally so you can see it and get
+  // your hands on it; the ways out are live for exactly this long.
+  if (!keyShut) {
+    if ((int32_t)(now - keyBootAt) < (int32_t)KEY_WINDOW_MS) return false;
+    bleOff();
+    WiFi.disconnect(true, false);
+    WiFi.mode(WIFI_OFF);
+    setCpuFrequencyMhz(80);
+    keyShut = true;
+    keyCardUntil = 0;
+    goSleep();
+    Serial.println("keyring: shut down, 80 MHz, no radios");
+    return true;
+  }
+
+  // Shut. A card while somebody is holding it, dark the rest of the time.
+  if (keyCardUntil) {
+    if ((int32_t)(now - keyCardUntil) < 0) {
+      if (now - lastDraw >= 150) { lastDraw = now; drawKeyCard(); }
+      return true;
+    }
+    keyCardUntil = 0;
+    keyDizzy = false;
+    goSleep();
+  }
+  return true;
+}
+
+// Smart mode, which is the whole of it.
+//
+// The radio is off. When the clock is due it comes up, and it goes
+// away again the moment the time lands or the window runs out. There
+// is no crystal on a C3, so the clock drifts and a day later it is due
+// again. Nobody answering is not a failure worth hammering: it waits
+// an hour and tries once more.
+static void smartTick() {
+  if (cfgNet != NET_BT || cfgBtMode != BTM_SMART || keyringNow()) return;
+  uint32_t now = millis();
+
+  if (btUp) {
+    // Boot brings the radio up before this ever runs, so a window
+    // nobody opened is this one's window from now.
+    if (!smartOnAt) { smartOnAt = now ? now : 1; return; }
+    bool got = (ctsState == CTS_DONE);
+    if (!got && smartOnAt && (int32_t)(now - smartOnAt) < (int32_t)SMART_WINDOW_MS) return;
+    bleOff();
+    smartOnAt = 0;
+    time_t t = time(nullptr);
+    if (got && t > 1735689600L) smartNext = t + SMART_EVERY_S;
+    smartRetryAt = now + (got ? SMART_EVERY_MS : SMART_RETRY_MS);
+    Serial.printf("bluetooth smart: %s, radio off\n", got ? "clock taken" : "nobody answered");
+    return;
+  }
+  if (smartRetryAt && (int32_t)(now - smartRetryAt) < 0) return;
+  if (timeOk && smartNext && time(nullptr) < smartNext) return;
+  ctsState = CTS_IDLE;
+  bleOn();
+  smartOnAt = now ? now : 1;
+  Serial.println("bluetooth smart: radio up for the clock");
+}
+
+// The ADXL's own sampling rate. Nothing to do if there is no ADXL.
+static void applyARate() {
+  if (!adxl) return;
+  wReg(adxl, 0x2C, AR_REG[constrain(cfgARate, 0, AR_N - 1)]);
+}
+
 static uint8_t rReg(uint8_t a, uint8_t r) {
   Wire.beginTransmission(a); Wire.write(r);
   if (Wire.endTransmission(false)) return 0;
@@ -2601,7 +2863,7 @@ static void startSensors() {
     if (rReg(t[i], A_DEVID) != 0xE5) continue;
     adxl = t[i];
     wReg(adxl, A_DATA_FORMAT, 0x0B);
-    wReg(adxl, 0x2C, 0x1A);            // 7.7: BW_RATE, low power at 100 Hz
+    wReg(adxl, 0x2C, AR_REG[constrain(cfgARate, 0, AR_N - 1)]);   // 7.13: the setting
     wReg(adxl, A_THRESH_TAP, 0x28); wReg(adxl, A_DUR, 0x10);
     wReg(adxl, A_LATENT, 0x30);     wReg(adxl, A_WINDOW, 0xC0);
     wReg(adxl, A_TAP_AXES, 0x07);
@@ -3642,7 +3904,7 @@ static void drawHome() {
   if (offlineNow() && !(cfgNet == NET_BT && (fb.ok || NimBLEDevice::getNumBonds() > 0))) {
     char hi[34];
     snprintf(hi, sizeof(hi), "%s, %s",
-             GREET[(millis() / 11000UL) % GREET_N], cfgName);
+             greetWord(), cfgName);
     // Bluetooth mode with nothing paired is the one state where the
     // robot has something to ask of you, so it asks instead of
     // saying hello to nobody.
@@ -5277,6 +5539,21 @@ static void drawSettings() {
   if (depth == 2 && itemIdx == C_PAIR)  { drawPair();  return; }
   if (depth == 2 && itemIdx == C_TLOG)  { drawTlog();  return; }
   if (depth == 2 && itemIdx == C_BVIEW) { drawBattUse(); return; }   // 7.8
+  if (depth == 2 && itemIdx == C_KEYRING) {
+    oled.clearDisplay();
+    bar("KEYRING MODE");
+    if (cfgKeyring) {
+      ctr("Already a keyring", 20, 1);
+      ctr("hold to come back", 38, 1);
+    } else {
+      ctr("No radios, no menus", 16, 1);
+      ctr("Out: hold 4s,", 28, 1);
+      ctr("or a home in 30s", 38, 1);
+      ctr("1 moves   hold yes", 54, 1);
+    }
+    oled.display();
+    return;
+  }
   if (depth == 2 && itemIdx == C_RESET) {
     oled.clearDisplay();
     bar("RESET SETTINGS");
@@ -5357,6 +5634,11 @@ static void drawSettings() {
       case C_NIGHT:  snprintf(v, sizeof(v), "%s", cfgNight ? "on" : "off"); break;
       case C_BLOG:   snprintf(v, sizeof(v), "%s", cfgBlog ? "on" : "off"); break;
       case C_PLOCK:  snprintf(v, sizeof(v), "%s", PLOCK_NAME[constrain(cfgPLock, 0, 3)]); break;
+      case C_BTMODE: snprintf(v, sizeof(v), "%s", BTM_NAME[constrain(cfgBtMode, 0, BTM_N - 1)]); break;
+      case C_CPU:    snprintf(v, sizeof(v), "%s", CPU_NAME[constrain(cfgCpu, 0, CPU_N - 1)]); break;
+      case C_ARATE:  snprintf(v, sizeof(v), "%s", AR_NAME[constrain(cfgARate, 0, AR_N - 1)]); break;
+      case C_KEYRING: snprintf(v, sizeof(v), "%s", cfgKeyring ? "on" : "off"); break;
+      case C_KEYCARD: snprintf(v, sizeof(v), "%s", KEYCARD_NAME[constrain(cfgKeyCard, 0, KEYCARD_N - 1)]); break;
       case C_BVIEW:  snprintf(v, sizeof(v), "%s", cfgBlog ? "hold" : "off"); break;
       case C_BRESET: snprintf(v, sizeof(v), "%.2f V", BLOG_V[constrain(cfgBlogV, 0, 3)]); break;
       case C_BED:    snprintf(v, sizeof(v), "%02d:%02d", cfgBed / 60, cfgBed % 60); break;
@@ -8587,6 +8869,15 @@ static void knockTwoInner() {
     }
     return;
   }
+  if (screen == S_SETTINGS && itemIdx == C_KEYRING && depth == 2) {
+    if (cfgKeyring) { keyLetOut("the settings"); depth = 1; return; }
+    cfgKeyring = true; prefs.putBool("keyring", true);
+    keyOut = false; keyShut = false; keyBootAt = millis();
+    keyPokes = 0; keyDizzy = false; keyCardUntil = 0;
+    depth = 1;
+    flash("KEYRING MODE", 1500);
+    return;
+  }
   if (screen == S_SETTINGS && itemIdx == C_RESET && depth == 2) {
     resetSettings();
     depth = 1;
@@ -8682,6 +8973,29 @@ static void knockTwoInner() {
       case C_PLOCK:
         cfgPLock = (cfgPLock + 1) % 4; prefs.putInt("plock", cfgPLock);
         flash(cfgPLock ? "POCKET LOCK ON" : "POCKET LOCK OFF", 1100);
+        break;
+      case C_BTMODE:
+        cfgBtMode = (cfgBtMode + 1) % BTM_N;
+        prefs.putInt("btmode", cfgBtMode);
+        applyBtMode(true);
+        break;
+      case C_CPU:
+        cfgCpu = (cfgCpu + 1) % CPU_N;
+        prefs.putInt("cpu", cfgCpu);
+        applyCpu();
+        break;
+      case C_ARATE:
+        cfgARate = (cfgARate + 1) % AR_N;
+        prefs.putInt("arate", cfgARate);
+        applyARate();
+        break;
+      case C_KEYCARD:
+        cfgKeyCard = (cfgKeyCard + 1) % KEYCARD_N;
+        prefs.putInt("keycard", cfgKeyCard);
+        break;
+      case C_KEYRING:
+        // Asked first, because this one is hard to undo on purpose.
+        depth = 2;
         break;
       case C_BLOG:
         cfgBlog = !cfgBlog; prefs.putBool("blog", cfgBlog);
@@ -8810,6 +9124,7 @@ static void knockThree() {
     facePickFrom = -1; depth = 1;
     return;
   }
+  if (screen == S_SETTINGS && itemIdx == C_KEYRING && depth == 2) { depth = 1; return; }
   if (screen == S_SETTINGS && itemIdx == C_RESET && depth == 2) { depth = 1; return; }
   if (screen == S_SETTINGS && itemIdx == C_TAP && depth >= 2) {
     if (depth == 3) {
@@ -9422,6 +9737,7 @@ static void input() {
             unlocking = true; unlockAt = now; unlockShown = false;
             touchTaps = 0; touchLongDone = true;
           }
+          else if (keyringNow() && keyShut) { keyPoke(); }
           else if (asleep) { if (touchWakes()) { wake("touch"); popupOnWake(); }
                              lastUserAt = now; touchTaps = 0; touchLongDone = true; }
           else lastUserAt = now;                     // awake: a real touch keeps it unlocked
@@ -9452,6 +9768,14 @@ static void input() {
       }
       // Held to four: home, and the three second count to switching
       // off, as before 6.1. Letting go now does nothing; the count runs.
+      // In keyring mode the long hold is the way out, not the way off.
+      // It only works in the window, which is the whole point: after
+      // that the robot is a keyring and holding it does nothing.
+      if (keyringNow() && !keyShut && held >= TOUCH_HOME_MS) {
+        keyLetOut("a long hold");
+        touchLongDone = true; touchTaps = 0;
+        return;
+      }
       if (!cfgGesture && !sleepArmed && !awayOn && !tmrOn && held >= TOUCH_HOME_MS) {
         sleepArmed = now;
         touchLongDone = true; holdShown = false;
@@ -9525,6 +9849,7 @@ static void input() {
   if (fabsf(amag - 1.0f) > SHAKE_G && now - lastShake > 600) {
     lastShake = now; cShake++;
     awayEv(AE_SHAKE);
+    if (keyringNow() && keyShut) { keyPoke(); return; }
     if (asleep) { if (motionWakes()) wake("shake"); return; }
     // 7.1: a shake still steps back (below), but is not "activity": a
     // bag being carried shakes, and that must not keep the screen lit.
@@ -11185,6 +11510,7 @@ static void pmInit() {
   pmAvail = (esp_pm_configure(&c) == ESP_OK);
   pmMode = 0;
   Serial.printf("power: %s\n", pmAvail ? "light sleep on offer" : "stock core, no light sleep");
+  applyCpu();                     // whatever the setting says, from the start
 }
 static void pmSet(bool idle) {
   if (!pmAvail) return;
@@ -11764,6 +12090,11 @@ static bool cfgApply(const String& k, int v) {
     else if (k == "bfull"){ battFull    = constrain(v / 100.0f, 3.90f, 4.30f); prefs.putFloat("bfull", battFull); }
     else if (k == "night") { cfgNight = v != 0; prefs.putBool("night", cfgNight); }
     else if (k == "plock") { cfgPLock = constrain(v, 0, 3); prefs.putInt("plock", cfgPLock); }
+    else if (k == "btmode"){ cfgBtMode = constrain(v, 0, BTM_N - 1); prefs.putInt("btmode", cfgBtMode); applyBtMode(false); }
+    else if (k == "cpu")   { cfgCpu = constrain(v, 0, CPU_N - 1); prefs.putInt("cpu", cfgCpu); applyCpu(); }
+    else if (k == "arate") { cfgARate = constrain(v, 0, AR_N - 1); prefs.putInt("arate", cfgARate); applyARate(); }
+    else if (k == "keycard"){ cfgKeyCard = constrain(v, 0, KEYCARD_N - 1); prefs.putInt("keycard", cfgKeyCard); }
+    else if (k == "greet") { cfgGreet = constrain(v, 0, GREET_N); prefs.putInt("greet", cfgGreet); }
     else if (k == "blog")  { cfgBlog = v != 0; prefs.putBool("blog", cfgBlog); if (cfgBlog && blog.magic != BLOG_MAGIC) blogReset(); }
     else if (k == "blogv") { cfgBlogV = constrain(v, 0, 3); prefs.putInt("blogv", cfgBlogV); blogArmed = true; }
     else if (k == "cap")   { cfgCap = constrain(v, 50, 5000); prefs.putInt("cap", cfgCap); }
@@ -13051,12 +13382,34 @@ static int rqCommand(const char* raw) {
   }
   else if (is("notifications on") || is("notification on") || is("popups on") || is("quiet off")) {
     cfgQuiet = false; prefs.putBool("quiet", false); flash("NOTIFICATIONS ON", 1200);
+    // Notifications need somebody listening, so the radio goes back to
+    // staying up. Asking for notifications and leaving the radio asleep
+    // would be a setting that quietly means nothing.
+    if (cfgBtMode != BTM_ALWAYS) {
+      cfgBtMode = BTM_ALWAYS; prefs.putInt("btmode", cfgBtMode); applyBtMode(false);
+    }
   }
   else if (is("notifications off") || is("notification off") || is("popups off") ||
            is("quiet") || is("quiet on") || is("silent")) {
     cfgQuiet = true; prefs.putBool("quiet", true); flash("NOTIFICATIONS QUIET", 1200);
+    // Nothing to listen for, so the radio stops holding a link open and
+    // only comes up for the clock.
+    if (cfgBtMode != BTM_SMART) {
+      cfgBtMode = BTM_SMART; prefs.putInt("btmode", cfgBtMode); applyBtMode(false);
+    }
   }
-  else if (is("home")) { screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0; }
+  else if (is("home")) {
+    // The way out of keyring mode, and the only one that does not need
+    // your hands on it. Taken whenever it arrives, not only during the
+    // window, because a "home" is never meant as anything else.
+    if (cfgKeyring) {
+      cfgKeyring = false; prefs.putBool("keyring", false);
+      keyOut = true; keyCardUntil = 0;
+      applyCpu(); applyBtMode(false);
+      flash("BACK TO NORMAL", 1400);
+    }
+    screen = S_HOME; depth = 0; itemIdx = 0; subIdx = 0;
+  }
   else if (is("wake touch") || is("wake by touch")) { cfgWakeBy = 1; prefs.putInt("wakeby", 1); flash("WAKE BY TOUCH", 1200); }
   else if (is("wake move") || is("wake shake") || is("wake by move") || is("wake by shake") || is("wake motion")) {
     cfgWakeBy = 2; prefs.putInt("wakeby", 2); flash("WAKE BY MOVE", 1200);
@@ -13570,7 +13923,13 @@ void setup() {
   devLoad();
   filtersLoad();                       // 7.5
   cfgBlog  = prefs.getBool("blog", true);
+  cfgKeyring = prefs.getBool("keyring", false);
   cfgPLock = constrain(prefs.getInt("plock", 2), 0, 3);
+  cfgBtMode = constrain(prefs.getInt("btmode", BTM_ALWAYS), 0, BTM_N - 1);
+  cfgCpu    = constrain(prefs.getInt("cpu", CPU_AUTO), 0, CPU_N - 1);
+  cfgARate  = constrain(prefs.getInt("arate", AR_NORMAL), 0, AR_N - 1);
+  cfgKeyCard = constrain(prefs.getInt("keycard", 0), 0, KEYCARD_N - 1);
+  cfgGreet   = constrain(prefs.getInt("greet", 0), 0, GREET_N);
   lastUserAt = millis();
   cfgBlogV = constrain(prefs.getInt("blogv", 1), 0, 3);
   cfgCap   = constrain(prefs.getInt("cap", 350), 50, 5000);
@@ -13920,6 +14279,9 @@ void setup() {
 void loop() {
   web.handleClient();
   unsigned long now = millis();
+  // Keyring mode takes the whole loop once its window has closed.
+  if (keyTick()) { delay(5); return; }
+  smartTick();
 
   // Keep a note of the time while it is trustworthy, for the screen
   // that comes up before the clock has landed.

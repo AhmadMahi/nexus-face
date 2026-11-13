@@ -79,6 +79,15 @@ static void applyBright() { rec("applyBright"); }
 static void goSleep() { rec("goSleep"); }
 static void rqStatus() { rec("rqStatus"); }
 bool awayOn = false, awayAuto = false; int cfgWakeBy = 0; uint32_t popGlanceMs = 1000;
+// 7.13: the radio mode and keyring mode, which rqCommand now touches.
+enum { BTM_ALWAYS = 0, BTM_SMART, BTM_N };
+int cfgBtMode = BTM_ALWAYS;
+bool cfgKeyring = false, keyOut = false, keyShut = false;
+uint32_t keyCardUntil = 0, keyBootAt = 0;
+int keyPokes = 0; bool keyDizzy = false;
+static void applyBtMode(bool) {}
+static void applyCpu() {}
+static void applyARate() {}
 int nightPush = 0; uint32_t nightCardUntil = 0;
 bool tmrOn = false, tmrDone = false; long tmrSetTo = -999, tmrLeftNow = 0;
 uint32_t relaxUntil = 0;
@@ -193,6 +202,26 @@ int main() {
   reset(); CHECK(rqCommand("face 99") && cfgFace == FACE_N - 1, "face capped");
   reset(); CHECK(rqCommand("notifications off") && cfgQuiet, "notifications off");
   reset(); CHECK(rqCommand("notifications on") && !cfgQuiet, "notifications on");
+
+  // 7.13: a robot told not to show notifications has no reason to hold
+  // a link open, and one told to show them has every reason to.
+  reset(); cfgBtMode = BTM_ALWAYS;
+  CHECK(rqCommand("notifications off") && cfgBtMode == BTM_SMART,
+        "notifications off puts the radio in smart mode");
+  reset(); cfgBtMode = BTM_SMART;
+  CHECK(rqCommand("notifications on") && cfgBtMode == BTM_ALWAYS,
+        "notifications on puts the radio back on");
+  reset(); cfgBtMode = BTM_SMART; cfgQuiet = true;
+  CHECK(rqCommand("quiet off") && cfgBtMode == BTM_ALWAYS,
+        "quiet off is the same thing by another name");
+
+  // The way out of keyring mode that does not need your hands on it.
+  reset(); cfgKeyring = true; keyOut = false;
+  CHECK(rqCommand("home") && !cfgKeyring && keyOut,
+        "home lets it out of keyring mode");
+  reset(); cfgKeyring = false;
+  CHECK(rqCommand("home") && !cfgKeyring,
+        "home on a normal robot is just home");
   reset(); CHECK(rqCommand("prayer fajr +2") && prayerAdj[0] == 2, "prayer fajr +2");
   reset(); CHECK(rqCommand("prayer maghrib -3") && prayerAdj[3] == -3, "prayer maghrib -3");
   reset(); CHECK(rqCommand("prayer zuhr 5") && prayerAdj[1] == 5, "zuhr is dhuhr");

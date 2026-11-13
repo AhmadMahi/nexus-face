@@ -130,6 +130,47 @@ screens.append(facepick("hold:keep", "23/23"))
 screens.append(facepick("Regulator"[:12], "23/23"))
 screens.append(facepick("M" * 12, "23/23"))
 
+
+# 7.13: keyring mode's cards, and the screen that warns you before it
+# starts. The cards are the only place the firmware draws at size 2 and
+# size 1 on the same screen, so both are measured.
+def keycard(name, lines):
+    sc = Screen("Keyring: " + name)
+    for t, y, size in lines:
+        w = len(t) * 6 * size
+        x = (W - w) // 2
+        sc.o.text(x, y, t, size, sc.name)
+        if t: sc.el("text", x, y, w - 1, 8 * size, t)
+    return sc
+
+PHONE = "+91 86600 27729"
+screens += [
+    keycard("contact",     [("Ahmed", 12, 2), (PHONE, 32, 1), ("if found, call me", 48, 1)]),
+    keycard("don't touch", [("Do not touch me", 20, 1), ("I am very busy", 36, 1)]),
+    keycard("handsome",    [("Oh, hello", 12, 2), ("and who are you?", 40, 1)]),
+    keycard("lost",        [("Lost?", 12, 2), (PHONE, 34, 1), ("that is my human", 50, 1)]),
+    keycard("keyring",     [("Just a keyring", 20, 1), ("nothing to see", 36, 1)]),
+    keycard("sleepy",      [("Shhh", 12, 2), ("I am asleep", 40, 1)]),
+    keycard("dizzy",       [("Stop it", 12, 2), ("I am getting dizzy", 40, 1)]),
+]
+_c = Screen("Keyring confirm"); _c.bar("KEYRING MODE")
+for _t, _y in [("No radios, no menus", 16), ("Out: hold 4s,", 28),
+               ("or a home in 30s", 38), ("1 moves   hold yes", 54)]:
+    _c.ctr(_t, _y)
+screens.append(_c)
+
+
+# 7.13's new rows, at their longest values, because a long label beside
+# a long value is where a settings row runs out of width.
+screens.append(settings("Connections", [("Network", "Bluetooth"), ("Bluetooth", "always on"),
+                                        ("Multi-link", "on, 2 in"), ("Primary", "iPhone")], 1))
+screens.append(settings("Battery", [("Battery use", "hold"), ("Power down", "2 h"),
+                                    ("Processor", "160 MHz"), ("Night sleep", "on")], 2))
+screens.append(settings("Touch and motion", [("Tap strength", "medium"), ("Accelerometer", "hold"),
+                                             ("Motion sensor", "100 Hz"), ("Knocks", "on")], 2))
+screens.append(settings("Away and safety", [("Tamper log", "hold"), ("Keyring mode", "off"),
+                                            ("Card", "don't touch"), ("Auto away", "on")], 2))
+
 for sc in screens: audit(sc)
 print("screens checked:", len(screens))
 print("problems:", len(problems))
