@@ -1,227 +1,225 @@
 # RAFIQ
 
-<img src="docs/rafiq.png" alt="Rafiq, yellow and red, on a keyring" width="300" align="right">
+<img src="docs/rafiq.png" alt="Rafiq, yellow and red, on a keyring" width="280" align="right">
 
-*rafiq* is Arabic for companion. A desk companion built on an ESP32-C3. It has a face, it knows the time,
-the weather and the prayer times, it keeps a shelf of short reads, and it
-carries the Quran, the 99 Names and the morning and evening adhkar in its
-own firmware so those work with no network at all.
+*rafiq* is Arabic for companion. A desk companion built on an ESP32-C3,
+with a face, a clock, the weather, the prayer times, a shelf of short
+reads, and a Bluetooth link to your phone.
 
-You drive it by knocking on the desk beside it.
+You drive it by tapping the pad on the front, or by knocking on the desk
+beside it.
 
-## 6.0: Bluetooth first
+**[How to use it](USING.md)** &nbsp;·&nbsp; **[Wiring](WIRING.md)**
+&nbsp;·&nbsp; **[Decisions](DECISIONS.md)** &nbsp;·&nbsp;
+**[Handover notes](HANDOFF.md)**
 
-Rafiq now lives on Bluetooth. Your iPhone gives it the time, the
-notifications, and commands from a Shortcut named **RAFIQ**. WiFi is
-something you ask for, for a while:
+<br clear="right">
 
-| How | WiFi lasts |
-|-----|-----------|
-| `RAFIQ sync` from a Shortcut | about a minute: clock, prayer times, weather, update check, a new read |
-| Settings > Wireless > Network, or the page, or `RAFIQ wifi` | until a real restart, or 30 min unused |
-| Settings > Check update, or `RAFIQ update` | while the update screen is open |
-| Settings > Hotspot, or `RAFIQ config` | until 10 min after the last phone leaves |
+---
 
-Install a file without internet: join `RAFIQ-SETUP`, open
-`192.168.4.1/ota`, pick the APP bin. Full details, every command, and
-how to build with light sleep are in [HANDOFF.md](HANDOFF.md).
+## What it does
+
+### The face
+
+- **21 watch faces.** Six laid out by hand, two that lean the way you lean
+  and right themselves when you set it down, two with something that pours,
+  three with hands, five that show what it knows about itself, two for
+  showing off, and one for the Hijri calendar. Two knocks on the clock
+  changes it.
+- **Six eye styles**, animated, with blinks and idle glances.
+- **Greeting** by name, either rotating or pinned to one line.
+
+### What it knows
+
+- **The time**, taken from your phone over Bluetooth and kept through
+  sleep. No NTP, no WiFi.
+- **Prayer times**, five a day with the next one picked out, each with its
+  own correction in minutes because calculated times and the local masjid
+  rarely agree. Friday midday is named Jumuah. Kept in flash, so they
+  survive a network that is down.
+- **The call in three steps.** Ten minutes out it says a word. Five minutes
+  out it says it again and begins to flash. On the minute it flashes for a
+  minute and leaves you alone.
+- **Weather** from Open-Meteo, synced by the phone or the Mac.
+- **Faith text carried in the firmware**: the tasbih counter, the 99 Names,
+  and the morning and evening adhkar. None of it needs a network.
+- **Short reads**, a shelf of stories kept in the filesystem. Four knocks
+  writes a new one.
+
+### Your phone
+
+- **Notifications** over Apple's notification service, with a filter, a VIP
+  list and a popup time.
+- **Shortcuts.** A Shortcut named RAFIQ sends it a line: `home`, `sync`,
+  `status`, `find me`, `timer 15`, `zikr`, `relax`, `night later` and a few
+  dozen more, listed in [USING.md](USING.md#shortcuts-from-your-phone).
+- **Phone guard.** It calls out if your phone leaves without you.
+- **Auto away.** It goes quiet by itself when you do, and comes back when
+  you return.
+- **Reminders**, up to twenty, each with its own repeat. It nags every
+  minute until you answer.
+
+### Your Mac and your PC
+
+A menu bar app for macOS and a tray app for Windows. Battery, the top three
+tasks, what is playing, a screenshot, a volume knob, and a walk-away lock
+that locks the Mac when the robot goes out of range.
+
+### Itself
+
+- **Battery reading** from a divider, with a history log and a settable
+  full charge voltage, because packs do not all top out at 4.20V.
+- **Processor speed**: auto, 80, 160 or 240 MHz.
+- **Deep sleep** on a timer or on command, waking on touch or on movement.
+- **Night sleep** at a bedtime you set.
+- **Tamper alarm.** Arm it, and every movement is logged.
+- **Safe mode.** Three crashes in a row and it comes up on WiFi so it can
+  be updated.
+- **OTA updates** from the app, from the robot itself, or from a file.
+
+### Games
+
+Six, played by tilting, two to a page: Snake, Brick, Car, Catch, Pong and
+Roll. Best scores kept in flash.
+
+### Keyring mode
+
+It stops being a robot. No radios, 80 MHz, dark screen. Picked up, it opens
+its eyes, says one line, and goes straight back to sleep. Six lines to
+choose from and a seventh for whoever will not leave it alone.
+
+It survives power cycles on purpose. The way back is a power cycle followed
+by a four second hold on the pad, or a `home` from a Shortcut within two
+minutes. See [USING.md](USING.md#keyring-mode).
+
+---
 
 ## Driving it
 
-Knocking always works. Leaning is something you turn on **as well**, in
-SETTINGS under Control, never instead: a misread lean can then never leave
-you with no way back.
+The pad on the front, and optionally knocks on the desk.
 
-### Leaning
+| Hold the pad | Does |
+|---|---|
+| a tap | next |
+| a hold, 0.7s by default | open |
+| a longer hold, about 1.5s | back |
+| four seconds | off |
 
-| Lean | Does |
-|------|------|
-| down | next |
-| up | the one before |
-| left | go in |
-| right | come out |
-| up, held three seconds | home |
-
-Turning it on asks you to hold still and then show it each of the four
-leans, so it learns which way round it is sitting and you see what each
-one does. Every boot after that takes a moment to settle first, because
-the resting position moves whenever the thing is picked up and put down.
-Inside a game, leaning plays the game and knocking handles pause and
-leave. While leaning is on, the fall animation is not armed at all: a
-hand turning the device over unloads it constantly and sets it off.
-
-Rest is measured in your hand, because that is where it asks you to hold
-it. Put the device down somewhere else afterwards and every lean would
-read as already held over, so once it has sat still for five seconds the
-resting position settles to wherever it actually is. That takes about six
-seconds and needs nothing from you.
-
-## Knocking
-
-One rule, everywhere:
+Hold time is settable from 0.5s to 2.5s, and the other two move with it.
 
 | Knocks | On a card | In a list | In a reader |
-|--------|-----------|-----------|-------------|
+|---|---|---|---|
 | 1 | next screen | next item | next page |
 | 2 | go in | open it | back to the list |
 | 3 | home | back out | back to the carousel |
 | 4 | home | reload | reload |
 
-Reload only means something on the shelf of short reads, where it writes a
-new one, and on the zikr counter, where it starts the hundred again.
+Full details, every screen, every setting and every command are in
+**[USING.md](USING.md)**.
+
+## Bluetooth first, and WiFi almost never
+
+Your iPhone is home. It gives the robot the time, the notifications, and
+commands from a Shortcut.
+
+**One setting decides the radio**: Settings, Phone and keyring,
+Notifications.
+
+| Notifications | Bluetooth |
+|---|---|
+| **on, linked** | up at boot and stays connected |
+| **off, daily** | up at boot, takes the time, gone. Back once a day for a few seconds, because the C3 has no crystal and the clock drifts |
+
+**WiFi is never on by itself.** Not at boot, not on a schedule, not as a
+fallback. It comes up when you ask for it by name, and goes away again:
+
+| How | WiFi lasts |
+|---|---|
+| `RAFIQ sync` | about a minute: clock, prayer times, weather, update check, a new read |
+| Settings, Network, or `RAFIQ wifi` | until a real restart, or 30 min unused |
+| Settings, Update, or `RAFIQ update` | while the update screen is open |
+| Settings, Hotspot, or `RAFIQ config` | until 10 min after the last phone leaves |
+
+## The config page
+
+The only thing that raises WiFi on purpose. Join `RAFIQ-SETUP` and open
+`192.168.4.1`. Your networks, reminders, vehicle dates, prayer corrections,
+notification filters, VIPs, the shelf, your name and greeting, and firmware
+upload.
 
 ## Screens
 
 ```
-HOME -> FOCUS -> WEATHER -> MESSAGES -> PRAYER -> FAITH -> SHORT READS -> GAMES -> SETTINGS -> SYSTEM
+HOME  VEHICLE  REMINDERS  MAC  WEATHER  NOTIFICATIONS  PRAYER  FAITH
+SHORT READS  GAMES  SETTINGS  SYSTEM
 ```
 
-**HOME** the time, the day and the date. With no network there is no clock
-to show, so it runs a stopwatch instead. Two knocks restart it.
+Plus three hubs opened from a Shortcut rather than by walking the list:
+TODAY, FAITH and CALM.
 
-**FOCUS** a plan of timed stretches, set on the page. Each one counts down,
-flashes when it is done and hands over to the next. Half an hour of work
-without a pause and it asks you to walk for a minute.
+## Settings
 
-**WEATHER** from Open-Meteo, located by IP.
+Six groups, so nothing is more than a few taps away.
 
-**MESSAGES** whatever was last sent from the page.
+| | |
+|---|---|
+| **Display** | brightness, watch face, clock, sleep, popup time, page turn, eye style, vehicle |
+| **Phone and keyring** | notifications, keyring mode, card, network, multi-link, devices, pair a Mac, hotspot |
+| **Touch and motion** | wake by, pocket lock, wake on hold, hold time, go back by, knocks, tap strength, accelerometer, motion sensor |
+| **Away and safety** | auto away, phone guard, tamper alarm, tamper log |
+| **Battery** | battery use, log, new log at, full charge, power down, processor, night sleep, bedtime |
+| **System** | update, reset, reboot, about |
 
-**PRAYER** five times from AlAdhan, with the next one picked out. They are
-kept in flash and are not fetched again unless you ask, or once every
-fiftieth boot, so they survive a network that is down. On a Friday the
-midday prayer is named Jumuah.
-
-Calculated times and the local masjid rarely agree, so each prayer carries
-its own correction in minutes, set on the page and kept in flash.
-
-The call comes in three steps. Ten minutes out it says a word. Five minutes
-out it says it again and begins to flash. On the minute itself it flashes
-for a minute and then leaves you alone. Each step fires once a day.
-
-**FAITH** two knocks opens five things:
-
-- **Zikr** thirty three SubhanAllah, thirty three Alhamdulillah, thirty
-  three Allahu Akbar and one to round it to a hundred. It paces itself.
-- **99 Names** one large name per knock, with its meaning.
-- **Quran** all 114 chapters. Each one gives its name and meaning, whether
-  it was revealed in Makkah or Madinah, its verse count and a short note on
-  what it covers. Descriptive notes, not tafsir.
-- **Morning adhkar** and **Evening adhkar**.
-
-All of it is compiled into the firmware, so none of it needs a network.
-
-**SHORT READS** a shelf of stories, newest first. Two knocks opens the
-shelf, two more opens one, one knock turns each page. Four knocks writes a
-new one and fills the rest of the shelf quietly afterwards. You can also
-paste your own on the page. They live in the filesystem and survive a
-reboot and an update.
-
-**GAMES** six, all played by tilting, two to a page. One knock steps
-through them and the page turns itself; the dots along the bottom say
-where you are.
-
-- **Snake** tilt to steer. Works up from 220ms a step to 120ms.
-- **Brick** tilt to slide the paddle, whose edges send the ball away at an
-  angle so you steer with it as well as block. Five wall patterns that
-  cycle as the levels climb.
-- **Car** three lanes. Obstacles are spaced so only one lane is ever
-  deadly at a time, and never spawn into a lane that would close the last
-  gap: hard, never unavoidable.
-- **Catch** tilt the basket. Keep the squares, let the crosses through.
-- **Pong** tilt to return it, first to seven. The ball quickens on every
-  return so a rally always ends.
-- **Roll** the one that leans hardest on the sensor: the ball carries
-  momentum, so you lead it and catch it again. Every level is flood filled
-  before it is used, so the goal is always reachable.
-
-While playing: two knocks pause, three leave, four start again. Best scores
-are kept in flash.
-
-Tilt only means anything relative to how the device is sitting, and this one
-could be upright or flat. So the first time you play it asks once: hold
-still, tilt right, tilt away. That mapping is kept in flash. Four knocks on
-the game list forgets it and asks again. The resting position is measured
-afresh every time a game starts, since that is what changes when you move
-it.
-
-**SETTINGS** brightness (dim, then quarters), watch face, control method,
-prayer refresh, a live accelerometer view, sleep timeout, page turn (by knock or automatic),
-popup time, eye style, hotspot, check for update, reboot.
-
-**SYSTEM** uptime, network, memory and address. The full detail lives on
-the page.
-
-**ABOUT**, the last thing in SETTINGS: who made it, and where to find him.
-
-## Watch faces
-
-Ten, for the clock screen only, chosen in SETTINGS. Six laid out by hand,
-two that lean the way you lean and right themselves a couple of seconds
-after you set the thing down, and two with something that pours: water
-that sloshes and sand that tips. Whatever the fill covers is inverted
-rather than swallowed, so it stays readable as the level moves.
-
-The faces read the sensor for themselves, so they work whether or not
-leaning is switched on as a way of driving the device.
-
-## The page
-
-It runs whenever the device is on its network, at the address shown on the
-SYSTEM screen. Two tabs: the work session, messages and the shelf on one,
-and everything configurable on the other.
-
-Control and updating are both on the page as well as on the device, so
-there is a way back if a setting on the face turns out to be awkward to
-reach. The page can switch between taps and tilt, install the newest
-release, or list the earlier ones and put any of them back.
-
-## Credentials
-
-Nothing secret is ever committed or published. The binary attached to a
-release carries placeholders only. Real credentials live in a gitignored
-`secrets.h` when you build locally, and on the device itself in NVS, where
-an update cannot reach them. Set the network from the page, or from the
-hotspot in SETTINGS if the device cannot get online.
-
-The OpenAI key, used only for writing short reads, is entered on the page
-and stored the same way.
+Prayer settings is a seventh group, opened from the FAITH screen, because
+that is where you are when you want it.
 
 ## Building
 
-Board ESP32-C3, partition scheme **Minimal SPIFFS (1.9MB APP with OTA)**.
-The OTA slot and the 128 kB filesystem both depend on it.
+| | |
+|---|---|
+| Board | ESP32C3 Dev Module |
+| Partition scheme | **Minimal SPIFFS (1.9MB APP with OTA / 190KB SPIFFS)** |
+| USB CDC On Boot | Enabled |
+| Core | esp32 3.3.10 |
+| Libraries | NimBLE-Arduino **2.5.1** (not 3.x), Adafruit GFX, Adafruit SSD1306, FluxGarage RoboEyes, ArduinoJson |
 
-Libraries: Adafruit GFX, Adafruit SSD1306, FluxGarage RoboEyes, ArduinoJson.
-NimBLE-Arduino 2.5.1, not 3.x.
+```
+esp32:esp32:esp32c3:PartitionScheme=min_spiffs,CDCOnBoot=cdc
+```
 
-Wiring, all on one I2C bus: SDA GPIO8, SCL GPIO9. OLED 0x3C, ADXL345 0x53,
-MPU6050 0x68. GPIO5 is the touch pad, GPIO4 the accelerometer interrupt,
-GPIO1 the battery divider. The diagram, the reason for each pin, and the two
-things that catch people out are in **[WIRING.md](WIRING.md)**.
+The sketch fills most of the 1.9MB slot, so the partition scheme is not
+optional. Wiring, the reason for each pin, and the two things that catch
+people out are in **[WIRING.md](WIRING.md)**.
+
+Light sleep needs a patched core. Without it the robot runs, but the link
+drops whenever the screen goes dark. See [HANDOFF.md](HANDOFF.md).
+
+### Checking it before it ships
+
+```
+zsh tools/v6/run_tests.sh      # the parser and the state machines, on the host
+python3 tools/v6/ui_check.py   # every screen, measured in pixels
+python3 tools/v6/conn_check.py # every connection request, against Apple's rules
+```
 
 ## Updating
 
-SETTINGS, then Check update, then two knocks. That opens two choices:
+| How | What to do |
+|---|---|
+| **the Rafiq app** | Check updates, then Update |
+| **the robot** | Settings, System, Update, then hold. The newest release, or the last eight so an older one can go back |
+| **a file** | the config page, Upload firmware, pick the APP `.bin` |
 
-**Newest release** looks up what is current here. If it is something you
-are not already on, it names it and asks. One knock moves between Yes and
-No, two knocks answers.
+Putting an older build back is allowed on purpose, so there is always a way
+off a release you did not get on with.
 
-**Earlier releases** lists the last eight, with the one you are running
-marked. One knock walks the list, two knocks picks one, and it asks the
-same question. Putting an older build back is allowed on purpose, so there
-is always a way off a release you did not get on with.
+If it says **will not fit**, the board has a partition table whose OTA slot
+is smaller than the build. Only USB can rewrite a partition table. Settings
+and credentials live in NVS and survive it.
 
-Nothing is written until the answer is Yes. Then it shows the download
-moving and restarts into it.
+## Credentials
 
-If it says **will not fit**, the second line gives the numbers, for example
-`1352k into 1280k slot`. That means the board was flashed with a partition
-table whose OTA slot is smaller than the build. Only USB can rewrite a
-partition table, so connect it and upload once with **Minimal SPIFFS
-(1.9MB APP with OTA)** selected. Settings and credentials live in NVS at a
-fixed offset that both schemes share, so they survive.
-
-The page shows the ceiling under System as **ota room**, so you can see how
-much headroom is left before it becomes a problem.
+Nothing secret is committed. The binary attached to a release carries
+placeholders only. Real credentials live in a gitignored `secrets.h` when
+you build locally, and on the device in NVS, where an update cannot reach
+them.

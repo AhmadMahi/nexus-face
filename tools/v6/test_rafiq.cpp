@@ -62,12 +62,13 @@ int rqPend = RQ_NONE; uint32_t rqPendAt = 0;
 bool cfgPGuard = false, pgFired = false, cfgQuiet = false, relaxOn = false, prayerWanted = false;
 uint32_t pgUntil = 0, findUntil = 0, relaxNext = 0, popupUntil = 0; int relaxKind = 0;
 int cfgBright = 160, cfgFace = 0, screen = 0, depth = 0, itemIdx = 0, subIdx = 0, noteIdx = 0;
-#define FACE_N 20
+#define FACE_N 21   // 7.14: arabic and crescent went
 #define S_HOME 0
 #define S_MSG 5
 const char* PRAYERS[5] = { "Fajr", "Dhuhr", "Asr", "Maghrib", "Isha" };
 int prayerAdj[5] = { 0, 0, 0, 0, 0 };
-static uint32_t millis() { return 123456; }
+uint32_t fakeNow = 0;
+static uint32_t millis() { return fakeNow ? fakeNow : 123456; }
 
 static void flash(const char* w, unsigned long) { rec(std::string("flash ") + w); }
 static void wake(const char* w) { rec(std::string("wake ") + w); }
@@ -82,12 +83,37 @@ bool awayOn = false, awayAuto = false; int cfgWakeBy = 0; uint32_t popGlanceMs =
 // 7.13: the radio mode and keyring mode, which rqCommand now touches.
 enum { BTM_ALWAYS = 0, BTM_SMART, BTM_N };
 int cfgBtMode = BTM_ALWAYS;
-bool cfgKeyring = false, keyOut = false, keyShut = false;
+bool cfgKeyring = false, keyOut = false;
 uint32_t keyCardUntil = 0, keyBootAt = 0;
 int keyPokes = 0; bool keyDizzy = false;
 static void applyBtMode(bool) {}
 static void applyCpu() {}
 static void applyARate() {}
+// 7.14: keyring mode's own state. The RTC_DATA_ATTR ones are the whole
+// point of the rebuild, so the test keeps them apart from the rest and
+// wipes only the others to model a wake from deep sleep.
+#define KEY_NOTICE_MS   10000UL
+#define KEY_LISTEN_MS  120000UL
+#define KEY_DIZZY_S          8
+#define KEY_DIZZY_N          3
+#define KEY_CARD_MS      2400UL
+#define KEYCARD_N            6
+int cfgKeyCard = 0, cfgNet = 1, cfgCpu = 0;
+#define NET_BT 1
+uint8_t rtcKeyShut = 0, rtcKeyCard = 0, rtcKeyPokes = 0;
+uint32_t rtcKeyPokeAt = 0;
+bool keyDark = false, keyLit = false;
+uint32_t lastDraw = 0, keyLastPoke = 0;
+static bool keyringNow() { return cfgKeyring && !keyOut; }
+static void drawKeyNotice(uint32_t s) { rec("notice " + std::to_string(s)); }
+static void drawKeyCard() { rec("card"); }
+static void screenPower(bool on) { rec(on ? "screen on" : "screen off"); }
+static void bleOff() { rec("bleOff"); }
+static void setCpuFrequencyMhz(int m) { rec("cpu " + std::to_string(m)); }
+static void keyringDeep() { rtcKeyShut = 1; rec("deep sleep"); }
+struct { void clearDisplay() {} void display() {} } oled;
+struct { void disconnect(bool, bool) { rec("wifi off"); } void mode(int) {} } WiFi;
+#define WIFI_OFF 0
 int nightPush = 0; uint32_t nightCardUntil = 0;
 bool tmrOn = false, tmrDone = false; long tmrSetTo = -999, tmrLeftNow = 0;
 uint32_t relaxUntil = 0;
@@ -104,7 +130,7 @@ static void saveAdj() { rec("saveAdj"); }
 static void rqRemind(const char* s) { rec(std::string("rqRemind ") + s); }
 static int popupSecs() { return 5; }
 static void popupShow() { rec("popupShow"); }
-struct { void printf(const char*, ...) {} } Serial;
+struct { void printf(const char*, ...) {} void println(const char*) {} } Serial;
 
 #include "fw_funcs.inc"
 
@@ -321,6 +347,73 @@ int main() {
   nightPush = 300; reset(); rqCommand("night later"); rqCommand("night later"); CHECK(nightPush == 360, "the push stops at six hours");
   nightPush = 0;
   reset(); CHECK(rqCommand("relax off") == 0, "relax off is gone");
+
+  // ================================================================
+  //  7.14: notifications own the radio
+  // ================================================================
+  reset(); cfgQuiet = false; cfgBtMode = BTM_ALWAYS;
+  setNotes(false, false);
+  CHECK(cfgQuiet && cfgBtMode == BTM_SMART, "notifications off puts the radio on the daily clock");
+  reset(); setNotes(true, false);
+  CHECK(!cfgQuiet && cfgBtMode == BTM_ALWAYS, "notifications on keeps the link up");
+  reset(); cfgQuiet = true; cfgBtMode = BTM_ALWAYS;   // disagreeing, as 7.13 allowed
+  setNotes(true, false);
+  CHECK(!cfgQuiet && cfgBtMode == BTM_ALWAYS, "the two can no longer disagree");
+
+  // ================================================================
+  //  7.14: keyring mode, the state machine
+  // ================================================================
+  //  The thing this replaces: in 7.13 keyShut and keyBootAt were plain
+  //  globals, so every wake from deep sleep came back with keyShut
+  //  false and handed out another thirty seconds of the ordinary
+  //  robot, radios and all. These tests model a wake by wiping exactly
+  //  what RAM loses and keeping exactly what RTC memory keeps.
+  auto keyFresh = [&]() {                       // power on, in keyring mode
+    cfgKeyring = true; keyOut = false;
+    rtcKeyShut = 0; rtcKeyPokes = 0; rtcKeyPokeAt = 0; rtcKeyCard = 0;
+    keyDark = keyLit = false; keyBootAt = 0; keyCardUntil = 0;
+    keyPokes = 0; keyDizzy = false; lastDraw = 0; fakeNow = 1000;
+  };
+  auto keyWake = [&]() {                        // what a deep sleep wake leaves behind
+    keyDark = keyLit = false; keyBootAt = 0; keyCardUntil = 0;
+    keyPokes = 0; keyDizzy = false; lastDraw = 0; fakeNow = 1000;
+  };
+
+  reset(); keyFresh();
+  CHECK(keyTick() && called("notice"), "power on shows the notice");
+  reset(); fakeNow = 1000 + 4000;
+  keyTick();
+  CHECK(called("notice 6"), "the notice counts down");
+
+  reset(); fakeNow = 1000 + KEY_NOTICE_MS;
+  CHECK(keyTick() && keyDark && called("screen off"), "ten seconds later the screen goes out");
+
+  reset(); fakeNow = 1000 + KEY_NOTICE_MS + 5000; keyCardUntil = fakeNow + 1000;
+  CHECK(keyTick() && called("card") && called("screen on"), "a poke inside the window still shows a card");
+  reset(); fakeNow += 2000;                     // the card has run out
+  keyTick();
+  CHECK(called("screen off") && !keyLit, "and the screen goes out again after it");
+
+  reset(); fakeNow = 1000 + KEY_LISTEN_MS;
+  CHECK(keyTick() && called("deep sleep") && called("bleOff") && called("wifi off"),
+        "two minutes with no home and both radios go");
+  CHECK(called("cpu 80") && rtcKeyShut == 1, "it drops to 80 MHz and latches shut");
+
+  //  The regression. A wake must not reopen anything.
+  reset(); keyWake();
+  CHECK(keyTick() && called("deep sleep"), "a wake goes straight back to sleep");
+  CHECK(!called("notice") && !called("screen on"), "a wake shows no notice and no menu");
+  int winds = 0;
+  for (int i = 0; i < 20; i++) { reset(); keyWake(); keyTick(); if (called("notice")) winds++; }
+  CHECK(winds == 0, "twenty wakes, and not one of them hands out a window");
+
+  //  Let out, and it is an ordinary robot again.
+  reset(); keyOut = true; cfgKeyring = false;
+  CHECK(!keyTick(), "once it is out, keyring mode takes nothing");
+
+  //  The card a wake will show is kept where a wake can read it.
+  reset(); cfgKeyCard = 3; keyArm();
+  CHECK(rtcKeyCard == 3, "arming remembers the card in RTC memory");
 
   // -- weather words --
   struct { const char* w; int c; } wx[] = { { "Sunny", 0 }, { "Clear", 0 }, { "Partly Cloudy", 2 },

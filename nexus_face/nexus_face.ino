@@ -16,9 +16,8 @@
    SCREENS  HOME  FOCUS  WEATHER  MESSAGES  PRAYER  FAITH
             SHORT READS  SETTINGS  SYSTEM
 
-   FAITH carries its own text, so Zikr, the 99 Names, all 114
-   chapters and the morning and evening adhkar work with no network
-   at all.
+   FAITH carries its own text, so Zikr, the 99 Names and the morning
+   and evening adhkar work with no network at all.
 
    WIRING   everything on one I2C bus
      SDA GPIO8   SCL GPIO9
@@ -79,7 +78,6 @@ struct Note {
 #include <Adafruit_SSD1306.h>
 #include <FluxGarage_RoboEyes.h>
 #include "faith_data.h"
-#include "arabic_glyphs.h"
 
 #define SDA_PIN 8
 #define SCL_PIN 9
@@ -316,7 +314,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "7.13.0"
+#define FW_VERSION "7.14.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -488,15 +486,30 @@ bool cfgKeyring = false;
 int  cfgKeyCard = 0;
 //  The window after power in which it will listen to be let out, and
 //  how long a card stays up when somebody disturbs it.
-#define KEY_WINDOW_MS 30000UL
-#define KEY_CARD_MS    3000UL
+//  7.14. The notice at power on, then the quiet window where a "home"
+//  can still arrive, then nothing at all.
+#define KEY_NOTICE_MS   10000UL      // what is on the screen after power on
+#define KEY_LISTEN_MS  120000UL      // the radio stays up this long, dark
+#define KEY_EYES_MS       900UL      // it looks at you first
+#define KEY_CARD_MS      2400UL      // then it says its line
 //  Picked up again and again: the fourth time inside this it says so.
-#define KEY_DIZZY_MS   4000UL
-#define KEY_DIZZY_N         3
+#define KEY_DIZZY_S          8       // seconds, because millis() does not survive sleep
+#define KEY_DIZZY_N          3
 bool     keyOut = false;        // let out during the window
 uint32_t keyCardUntil = 0, keyLastPoke = 0;
 int      keyPokes = 0;
 bool     keyDizzy = false;
+
+//  What has to survive deep sleep. RAM does not: a wake runs setup()
+//  again with everything back at its initialiser, which is exactly why
+//  7.13 kept handing out another thirty seconds of the ordinary robot
+//  every single time it was picked up. RTC memory survives a wake and
+//  is cleared by a power cut, which is the behaviour this wants on
+//  both counts.
+RTC_DATA_ATTR uint8_t  rtcKeyShut  = 0;   // 1 = past the window, dumb from here on
+RTC_DATA_ATTR uint8_t  rtcKeyCard  = 0;   // the chosen card, so NVS is not needed on a wake
+RTC_DATA_ATTR uint8_t  rtcKeyPokes = 0;   // pokes inside the dizzy window
+RTC_DATA_ATTR uint32_t rtcKeyPokeAt = 0;  // system clock of the last one
 
 //  Smart mode's radio window: when it opened, when the clock is next
 //  due, and when to try again on a boot where the clock is not set and
@@ -922,6 +935,9 @@ static void applyARate();
 static void applyBtMode(bool announce);
 static bool keyringNow();
 static void drawKeyCard();
+static void keyringDeep();
+static void keyringWake();
+static void keyArm();
 static void keyPoke();
 static void keyLetOut(const char* why);
 static bool keyTick();
@@ -1036,8 +1052,8 @@ static void hijriFromJdn(long jd, int& hy, int& hm, int& hd) {
   hd = (int)(l - (709 * hm) / 24);
   hy = (int)(30 * n + j - 30);
 }
-// Latin, for the faces that are otherwise in English. The Arabic ones
-// are bitmaps and live in arabic_glyphs.h.
+// The Hijri month names. The two faces that drew them as Arabic
+// bitmaps went in 7.14; this is the only spelling left.
 const char* HIJRI_LATIN[12] = {
   "Muharram", "Safar", "Rabi I", "Rabi II", "Jumada I", "Jumada II",
   "Rajab", "Shaban", "Ramadan", "Shawwal", "Dhul Qadah", "Dhul Hijjah" };
@@ -1105,9 +1121,9 @@ int itemIdx = 0;                 // what is picked at depth 1
 int subIdx  = 0;                 // what is picked at depth 2
 
 // ---------------- faith ----------------
-enum { F_ZIKR = 0, F_NAMES, F_QURAN, F_MORNING, F_EVENING, F_COUNT };
+enum { F_ZIKR = 0, F_NAMES, F_MORNING, F_EVENING, F_COUNT };
 const char* F_NAME[F_COUNT] =
-  { "Zikr", "99 Names", "Quran", "Morning adhkar", "Evening adhkar" };
+  { "Zikr", "99 Names", "Morning adhkar", "Evening adhkar" };
 
 int  zikrStep = 0;               // which of the four phrases
 int  zikrDone = 0;               // how many of it are counted
@@ -1125,7 +1141,7 @@ enum { C_BRIGHT = 0, C_FACE, C_SLEEP, C_TURN, C_POPUP, C_EYES,
        C_GUARD, C_TAMPER, C_TLOG, C_HOLD, C_CLOCK, C_WAKEBY,
        C_MULTI, C_DEV1, C_DEV2, C_AUTOAWAY, C_NIGHT, C_BED,
        C_BLOG, C_BVIEW, C_BRESET, C_PLOCK,
-       C_BTMODE, C_CPU, C_ARATE, C_KEYRING, C_KEYCARD, C_COUNT };
+       C_BTMODE, C_CPU, C_ARATE, C_KEYRING, C_KEYCARD, C_NOTES, C_COUNT };
 const char* C_NAME[C_COUNT] =
   { "Brightness", "Watch face", "Sleep after", "Page turn", "Popup time",
     "Eye style", "Prayer times", "Hijri shift", "Network", "Vehicle",
@@ -1136,7 +1152,8 @@ const char* C_NAME[C_COUNT] =
     "Phone guard", "Tamper alarm", "Tamper log", "Hold time", "Clock", "Wake by",
     "Multi-link", "Primary", "Second", "Auto away", "Night sleep", "Bedtime",
     "Battery log", "Battery use", "New log at", "Pocket lock",
-    "Bluetooth", "Processor", "Motion sensor", "Keyring mode", "Card" };
+    "Bluetooth", "Processor", "Motion sensor", "Keyring mode", "Card",
+    "Notifications" };
 
 // ---------------- settings, in groups ----------------
 //
@@ -1158,19 +1175,22 @@ const char* C_NAME[C_COUNT] =
 //  twenty three to seven.
 // 7.6: grouped by what you are trying to do. Prayer settings is not in
 // the list: it is opened from Faith, next to the prayer times it changes.
-enum { SG_DISPLAY = 0, SG_TOUCH, SG_CONN, SG_SAFE, SG_BATT, SG_SYSTEM, SG_COUNT,
+// 7.14: the phone is second, because notifications and keyring mode
+// are the two settings that get looked for, and they are both about
+// the phone. Everything else keeps the order it had.
+enum { SG_DISPLAY = 0, SG_CONN, SG_TOUCH, SG_SAFE, SG_BATT, SG_SYSTEM, SG_COUNT,
        SG_FAITHSET = SG_COUNT, SG_ALL,
        SG_WIRELESS = SG_CONN, SG_DEVICES = SG_CONN, SG_CONTROLS = SG_TOUCH };
-const char* SG_NAME[SG_ALL] = { "Display", "Touch and motion", "Connections",
+const char* SG_NAME[SG_ALL] = { "Display", "Phone and keyring", "Touch and motion",
                                 "Away and safety", "Battery", "System", "Prayer settings" };
 
 #define SG_MAX 9
 #define SG_END 0xFF
 const uint8_t SG_ROWS[SG_ALL][SG_MAX] = {
   { C_BRIGHT,   C_FACE,  C_CLOCK, C_SLEEP,  C_POPUP,  C_TURN,   C_EYES,  C_BIKE,   SG_END },
+  { C_NOTES,    C_KEYRING, C_KEYCARD, C_MODE, C_MULTI, C_DEV1,   C_DEV2,  C_PAIR, C_HOTSPOT },
   { C_WAKEBY,   C_PLOCK, C_WAKEH, C_HOLD,   C_SHAKE,  C_KNOCK,  C_TAP,   C_ACCEL,  C_ARATE },
-  { C_MODE,     C_BTMODE, C_MULTI, C_DEV1,  C_DEV2,   C_PAIR,   C_HOTSPOT, SG_END, SG_END },
-  { C_AUTOAWAY, C_GUARD, C_TAMPER, C_TLOG,  C_KEYRING, C_KEYCARD, SG_END,  SG_END,  SG_END },
+  { C_AUTOAWAY, C_GUARD, C_TAMPER, C_TLOG,  SG_END,   SG_END,   SG_END,  SG_END,   SG_END },
   { C_BVIEW,    C_BLOG,  C_BRESET, C_BATT,  C_DEEP,   C_CPU,    C_NIGHT,  C_BED,   SG_END },
   { C_UPDATE,   C_RESET, C_REBOOT, C_ABOUT, SG_END,   SG_END,   SG_END,  SG_END,   SG_END },
   { C_PRAYER,   C_HIJRI, SG_END,  SG_END,   SG_END,   SG_END,   SG_END,  SG_END,   SG_END },
@@ -1239,14 +1259,14 @@ enum { F_CLASSIC = 0, F_STACK, F_DATEUP, F_MINIMAL, F_SIDE, F_BANNER,
        // actually knows about itself, and one is for showing off.
        F_DIAL, F_BAUHAUS, F_REGULATOR, F_RINGS, F_INFOGRAPH,
        F_STATUS, F_VITALS, F_BARS, F_TERMINAL, F_BINARY,
-       // and three that know what month it is in the other calendar
-       F_ARABIC, F_HIJRI, F_CRESCENT, FACE_N };
+       // and one that knows what month it is in the other calendar
+       F_HIJRI, FACE_N };
 const char* FACE_NAME[FACE_N] =
   { "classic", "stacked", "date up", "minimal", "side", "banner",
     "drift", "parallax", "water", "sand",
     "dial", "bauhaus", "regulator", "rings", "infograph",
     "status", "vitals", "bars", "terminal", "binary",
-    "arabic", "hijri", "crescent" };
+    "hijri" };
 int cfgFace = F_CLASSIC;
 
 // Changing the face from the clock itself rather than walking into
@@ -2685,6 +2705,23 @@ static void applyCpu() {
 }
 
 // Which radio behaviour is wanted, applied now.
+// Notifications decide the radio, and this is the only place that
+// says so. On means somebody has to be listening, so the link stays
+// up. Off means there is nothing to listen for, so the radio comes up
+// once a day for the clock and is otherwise not running at all.
+//
+// Before 7.14 these were two settings that could disagree: you could
+// ask for notifications and leave the radio asleep, which is a switch
+// that quietly means nothing.
+static void setNotes(bool on, bool announce) {
+  cfgQuiet = !on;
+  prefs.putBool("quiet", cfgQuiet);
+  int want = on ? BTM_ALWAYS : BTM_SMART;
+  if (cfgBtMode != want) { cfgBtMode = want; prefs.putInt("btmode", cfgBtMode); }
+  applyBtMode(false);
+  if (announce) flash(on ? "NOTIFICATIONS ON" : "NOTIFICATIONS OFF", 1200);
+}
+
 static void applyBtMode(bool announce) {
   if (cfgNet != NET_BT) { if (announce) flash("NOT ON BLUETOOTH", 1200); return; }
   smartOnAt = 0;
@@ -2695,6 +2732,19 @@ static void applyBtMode(bool announce) {
     if (!btUp) bleOn();
     if (announce) flash("BLUETOOTH ALWAYS ON", 1300);
   }
+}
+
+// Ten seconds at power on, counting down, so whoever switched it on
+// knows what it is about to become and how to stop it.
+static void drawKeyNotice(uint32_t secs) {
+  oled.clearDisplay();
+  bar("KEYRING MODE");
+  char l[22];
+  snprintf(l, sizeof(l), "Going quiet in %lus", (unsigned long)secs);
+  ctr(l, 18, 1);
+  ctr("hold 4s to stop", 34, 1);
+  ctr("or send home", 46, 1);
+  oled.display();
 }
 
 // What it says when somebody picks it up.
@@ -2743,21 +2793,104 @@ static void drawKeyCard() {
 
 // Keyring mode's whole life.
 //
-// The first thirty seconds after power are ordinary: the screen works,
-// the radio is up, and both ways out are open. "home" from a Shortcut
-// lets it out, and so does a four second hold on the pad. After that
-// the radios go, the processor drops to 80 MHz and the screen stays
-// dark until somebody disturbs it, and then it shows a card and goes
-// dark again.
+//   power on   ten seconds of notice on the screen, and a four second
+//              hold gets you out without a phone
+//   then       the screen goes dark but the radio stays up for two
+//              minutes, listening for one word: "home"
+//   after that both radios off, 80 MHz, deep sleep, and from then on
+//              it is a piece of plastic that says one line when it is
+//              picked up. A power cycle starts this over; nothing else
+//              does.
+//
+// Everything that decides which of those it is in lives in RTC memory,
+// because a wake from deep sleep is a fresh run of setup().
 uint32_t keyBootAt = 0;
-bool     keyShut = false;
+bool     keyDark = false;      // the screen has been put out for the quiet window
+bool     keyLit  = false;      // a card is up inside that window
 
-// Somebody picked it up, touched it or shook it.
+// Arm it: remember the card where a wake can reach it without NVS.
+static void keyArm() {
+  rtcKeyCard  = (uint8_t)constrain(cfgKeyCard, 0, KEYCARD_N - 1);
+  rtcKeyPokes = 0;
+  rtcKeyPokeAt = 0;
+}
+
+// Off, with both things that can wake it armed. Never returns.
+//
+// Touch and motion both wake it whatever the wake-by setting says. In
+// keyring mode that setting is not the owner's any more: whoever has
+// picked the thing up is who it is talking to.
+static void keyringDeep() {
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  rtcKeyShut = 1;
+  esp_deep_sleep_enable_gpio_wakeup(BIT(TOUCH_PIN), touchRest ? ESP_GPIO_WAKEUP_GPIO_LOW
+                                                              : ESP_GPIO_WAKEUP_GPIO_HIGH);
+  if (intWired) esp_deep_sleep_enable_gpio_wakeup(BIT(TAP_INT_PIN), ESP_GPIO_WAKEUP_GPIO_HIGH);
+  esp_deep_sleep_start();
+}
+
+// Somebody picked it up while it was shut. Called first thing in
+// setup(), before the radio, before the filesystem, before anything
+// reads a setting. Never returns.
+static void keyringWake() {
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  prefs.begin("nexus", false);
+  touchRest = prefs.getBool("trest", false);
+  cfgBright = constrain(prefs.getInt("bri", 160), 0, 255);
+  cfgEyes   = constrain(prefs.getInt("eye", 0), 0, STYLE_N - 1);
+  intWired  = true;                  // it was, or a motion wake could not have happened
+  pinMode(TOUCH_PIN, INPUT);
+  pinMode(TAP_INT_PIN, INPUT_PULLDOWN);
+
+  // Counted on the system clock, which the RTC keeps running through
+  // deep sleep. millis() restarts at nought on every wake and would
+  // have called every single poke the first one.
+  uint32_t tnow = (uint32_t)time(nullptr);
+  if (rtcKeyPokeAt && tnow - rtcKeyPokeAt < KEY_DIZZY_S) rtcKeyPokes++;
+  else                                                   rtcKeyPokes = 1;
+  rtcKeyPokeAt = tnow;
+  keyDizzy   = (rtcKeyPokes > KEY_DIZZY_N);
+  cfgKeyCard = constrain((int)rtcKeyCard, 0, KEYCARD_N - 1);
+
+  if (oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR, true, false)) {
+    oled.setTextWrap(false);
+    oled.setTextColor(SSD1306_WHITE);
+    applyBright();
+    // It looks at you, then it speaks. Nothing else: no title bar, no
+    // clock, no menu, no way in.
+    eyes.begin(SCRW, SCRH, 50);
+    eyes.setMood(keyDizzy ? ANGRY : STYLES[cfgEyes].mood);
+    uint32_t until = millis() + KEY_EYES_MS;
+    while ((int32_t)(millis() - until) < 0) { eyesFrame(); delay(20); }
+    drawKeyCard();
+    delay(KEY_CARD_MS);
+    oled.clearDisplay(); oled.display();
+    oled.ssd1306_command(SSD1306_DISPLAYOFF);
+  }
+
+  // Going back to sleep with the pad still held wakes it again at once.
+  for (int i = 0; i < 50 && digitalRead(TOUCH_PIN) != touchRest; i++) delay(100);
+  // Reading INT_SOURCE lets INT1 drop. Both addresses, because this path
+  // has not probed which one the sensor is at, and a latched INT1 here
+  // means waking straight back up, for ever, with no way in to stop it.
+  rReg(0x53, 0x30);
+  rReg(0x1D, 0x30);
+  delay(5);
+  keyringDeep();
+}
+
+// Somebody picked it up while it was still awake, which only happens
+// inside the window after power on. Once it is shut, a poke is a wake
+// from deep sleep and keyringWake() handles it instead.
 static void keyPoke() {
   uint32_t now = millis();
-  if (now - keyLastPoke < KEY_DIZZY_MS) keyPokes++; else keyPokes = 1;
+  uint32_t tnow = (uint32_t)time(nullptr);
+  if (rtcKeyPokeAt && tnow - rtcKeyPokeAt < KEY_DIZZY_S) rtcKeyPokes++;
+  else                                                   rtcKeyPokes = 1;
+  rtcKeyPokeAt = tnow;
   keyLastPoke = now;
-  keyDizzy = (keyPokes > KEY_DIZZY_N);
+  keyDizzy = (rtcKeyPokes > KEY_DIZZY_N);
   keyCardUntil = now + KEY_CARD_MS;
   if (asleep) wake("keyring");
 }
@@ -2765,43 +2898,71 @@ static void keyPoke() {
 // Out of keyring mode, by whichever route.
 static void keyLetOut(const char* why) {
   cfgKeyring = false; prefs.putBool("keyring", false);
-  keyOut = true; keyShut = false; keyCardUntil = 0; keyPokes = 0; keyDizzy = false;
+  keyOut = true; keyDark = false; keyCardUntil = 0; keyPokes = 0; keyDizzy = false;
+  rtcKeyShut = 0; rtcKeyPokes = 0; rtcKeyPokeAt = 0;
+  // The window forced Bluetooth on; give the saved mode back.
+  int want = constrain(prefs.getInt("net", NET_BT), 0, NET_N - 1);
+  if (want == NET_WIFI) want = NET_BT;        // WiFi is never home
+  cfgNet = want;
+  screenPower(true);
   applyCpu(); applyARate(); applyBtMode(false);
   Serial.printf("keyring: let out by %s\n", why);
   flash("BACK TO NORMAL", 1400);
 }
 
 // True when it has taken the loop and nothing else should run.
+//
+// Three states and no others. The notice, the quiet window, and then
+// it never comes back here because keyringDeep() does not return.
 static bool keyTick() {
   if (!keyringNow()) return false;
+  if (rtcKeyShut) { keyringDeep(); return true; }   // armed but still awake: finish the job
   uint32_t now = millis();
   if (!keyBootAt) keyBootAt = now ? now : 1;
+  uint32_t age = now - keyBootAt;
 
-  // The window. Everything behaves normally so you can see it and get
-  // your hands on it; the ways out are live for exactly this long.
-  if (!keyShut) {
-    if ((int32_t)(now - keyBootAt) < (int32_t)KEY_WINDOW_MS) return false;
-    bleOff();
-    WiFi.disconnect(true, false);
-    WiFi.mode(WIFI_OFF);
-    setCpuFrequencyMhz(80);
-    keyShut = true;
-    keyCardUntil = 0;
-    goSleep();
-    Serial.println("keyring: shut down, 80 MHz, no radios");
+  // 1. Ten seconds of notice, so whoever switched it on can see what
+  //    it is about to become and get out of it with a hold.
+  if (age < KEY_NOTICE_MS) {
+    if (now - lastDraw >= 120) {
+      lastDraw = now;
+      drawKeyNotice((KEY_NOTICE_MS - age + 999) / 1000);
+    }
     return true;
   }
 
-  // Shut. A card while somebody is holding it, dark the rest of the time.
-  if (keyCardUntil) {
-    if ((int32_t)(now - keyCardUntil) < 0) {
-      if (now - lastDraw >= 150) { lastDraw = now; drawKeyCard(); }
-      return true;
+  // 2. Dark, but the radio is still up and rqCommand is still listening.
+  //    One word gets it out. Nothing is drawn and nothing is read.
+  if (age < KEY_LISTEN_MS) {
+    if (!keyDark) {
+      oled.clearDisplay(); oled.display();
+      screenPower(false);
+      keyDark = true; keyLit = false;
+      Serial.println("keyring: dark, radio up, listening for home");
     }
-    keyCardUntil = 0;
-    keyDizzy = false;
-    goSleep();
+    // Picked up inside the window: it already behaves like a keyring,
+    // it is just not asleep yet.
+    if (keyCardUntil) {
+      if ((int32_t)(now - keyCardUntil) < 0) {
+        if (!keyLit) { screenPower(true); keyLit = true; }
+        if (now - lastDraw >= 150) { lastDraw = now; drawKeyCard(); }
+        return true;
+      }
+      keyCardUntil = 0; keyDizzy = false;
+      oled.clearDisplay(); oled.display();
+      screenPower(false); keyLit = false;
+    }
+    return true;
   }
+
+  // 3. Nobody said anything. Off for good.
+  bleOff();
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  setCpuFrequencyMhz(80);
+  keyArm();
+  Serial.println("keyring: shut. no radios, 80 MHz, deep sleep");
+  keyringDeep();
   return true;
 }
 
@@ -3542,24 +3703,6 @@ static bool hijriNow(int& hy, int& hm, int& hd) {
   return true;
 }
 
-// ---- Arabic, out of the baked bitmaps ----
-static void arDigit(int x, int y, int d, bool big) {
-  if (d < 0 || d > 9) return;
-  if (big) oled.drawBitmap(x, y, AR_BIG[d],   AR_BIG_W,   AR_BIG_H,   SSD1306_WHITE);
-  else     oled.drawBitmap(x, y, AR_SMALL[d], AR_SMALL_W, AR_SMALL_H, SSD1306_WHITE);
-}
-// Western order on purpose. A clock is read left to right whichever
-// digits it is wearing, and an Arabic reader reads ١٢:٣٠ the same way
-// round as 12:30.
-static void arNum(int x, int y, int v, int digits, bool big) {
-  int w = big ? AR_BIG_W : AR_SMALL_W;
-  for (int i = digits - 1; i >= 0; i--) { arDigit(x + i * w, y, v % 10, big); v /= 10; }
-}
-static int arNumW(int digits, bool big) { return digits * (big ? AR_BIG_W : AR_SMALL_W); }
-static void arMonth(int x, int y, int m) {
-  if (m < 1 || m > 12) return;
-  oled.drawBitmap(x, y, AR_MONTH[m - 1], AR_MONTH_W, AR_MONTH_H, SSD1306_WHITE);
-}
 
 // A band that shows one line, then the other, sliding the old one up
 // and out as the new one comes up behind it. Two seconds each.
@@ -3785,9 +3928,13 @@ static void faceTerminal() {
     snprintf(l[3], 24, "rssi  %d dBm", (int)WiFi.RSSI());
   } else {
     int q;
-    snprintf(l[2], 24, "net   %s", cfgNet == NET_BT ? "bluetooth" : "none");
-    if (linkRssi(q)) snprintf(l[3], 24, "rssi  %d dBm", q);
-    else             snprintf(l[3], 24, "rssi  --");
+    // 7.14: "bluetooth" used to be printed whether the radio was
+    // running or not, which is the one thing this face is for.
+    snprintf(l[2], 24, "net   %s",
+             cfgNet != NET_BT ? "none" : btUp ? "bluetooth" : "bluetooth off");
+    if (linkRssi(q))            snprintf(l[3], 24, "rssi  %d dBm", q);
+    else if (cfgNet == NET_BT && !btUp) snprintf(l[3], 24, "rssi  radio off");
+    else                        snprintf(l[3], 24, "rssi  --");
   }
   if (isnan(battV)) snprintf(l[4], 24, "batt  no pack");
   else              snprintf(l[4], 24, "batt  %d%% %.2fV", battPct(battV), battV);
@@ -3799,26 +3946,6 @@ static void faceTerminal() {
   }
 }
 
-// ---- 21. arabic: the time in Arabic numerals, the month in Arabic ----
-static void faceArabic() {
-  // HH:MM across the middle. Four glyphs and a colon of two dots,
-  // centred as one block so it does not shift as the digits change.
-  const int DW = AR_BIG_W, GAP = 7;
-  int w = DW * 4 + GAP;
-  int x = (SCRW - w) / 2, y = 4;
-  arNum(x, y, fb.H, 2, true);
-  arNum(x + DW * 2 + GAP, y, fb.M, 2, true);
-  int cx = x + DW * 2 + GAP / 2;
-  oled.fillRect(cx - 1, y + 7,  2, 2, SSD1306_WHITE);
-  oled.fillRect(cx - 1, y + 15, 2, 2, SSD1306_WHITE);
-
-  int hy, hm, hd;
-  if (!hijriNow(hy, hm, hd)) { ctr("--", 40, 1); return; }
-  // the day on the left, the year on the right, the month between them
-  arNum(3, 30, hd, 2, false);
-  arNum(SCRW - 3 - arNumW(4, false), 30, hy, 4, false);
-  arMonth((SCRW - AR_MONTH_W) / 2, 45, hm);
-}
 
 // ---- 22. hijri: an English clock whose date keeps changing its mind ----
 static void faceHijri() {
@@ -3836,31 +3963,6 @@ static void faceHijri() {
   slideBand(44, g, h);
 }
 
-// ---- 23. crescent: the moon, and the month it belongs to ----
-static void faceCrescent() {
-  // A crescent is two circles, one eating the other.
-  const int CX = 22, CY = 20, R = 13;
-  oled.fillCircle(CX, CY, R, SSD1306_WHITE);
-  oled.fillCircle(CX + 6, CY - 2, R, SSD1306_BLACK);
-
-  oled.setTextSize(2);
-  oled.setCursor(46, 12);
-  oled.print(fb.hm);
-  oled.setTextSize(1);
-  at(46 + 5 * 12 + 2, 19, fb.ss);
-
-  // The month name is 104 wide and 16 tall, which is most of the lower
-  // half, so everything else is placed round it rather than near it.
-  // At 40 it ran straight through the line underneath.
-  int hy, hm, hd;
-  if (hijriNow(hy, hm, hd)) {
-    arNum(3, 39, hd, 2, false);                       // 39..49
-    arMonth(SCRW - 2 - AR_MONTH_W, 37, hm);           // 37..52
-    char y[12]; snprintf(y, sizeof(y), "%d", hy);
-    at(3, 55, y);                                     // 55..61
-    at(SCRW - 3 - (int)strlen(fb.dshort) * 6, 55, fb.dshort);
-  }
-}
 
 // ---- 10. binary: hours, minutes and seconds, in dots ----
 //  One column per digit, most significant at the top, and only the dots
@@ -4220,7 +4322,6 @@ static void spinner(int cy) {
 //  FAITH
 // ================================================================
 static const char* faithLabel(int i, char* b, size_t n) { snprintf(b, n, "%s", F_NAME[i]); return b; }
-static const char* surahLabel(int i, char* b, size_t n) { snprintf(b, n, "%d %s", i + 1, SURAH[i].name); return b; }
 static const char* mornLabel(int i, char* b, size_t n)  { snprintf(b, n, "%s", MORNING[i].title); return b; }
 static const char* eveLabel(int i, char* b, size_t n)   { snprintf(b, n, "%s", EVENING[i].title); return b; }
 
@@ -4289,10 +4390,6 @@ static void drawFaith() {
     switch (itemIdx) {
       case F_ZIKR:  drawZikr();  break;
       case F_NAMES: drawNames(); break;
-      case F_QURAN:
-        snprintf(r, sizeof(r), "%d/114", subIdx + 1);
-        drawList("QURAN", r, 114, subIdx, surahLabel);
-        break;
       case F_MORNING:
         snprintf(r, sizeof(r), "%d/%d", subIdx + 1, MORNING_N);
         drawList("MORNING", r, MORNING_N, subIdx, mornLabel);
@@ -5487,9 +5584,7 @@ static void drawFaceOnly() {
     case F_BARS:      faceBars();       break;
     case F_TERMINAL:  faceTerminal();   break;
     case F_BINARY:    faceBinary();     break;
-    case F_ARABIC:    faceArabic();     break;
     case F_HIJRI:     faceHijri();      break;
-    case F_CRESCENT:  faceCrescent();   break;
     default:         faceClassic();     break;
   }
 }
@@ -5547,8 +5642,8 @@ static void drawSettings() {
       ctr("hold to come back", 38, 1);
     } else {
       ctr("No radios, no menus", 16, 1);
-      ctr("Out: hold 4s,", 28, 1);
-      ctr("or a home in 30s", 38, 1);
+      ctr("Out: hold 4s, or a", 28, 1);
+      ctr("home within 2 min", 38, 1);
       ctr("1 moves   hold yes", 54, 1);
     }
     oled.display();
@@ -5573,7 +5668,7 @@ static void drawSettings() {
   // The groups. Four fit on the screen; the list moves to keep the
   // chosen one in view.
   if (depth == 1 && setGrp < 0) {
-    static const uint8_t* const ic[SG_COUNT] = { IC_SUN, IC_HAND, IC_BT, IC_SHIELD, IC_BATT, IC_CHIP };
+    static const uint8_t* const ic[SG_COUNT] = { IC_SUN, IC_BT, IC_HAND, IC_SHIELD, IC_BATT, IC_CHIP };
     bar("SETTINGS");
     int first = uiFirst(grpSel, SG_COUNT);
     for (int r = 0; r < UI_ROWS && first + r < SG_COUNT; r++) {
@@ -5634,10 +5729,12 @@ static void drawSettings() {
       case C_NIGHT:  snprintf(v, sizeof(v), "%s", cfgNight ? "on" : "off"); break;
       case C_BLOG:   snprintf(v, sizeof(v), "%s", cfgBlog ? "on" : "off"); break;
       case C_PLOCK:  snprintf(v, sizeof(v), "%s", PLOCK_NAME[constrain(cfgPLock, 0, 3)]); break;
-      case C_BTMODE: snprintf(v, sizeof(v), "%s", BTM_NAME[constrain(cfgBtMode, 0, BTM_N - 1)]); break;
       case C_CPU:    snprintf(v, sizeof(v), "%s", CPU_NAME[constrain(cfgCpu, 0, CPU_N - 1)]); break;
       case C_ARATE:  snprintf(v, sizeof(v), "%s", AR_NAME[constrain(cfgARate, 0, AR_N - 1)]); break;
       case C_KEYRING: snprintf(v, sizeof(v), "%s", cfgKeyring ? "on" : "off"); break;
+      // One row, and it says what the radio is doing as well, because
+      // that is what it decides.
+      case C_NOTES:  snprintf(v, sizeof(v), "%s", cfgQuiet ? "off, daily" : "on, linked"); break;
       case C_KEYCARD: snprintf(v, sizeof(v), "%s", KEYCARD_NAME[constrain(cfgKeyCard, 0, KEYCARD_N - 1)]); break;
       case C_BVIEW:  snprintf(v, sizeof(v), "%s", cfgBlog ? "hold" : "off"); break;
       case C_BRESET: snprintf(v, sizeof(v), "%.2f V", BLOG_V[constrain(cfgBlogV, 0, 3)]); break;
@@ -7462,14 +7559,6 @@ static void wrapInto(const String& text) {
   rdTurn = millis() + AUTO_TURN_MS;
 }
 
-static void openSurah(int i) {
-  const Surah& s = SURAH[i];
-  String body = String(s.meaning) + "\n" +
-                (s.makki ? "Revealed in Makkah" : "Revealed in Madinah") + "\n" +
-                String(s.ayat) + " verses\n\n" + s.theme;
-  rdTitle = s.name;                      // the number is already in the list
-  wrapInto(body);
-}
 static void openDhikr(const Dhikr* set, int i) {
   rdTitle = set[i].title;
   wrapInto(set[i].body);
@@ -8721,7 +8810,6 @@ static void knockOne() {
       switch (itemIdx) {
         case F_ZIKR:    zikrTick(); break;
         case F_NAMES:   subIdx = (subIdx + 1) % 99; break;
-        case F_QURAN:   subIdx = (subIdx + 1) % 114; break;
         case F_MORNING: subIdx = (subIdx + 1) % MORNING_N; break;
         default:        subIdx = (subIdx + 1) % EVENING_N; break;
       }
@@ -8832,7 +8920,6 @@ static void knockTwoInner() {
     }
     if (depth == 2) {
       switch (itemIdx) {
-        case F_QURAN:   openSurah(subIdx);           depth = 3; break;
         case F_MORNING: openDhikr(MORNING, subIdx);  depth = 3; break;
         case F_EVENING: openDhikr(EVENING, subIdx);  depth = 3; break;
         default:        depth = 1; break;            // zikr and the names step back
@@ -8872,8 +8959,9 @@ static void knockTwoInner() {
   if (screen == S_SETTINGS && itemIdx == C_KEYRING && depth == 2) {
     if (cfgKeyring) { keyLetOut("the settings"); depth = 1; return; }
     cfgKeyring = true; prefs.putBool("keyring", true);
-    keyOut = false; keyShut = false; keyBootAt = millis();
+    keyOut = false; keyDark = false; keyBootAt = millis();
     keyPokes = 0; keyDizzy = false; keyCardUntil = 0;
+    keyArm();
     depth = 1;
     flash("KEYRING MODE", 1500);
     return;
@@ -8974,10 +9062,8 @@ static void knockTwoInner() {
         cfgPLock = (cfgPLock + 1) % 4; prefs.putInt("plock", cfgPLock);
         flash(cfgPLock ? "POCKET LOCK ON" : "POCKET LOCK OFF", 1100);
         break;
-      case C_BTMODE:
-        cfgBtMode = (cfgBtMode + 1) % BTM_N;
-        prefs.putInt("btmode", cfgBtMode);
-        applyBtMode(true);
+      case C_NOTES:
+        setNotes(cfgQuiet, true);        // cfgQuiet is "off", so this flips it
         break;
       case C_CPU:
         cfgCpu = (cfgCpu + 1) % CPU_N;
@@ -8992,6 +9078,7 @@ static void knockTwoInner() {
       case C_KEYCARD:
         cfgKeyCard = (cfgKeyCard + 1) % KEYCARD_N;
         prefs.putInt("keycard", cfgKeyCard);
+        rtcKeyCard = (uint8_t)cfgKeyCard;     // what a wake will read
         break;
       case C_KEYRING:
         // Asked first, because this one is hard to undo on purpose.
@@ -9737,7 +9824,7 @@ static void input() {
             unlocking = true; unlockAt = now; unlockShown = false;
             touchTaps = 0; touchLongDone = true;
           }
-          else if (keyringNow() && keyShut) { keyPoke(); }
+          else if (keyringNow() && keyDark) { keyPoke(); }
           else if (asleep) { if (touchWakes()) { wake("touch"); popupOnWake(); }
                              lastUserAt = now; touchTaps = 0; touchLongDone = true; }
           else lastUserAt = now;                     // awake: a real touch keeps it unlocked
@@ -9771,7 +9858,7 @@ static void input() {
       // In keyring mode the long hold is the way out, not the way off.
       // It only works in the window, which is the whole point: after
       // that the robot is a keyring and holding it does nothing.
-      if (keyringNow() && !keyShut && held >= TOUCH_HOME_MS) {
+      if (keyringNow() && !keyDark && held >= TOUCH_HOME_MS) {
         keyLetOut("a long hold");
         touchLongDone = true; touchTaps = 0;
         return;
@@ -9849,7 +9936,7 @@ static void input() {
   if (fabsf(amag - 1.0f) > SHAKE_G && now - lastShake > 600) {
     lastShake = now; cShake++;
     awayEv(AE_SHAKE);
-    if (keyringNow() && keyShut) { keyPoke(); return; }
+    if (keyringNow() && keyDark) { keyPoke(); return; }
     if (asleep) { if (motionWakes()) wake("shake"); return; }
     // 7.1: a shake still steps back (below), but is not "activity": a
     // bag being carried shakes, and that must not keep the screen lit.
@@ -12620,7 +12707,6 @@ static int hubItems(int s, HubIt* o) {
     o[n++] = { HI_SCREEN, (uint8_t)S_PRAYER, IC_MOON, "Prayer times" };
     o[n++] = { HI_FAITH, F_ZIKR, IC_BEADS, "Zikr" };
     o[n++] = { HI_ADHKAR, 0, IC_DAWN, "Adhkar" };
-    o[n++] = { HI_FAITH, F_QURAN, IC_BOOK, "Quran" };
     o[n++] = { HI_FAITH, F_NAMES, IC_STAR, "99 Names" };
     o[n++] = { HI_PSET, 0, IC_SLIDE, "Prayer settings" };
   } else if (s == S_CALM) {
@@ -13381,22 +13467,11 @@ static int rqCommand(const char* raw) {
     screen = S_HOME; depth = 0;
   }
   else if (is("notifications on") || is("notification on") || is("popups on") || is("quiet off")) {
-    cfgQuiet = false; prefs.putBool("quiet", false); flash("NOTIFICATIONS ON", 1200);
-    // Notifications need somebody listening, so the radio goes back to
-    // staying up. Asking for notifications and leaving the radio asleep
-    // would be a setting that quietly means nothing.
-    if (cfgBtMode != BTM_ALWAYS) {
-      cfgBtMode = BTM_ALWAYS; prefs.putInt("btmode", cfgBtMode); applyBtMode(false);
-    }
+    setNotes(true, true);
   }
   else if (is("notifications off") || is("notification off") || is("popups off") ||
            is("quiet") || is("quiet on") || is("silent")) {
-    cfgQuiet = true; prefs.putBool("quiet", true); flash("NOTIFICATIONS QUIET", 1200);
-    // Nothing to listen for, so the radio stops holding a link open and
-    // only comes up for the clock.
-    if (cfgBtMode != BTM_SMART) {
-      cfgBtMode = BTM_SMART; prefs.putInt("btmode", cfgBtMode); applyBtMode(false);
-    }
+    setNotes(false, true);
   }
   else if (is("home")) {
     // The way out of keyring mode, and the only one that does not need
@@ -13843,12 +13918,25 @@ void setup() {
   // Before the serial port settles, before anything is read and long
   // before anything is powered. A touch that was not meant costs this
   // much and nothing else.
+  // Shut as a keyring: show the card and go straight back. Never
+  // returns, never reaches the radio, and never reaches wakeGate,
+  // because whoever picked this up does not know to hold the pad.
+  // Any boot that is not a sleep wake reopens the way out: that is
+  // what "turn it off and turn it on again" means here.
+  if (woke_ == ESP_SLEEP_WAKEUP_GPIO || woke_ == ESP_SLEEP_WAKEUP_TIMER) {
+    if (rtcKeyShut) keyringWake();
+  } else {
+    rtcKeyShut = 0;
+  }
   if (woke_ == ESP_SLEEP_WAKEUP_GPIO) wakeGate();
   delay(300);
 
   prefs.begin("nexus", false);
   pmInit();                            // says whether light sleep is on offer
-  bool awayBoot = prefs.getBool("away", false);   // Away: no start-up screens at all
+  // Away and keyring both mean no start-up screens at all. A keyring
+  // that introduced itself, swept its sensors and offered a how-to
+  // card would not be a keyring.
+  bool awayBoot = prefs.getBool("away", false) || prefs.getBool("keyring", false);
   cBoot = prefs.getUInt("boots", 0) + 1;
   prefs.putUInt("boots", cBoot);
 
@@ -13935,6 +14023,14 @@ void setup() {
   cfgCap   = constrain(prefs.getInt("cap", 350), 50, 5000);
   blogBoot(fromDeep);                  // 7.8
   cfgQuiet   = prefs.getBool("quiet", false);
+  // 7.14: notifications own the radio. A robot coming up from 7.13
+  // could have the two disagreeing, because they were two settings.
+  // Whatever was asked for in words wins over whatever the radio was
+  // last told.
+  {
+    int want = cfgQuiet ? BTM_SMART : BTM_ALWAYS;
+    if (cfgBtMode != want) { cfgBtMode = want; prefs.putInt("btmode", cfgBtMode); }
+  }
   lastSyncAt = prefs.getUInt("lsync", 0);
   cfgWakeIdx  = constrain(prefs.getInt("wakeh", 2), 0, WAKE_N - 1);
   cfgBike     = prefs.getBool("bike", false);
@@ -14129,6 +14225,13 @@ void setup() {
     btFellBack = true;
     Serial.printf("bluetooth crashed %d starts running: trying again, no WiFi\n", BT_GIVE_UP);
     flash("BLUETOOTH RESTARTED", 1400);
+  }
+  // A keyring with the radio switched off has no way out at all, so
+  // the two minute window is always on Bluetooth whatever the saved
+  // mode says. NVS is not touched; coming out restores it.
+  if (cfgKeyring && !keyOut && cfgNet != NET_BT) {
+    cfgNet = NET_BT;
+    Serial.println("keyring: bluetooth for the window, whatever the saved mode");
   }
   if (cfgOffline) {
     WiFi.persistent(false);

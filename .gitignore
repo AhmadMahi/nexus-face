@@ -3,3 +3,9 @@ out/
 *.elf
 .DS_Store
 build/
+__pycache__/
+tools/v6/fw_funcs.inc
+tools/v6/t
+tools/v6/screens.png
+tools/v6/icons.json
+tools/v6/glcdfont.c

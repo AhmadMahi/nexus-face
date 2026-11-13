@@ -154,16 +154,52 @@ screens += [
     keycard("dizzy",       [("Stop it", 12, 2), ("I am getting dizzy", 40, 1)]),
 ]
 _c = Screen("Keyring confirm"); _c.bar("KEYRING MODE")
-for _t, _y in [("No radios, no menus", 16), ("Out: hold 4s,", 28),
-               ("or a home in 30s", 38), ("1 moves   hold yes", 54)]:
+for _t, _y in [("No radios, no menus", 16), ("Out: hold 4s, or a", 28),
+               ("home within 2 min", 38), ("1 moves   hold yes", 54)]:
     _c.ctr(_t, _y)
 screens.append(_c)
+
+# 7.14: the ten second notice at power on. The countdown is measured at
+# its widest, which is two digits, because a one character difference in
+# the middle of a centred line is how a centred line runs off the end.
+for _secs in (10, 9):
+    _n = Screen(f"Keyring notice {_secs}s"); _n.bar("KEYRING MODE")
+    _n.ctr(f"Going quiet in {_secs}s", 18)
+    _n.ctr("hold 4s to stop", 34)
+    _n.ctr("or send home", 46)
+    screens.append(_n)
+
+# 7.14: the terminal face. A watch face owns the whole panel, with no
+# title bar and no padding, so the list rules in audit() do not apply to
+# it. What does apply is the right edge: the face writes at x 10 and
+# "bluetooth off" is the longest value any of its lines has carried.
+def termline(label, value):
+    line = f"{label:<6}{value}"       # every label in that face is padded to six
+    right = 10 + len(line) * 6
+    if right > W:
+        problems.append(f"face terminal: '{line}' runs {right - W}px past the right edge")
+    return right
+
+for _lab, _val in [("time", "23:41:07"), ("date", "Thu 13 Nov"),
+                   ("net", "bluetooth off"), ("net", "bluetooth"), ("net", "none"),
+                   ("rssi", "radio off"), ("rssi", "-99 dBm"), ("rssi", "--"),
+                   ("batt", "100% 4.09V"), ("batt", "no pack"), ("up", "123d 23h")]:
+    termline(_lab, _val)
 
 
 # 7.13's new rows, at their longest values, because a long label beside
 # a long value is where a settings row runs out of width.
-screens.append(settings("Connections", [("Network", "Bluetooth"), ("Bluetooth", "always on"),
-                                        ("Multi-link", "on, 2 in"), ("Primary", "iPhone")], 1))
+#
+# 7.14: the group list itself, because "Phone and keyring" is the
+# longest name any group has had, and the rows it holds.
+screens.append(menu("SETTINGS", [(None, "Display", ""), (None, "Phone and keyring", ""),
+                                 (None, "Touch and motion", ""), (None, "Away and safety", "")], 1))
+screens.append(settings("Phone and keyring", [("Notifications", "off, daily"),
+                                              ("Keyring mode", "off"),
+                                              ("Card", "don't touch"),
+                                              ("Network", "Bluetooth")], 0))
+screens.append(settings("Phone and keyring", [("Multi-link", "on, 2 in"), ("Primary", "iPhone"),
+                                              ("Second", "MacBook Pro"), ("Pair a Mac", "paired")], 2))
 screens.append(settings("Battery", [("Battery use", "hold"), ("Power down", "2 h"),
                                     ("Processor", "160 MHz"), ("Night sleep", "on")], 2))
 screens.append(settings("Touch and motion", [("Tap strength", "medium"), ("Accelerometer", "hold"),
