@@ -22,8 +22,12 @@ jobs:
             https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.3.10
-          arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" \
-            "FluxGarage RoboEyes" "ArduinoJson" "NimBLE-Arduino@2.5.1"
+          # Pinned, because an unpinned library turns this build into a
+          # different binary from the one that was tested by hand.
+          arduino-cli lib install \
+            "Adafruit GFX Library@1.13.0" "Adafruit SSD1306@2.5.17" \
+            "FluxGarage RoboEyes@1.1.1" "ArduinoJson@7.4.3" \
+            "NimBLE-Arduino@2.5.1"
           # Releases built here use the stock core, which has no power
           # management. They run, but without light sleep: Bluetooth
           # drops whenever the screen goes dark, as in 5.20. Build with
@@ -44,7 +48,7 @@ jobs:
         run: |
           echo "building $SKETCH"
           arduino-cli compile \
-            --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs \
+            --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs,CDCOnBoot=cdc \
             --output-dir out "$SKETCH"
           cp "out/$SKETCH.ino.bin" nexus_face.bin
           ls -l nexus_face.bin
@@ -57,9 +61,25 @@ jobs:
           echo "sketch=$SKETCH  FW_VERSION=$FW  tag=$TAG"
           [ "$FW" = "$TAG" ] || { echo "::error::FW_VERSION ($FW) != tag ($TAG)"; exit 1; }
 
-      - uses: softprops/action-gh-release@v2
+      # The release assets are built by hand, with the full FQBN above and
+      # whatever core the release calls for, then uploaded. CI must not
+      # replace one that is already there. In 7.13.0 it did: nexus_face.bin
+      # was uploaded and checksum verified at 15:18, and this job quietly
+      # overwrote it at 15:21 with its own build. Nobody would have seen it
+      # except by weighing the asset.
+      - name: Publish only if the release has no binary yet
         if: startsWith(github.ref, 'refs/tags/v')
-        with:
-          files: nexus_face.bin
-          prerelease: false
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "$TAG" --generate-notes
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+               --json assets -q '.assets[].name' | grep -qx 'nexus_face.bin'; then
+            echo "nexus_face.bin is already on $TAG. Leaving it alone."
+            exit 0
+          fi
+          echo "No binary on $TAG yet, uploading this build."
+          gh release upload "$TAG" nexus_face.bin --repo "$GITHUB_REPOSITORY"
