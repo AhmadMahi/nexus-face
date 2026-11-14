@@ -127,8 +127,13 @@ Notifications.
 
 | Notifications | Bluetooth |
 |---|---|
+| **off, daily** | the default. Up when you switch it on, takes the time, gone. Back once a day for a few seconds, with the screen dark, because the C3 has no crystal and the clock drifts |
 | **on, linked** | up at boot and stays connected |
-| **off, daily** | up at boot, takes the time, gone. Back once a day for a few seconds, because the C3 has no crystal and the clock drifts |
+
+**Picking it up does not wake the radio.** It wakes the screen, and the
+time it shows is its own. With the radio off, Shortcuts cannot reach it
+and notifications do not arrive until the next time it is up: switch
+Notifications on if you want them whenever you say them.
 
 **WiFi is never on by itself.** Not at boot, not on a schedule, not as a
 fallback. It comes up when you ask for it by name, and goes away again:

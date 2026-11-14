@@ -108,7 +108,32 @@ static bool keyringNow() { return cfgKeyring && !keyOut; }
 static void drawKeyNotice(uint32_t s) { rec("notice " + std::to_string(s)); }
 static void drawKeyCard() { rec("card"); }
 static void screenPower(bool on) { rec(on ? "screen on" : "screen off"); }
-static void bleOff() { rec("bleOff"); }
+// 7.15: a clock the test can move. Left at nought it is the real
+// one, so every test written before this still sees what it saw.
+static time_t fakeEpoch = 0;
+static time_t fwTime(time_t* p) {
+  if (!fakeEpoch) return ::time(p);
+  if (p) *p = fakeEpoch;
+  return fakeEpoch;
+}
+#define time fwTime
+
+// 7.15: the radio that is off unless the clock is due.
+#define SMART_WINDOW_MS 45000UL
+#define SMART_EVERY_S   86400L
+#define SMART_RETRY_S     3600L
+#define SMART_RETRY_MS   3600000UL
+#define CLOCK_SANE     1735689600L
+enum { CTS_IDLE = 0, CTS_DONE, CTS_NONE };
+int ctsState = CTS_IDLE;
+bool btUp = false;
+uint8_t fakeBonds = 1;
+static uint8_t bondsKnown() { return fakeBonds; }
+static void bleOn()  { if (btUp) return; btUp = true;  rec("bleOn"); }
+static void bleOff() { btUp = false; rec("bleOff"); }
+uint32_t smartOnAt = 0, smartRetryMs = 0;
+bool     smartSettled = false;
+time_t   smartNextS = 0, smartRetryS = 0;
 static void setCpuFrequencyMhz(int m) { rec("cpu " + std::to_string(m)); }
 static void keyringDeep() { rtcKeyShut = 1; rec("deep sleep"); }
 struct { void clearDisplay() {} void display() {} } oled;
@@ -414,6 +439,80 @@ int main() {
   //  The card a wake will show is kept where a wake can read it.
   reset(); cfgKeyCard = 3; keyArm();
   CHECK(rtcKeyCard == 3, "arming remembers the card in RTC memory");
+
+  // ================================================================
+  //  7.15: the radio is off unless the clock is due
+  // ================================================================
+  //  What this replaces: smartNext and smartRetryAt were ordinary
+  //  globals holding millis() readings. A deep sleep wake clears the
+  //  first and restarts the second at nought, so every wake came back
+  //  believing the clock had never been fetched and opened a forty
+  //  five second radio window. The radio was never off for longer than
+  //  one wake, which is the whole of "it keeps saying connecting".
+  //
+  //  As with keyring mode, a wake is modelled by wiping exactly what
+  //  RAM loses and keeping exactly what RTC memory keeps.
+  auto smartFresh = [&]() {                     // power on
+    cfgNet = NET_BT; cfgBtMode = BTM_SMART; cfgKeyring = false; keyOut = false;
+    btUp = false; ctsState = CTS_IDLE; fakeBonds = 1;
+    smartNextS = 0; smartRetryS = 0;            // RTC memory, cleared by a power cut
+    smartOnAt = 0; smartRetryMs = 0; smartSettled = false;
+    fakeNow = 1000; fakeEpoch = 1760000000L;
+  };
+  auto smartWake = [&]() {                      // what a deep sleep wake leaves behind
+    btUp = false; ctsState = CTS_IDLE;
+    smartOnAt = 0; smartRetryMs = 0; smartSettled = false;
+    fakeNow = 1000;                             // millis() starts again at nought
+  };
+
+  reset(); smartFresh();
+  CHECK(smartDue(), "a power on is always owed a clock");
+  smartTick();
+  CHECK(called("bleOn") && btUp, "and brings the radio up for it");
+  ctsState = CTS_DONE; fakeNow += 2000;
+  reset(); smartTick();
+  CHECK(called("bleOff") && !btUp, "the clock lands and the radio goes");
+  CHECK(smartNextS == fakeEpoch + SMART_EVERY_S, "the next one is a day away");
+  CHECK(smartSettled, "and this wake is finished with it");
+
+  //  The regression, and the reason for all of it.
+  time_t keptNext = smartNextS;
+  reset(); smartWake();
+  CHECK(!smartDue(), "a wake an instant later is not owed a clock");
+  smartTick();
+  CHECK(!called("bleOn") && !btUp, "so a wake does not bring the radio up");
+  CHECK(smartNextS == keptNext, "and the day's appointment is still the same one");
+  int ups = 0;
+  for (int i = 0; i < 20; i++) { reset(); smartWake(); smartTick(); if (called("bleOn")) ups++; }
+  CHECK(ups == 0, "twenty wakes, and the radio stays off for every one");
+
+  //  A day later it is owed one again.
+  reset(); smartWake(); fakeEpoch = keptNext + 1;
+  CHECK(smartDue(), "a day later the clock is due again");
+  smartTick();
+  CHECK(called("bleOn"), "and the radio comes up, once");
+
+  //  Nobody answered.
+  reset(); smartFresh(); smartTick();
+  reset(); fakeNow += SMART_WINDOW_MS + 1;
+  smartTick();
+  CHECK(called("bleOff") && !btUp, "nobody answered, and the radio goes anyway");
+  CHECK(smartRetryS == fakeEpoch + SMART_RETRY_S, "it waits an hour before asking again");
+  reset(); smartWake();
+  CHECK(!smartDue(), "and the hour survives a wake, as the day does");
+
+  //  Never paired. There is nothing to be quiet about.
+  reset(); smartFresh(); fakeBonds = 0;
+  smartTick();
+  reset(); fakeNow += SMART_WINDOW_MS + 1;
+  smartTick();
+  CHECK(!called("bleOff") && btUp, "with nothing ever paired it stays up to be found");
+
+  //  Notifications on is the other mode, and this one keeps out of it.
+  reset(); smartFresh(); cfgBtMode = BTM_ALWAYS;
+  smartTick();
+  CHECK(!called("bleOn"), "with notifications on the daily clock has no say");
+  fakeEpoch = 0;                                // back to the real clock
 
   // -- weather words --
   struct { const char* w; int c; } wx[] = { { "Sunny", 0 }, { "Clear", 0 }, { "Partly Cloudy", 2 },

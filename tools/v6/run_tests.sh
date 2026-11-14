@@ -10,7 +10,7 @@ cd "${0:A:h}"
 python3 extract_rafiq.py \
   utcFromTm rqSkip rqTagged rqAfterTag rafiqTagged rqFromShortcuts rafiqIs \
   rqFresh rqFnv rqRanBefore rqRemember wxCodeFromWords rqNum rqWeather \
-  setNotes keyArm keyTick \
+  setNotes keyArm keyTick smartDue smartTick \
   tmrCommand rqCommand rafiqPayload rafiqNote > fw_funcs.inc
 g++ -std=gnu++17 -w -o t test_rafiq.cpp
 ./t

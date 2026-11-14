@@ -140,7 +140,7 @@ Six groups. Tap to move, hold to open.
 
 | Row | Choices |
 |---|---|
-| **Notifications** | **on, linked** or **off, daily**. This decides the radio. See below |
+| **Notifications** | **off, daily** (the default) or **on, linked**. This decides the radio. See below |
 | **Keyring mode** | off, or on. See below |
 | **Card** | which line it says when somebody picks it up |
 | Network | Bluetooth, WiFi, or off. WiFi here is temporary: it ends at the next real restart, or after half an hour unused |
@@ -201,14 +201,31 @@ than from this list, because that is where you are when you want it.
 
 | Notifications | What the radio does |
 |---|---|
+| **off, daily** | the default. Bluetooth comes up when you switch the robot on, takes the time, and goes. It comes back once a day for a few seconds to take the time again, then goes. The rest of the day the radio is not running |
 | **on, linked** | Bluetooth comes up at boot and stays connected to your phone. Notifications arrive, Shortcuts reach it, the clock stays right |
-| **off, daily** | Bluetooth comes up at boot, takes the time, and goes. It comes back once a day for a few seconds to take the time again, then goes. The rest of the day the radio is not running |
 
-The second one is the long battery. The C3 has no crystal, so the clock
-drifts, which is the only reason it comes back at all.
+**Picking it up does not wake the radio.** It wakes the screen. The time
+it shows is its own, kept by the chip through the sleep, and the radio
+stays exactly where it was.
+
+Off and daily is the long battery. The C3 has no crystal, so the clock
+drifts, which is the only reason it comes back at all. The once a day
+visit happens with the screen dark: it wakes, takes the time, and is
+gone again, and you never see it.
+
+**What you give up with the radio off:** Shortcuts cannot reach it, and
+notifications do not arrive, until the next time the radio is up. If you
+want `RAFIQ sync`, `RAFIQ timer` and the rest to work whenever you say
+them, switch Notifications on.
 
 `notifications on` and `notifications off` from a Shortcut do the same
 thing as the row.
+
+Two exceptions, both deliberate. **Keyring mode** always gets its radio
+for the two minute window, because `home` is its only exit that does not
+need your hands on it. And a robot that **nothing has ever paired with**
+leaves the radio up and stays findable, because a radio that is down
+cannot be paired with.
 
 **WiFi is never on.** Not at boot, not on a schedule, not as a fallback. It
 comes up only when you ask for it by name: Settings, Hotspot, or
@@ -309,6 +326,8 @@ selected. Settings and credentials live in NVS and survive that.
 | the pad does nothing | it relearns its resting level a minute after power on. Give it a minute without touching it |
 | it says RESTARTED: CRASH | three crashes in a row and it comes up in safe mode on WiFi, so it can be updated |
 | the clock is wrong | `RAFIQ sync`, or switch Notifications on so it holds a link |
+| a Shortcut does nothing | with Notifications off the radio is down and nothing can reach it. Switch Notifications on, or switch the robot off and on, which brings the radio up for the clock |
+| it says `bluetooth off` on the terminal face | that is the radio being off on purpose, not a fault. With Notifications off it is off almost all the time |
 | the battery reads low | Settings, Battery, Battery full. If it still reads low, add 100nF from GPIO1 to ground, see [WIRING.md](WIRING.md) |
 | nothing on the screen | four seconds on the pad switches it off; hold again to bring it back |
 | it will not come out of keyring mode | switch it off, switch it on, and either hold the pad for four seconds in the first ten, or send `home` within two minutes |

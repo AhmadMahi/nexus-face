@@ -314,7 +314,7 @@ static uint32_t deepAfterMs() { return (uint32_t)DEEP_OPTS[cfgDeepIdx] * 1000UL;
 #define SCRW 128                 // RoboEyes owns W and H, so ours differ
 #define SCRH 64
 
-#define FW_VERSION "7.14.0"
+#define FW_VERSION "7.15.0"
 #define OTA_REPO   "AhmadMahi/nexus-face"
 #define OTA_ASSET  "nexus_face.bin"
 
@@ -514,12 +514,26 @@ RTC_DATA_ATTR uint32_t rtcKeyPokeAt = 0;  // system clock of the last one
 //  Smart mode's radio window: when it opened, when the clock is next
 //  due, and when to try again on a boot where the clock is not set and
 //  time(nullptr) means nothing yet.
+//
+//  7.15: when the clock is next due and when to try again both live in
+//  RTC memory now, and both are moments on the wall clock rather than
+//  readings of millis(). Until 7.14 they were ordinary globals holding
+//  millis() values, and a deep sleep wake clears the first and restarts
+//  the second at nought. Every single time the robot was picked up it
+//  came back believing the clock had never been fetched, brought the
+//  radio up and sat there for forty five seconds. That is the whole of
+//  the "it keeps saying connecting" fault: the radio was never off for
+//  longer than one wake.
 #define SMART_WINDOW_MS 45000UL      // long enough to connect and read
 #define SMART_EVERY_S   86400L       // a day
-#define SMART_EVERY_MS  86400000UL
-#define SMART_RETRY_MS   3600000UL   // nobody answered: try in an hour
-uint32_t smartOnAt = 0, smartRetryAt = 0;
-time_t   smartNext = 0;
+#define SMART_RETRY_S     3600L      // nobody answered: try in an hour
+#define SMART_RETRY_MS   3600000UL   // the same, for a robot with no clock
+#define CLOCK_SANE     1735689600L   // 2025: anything below this is not a time
+uint32_t smartOnAt = 0;              // this wake's window, millis
+uint32_t smartRetryMs = 0;           // no clock to count by: hold off this long
+bool     smartSettled = false;       // this wake's window is finished with
+RTC_DATA_ATTR time_t smartNextS  = 0;   // the clock is due again at this moment
+RTC_DATA_ATTR time_t smartRetryS = 0;   // and not before this one
 const char* lastReset = "";
 const char* bootNote = nullptr;
 volatile uint8_t btNews = 0;
@@ -760,8 +774,10 @@ uint32_t tmrStart = 0, tmrEnd = 0, tmrDoneAt = 0;           // how long news sho
 //  see whether it is back. A check wake is silent: no screen.
 RTC_DATA_ATTR uint32_t rtcAwaySince = 0;   // when checking began, system clock
 RTC_DATA_ATTR uint8_t  rtcWakeCheck = 0;   // this timer wake is a check, not a prayer
+RTC_DATA_ATTR uint8_t  rtcWakeClock = 0;   // this timer wake is the day's clock, not a prayer
 bool     deepAuto = false;             // this deep sleep is the phone-away kind
 bool     checkWake = false;            // woke only to look for the phone
+bool     clockWake = false;            // woke only to take the time, once a day
 uint32_t checkUntil = 0;
 #define  CHECK_WINDOW_MS 20000UL
 uint32_t    glanceUntil = 0;           // a lift's look at the time ends here
@@ -1666,12 +1682,30 @@ static void btSet(int stage) {
               : stage == BT_BONDED ? "bonded" : "would not start");
 }
 
+// How many phones this robot knows.
+//
+// 7.15: the radio is now often down, and NimBLE can only answer this
+// while its host is running. Asked with the stack deinitialised it is
+// at best a guess and at worst a crash, and drawHome asks it on every
+// frame. So the answer is taken whenever the radio is up and kept in
+// RTC memory, which survives exactly the sleep that put the radio
+// down in the first place.
+RTC_DATA_ATTR uint8_t rtcBonds = 0;
+// Has the radio run at all since the last power on? Before it has,
+// "off" reads like a fault; after it has, it is the plain truth.
+RTC_DATA_ATTR uint8_t btWasUp = 0;
+static uint8_t bondsKnown() {
+  if (btUp) rtcBonds = (uint8_t)NimBLEDevice::getNumBonds();
+  return rtcBonds;
+}
+
 static const char* btShort() {
   switch (btStage) {
     case BT_ADVERTISING: return "pair me";
     case BT_CONNECTED:   return "linked";
     case BT_BONDED:      return "paired";
     case BT_FAIL:        return "no radio";
+    case BT_OFF:         return btWasUp ? "radio off" : "starting";
     default:             return "starting";
   }
 }
@@ -2270,7 +2304,7 @@ static void bleOn() {
   adv->setScanResponseData(sr);
   advFast();
 
-  btUp = true;
+  btUp = true; btWasUp = 1;
   // start() says whether the controller took it. An earlier build
   // called a function that returns nothing and then put "pair me" on
   // the screen whatever had happened. A screen that cannot be wrong
@@ -2596,7 +2630,7 @@ static void btTick() {
   // a battery spent on nothing. Pairing for the first time still shows.
   if (btWokeReq) {
     btWokeReq = false;
-    if (!asleep || NimBLEDevice::getNumBonds() == 0) wake("phone");
+    if (!asleep || bondsKnown() == 0) wake("phone");
   }
 
   // Handed over whole, so the screen never sees half a notification.
@@ -2724,9 +2758,10 @@ static void setNotes(bool on, bool announce) {
 
 static void applyBtMode(bool announce) {
   if (cfgNet != NET_BT) { if (announce) flash("NOT ON BLUETOOTH", 1200); return; }
-  smartOnAt = 0;
+  smartOnAt = 0; smartSettled = false;
   if (cfgBtMode == BTM_SMART) {
-    smartRetryAt = 0; smartNext = 0;        // due now: take the time, then go
+    // Due now: take the time, then go.
+    smartRetryMs = 0; smartRetryS = 0; smartNextS = 0;
     if (announce) flash("BLUETOOTH SMART", 1300);
   } else {
     if (!btUp) bleOn();
@@ -2966,6 +3001,23 @@ static bool keyTick() {
   return true;
 }
 
+// Is the day's clock owing?
+//
+// Asked on the wall clock, which the chip keeps running through deep
+// sleep, so the answer is the same on the far side of a wake. A robot
+// with no clock at all has nothing to compare and is always owed one,
+// held off only by the millis() fuse below so a phone that is not
+// there cannot be asked twice a second.
+static bool smartDue() {
+  if (bondsKnown() == 0) return true;          // never paired: be findable
+  if (smartRetryMs && (int32_t)(millis() - smartRetryMs) < 0) return false;
+  time_t t = time(nullptr);
+  if (t < CLOCK_SANE) return true;             // no clock: ask, whatever else is set
+  if (smartRetryS && t < smartRetryS) return false;
+  if (smartNextS  && t < smartNextS)  return false;
+  return true;
+}
+
 // Smart mode, which is the whole of it.
 //
 // The radio is off. When the clock is due it comes up, and it goes
@@ -2982,20 +3034,31 @@ static void smartTick() {
     // nobody opened is this one's window from now.
     if (!smartOnAt) { smartOnAt = now ? now : 1; return; }
     bool got = (ctsState == CTS_DONE);
-    if (!got && smartOnAt && (int32_t)(now - smartOnAt) < (int32_t)SMART_WINDOW_MS) return;
+    if (!got && (int32_t)(now - smartOnAt) < (int32_t)SMART_WINDOW_MS) return;
+    // Nothing has ever paired with it. There is no clock coming and
+    // nothing to be quiet about: a radio that is down cannot be paired
+    // with, so it stays up until something does.
+    if (bondsKnown() == 0) return;
     bleOff();
-    smartOnAt = 0;
+    smartOnAt = 0; smartSettled = true;
     time_t t = time(nullptr);
-    if (got && t > 1735689600L) smartNext = t + SMART_EVERY_S;
-    smartRetryAt = now + (got ? SMART_EVERY_MS : SMART_RETRY_MS);
+    if (got && t > CLOCK_SANE) {
+      smartNextS = t + SMART_EVERY_S; smartRetryS = 0; smartRetryMs = 0;
+    } else {
+      // Nobody answered. An hour, counted on the clock when there is
+      // one so the wait survives a sleep, and on millis() when there
+      // is not so it at least survives this wake.
+      smartRetryS  = (t > CLOCK_SANE) ? t + SMART_RETRY_S : 0;
+      smartRetryMs = now + SMART_RETRY_MS;
+    }
     Serial.printf("bluetooth smart: %s, radio off\n", got ? "clock taken" : "nobody answered");
     return;
   }
-  if (smartRetryAt && (int32_t)(now - smartRetryAt) < 0) return;
-  if (timeOk && smartNext && time(nullptr) < smartNext) return;
+  if (!smartDue()) { smartSettled = true; return; }
   ctsState = CTS_IDLE;
   bleOn();
   smartOnAt = now ? now : 1;
+  smartSettled = false;
   Serial.println("bluetooth smart: radio up for the clock");
 }
 
@@ -4003,7 +4066,7 @@ static void drawHome() {
   // 6.0.1: on Bluetooth the phone gives it the time, and with the
   // time, home is the watch face, exactly as it was on WiFi. The hello
   // and pairing screens are only for when there is no clock yet.
-  if (offlineNow() && !(cfgNet == NET_BT && (fb.ok || NimBLEDevice::getNumBonds() > 0))) {
+  if (offlineNow() && !(cfgNet == NET_BT && (fb.ok || bondsKnown() > 0))) {
     char hi[34];
     snprintf(hi, sizeof(hi), "%s, %s",
              greetWord(), cfgName);
@@ -4234,6 +4297,7 @@ static void drawMessage() {
     ctr(l, 45, 1);
     ctr(noteN ? "Hold to open"
               : cfgNet != NET_BT        ? "needs bluetooth"
+              : cfgQuiet                ? "switched off here"
               : (ancsState == ANCS_READY || btApp) ? "from your phone"
               : ancsState == ANCS_FAIL  ? "allow it on the phone"
                                         : "linking up", 56, 1);
@@ -8256,7 +8320,8 @@ static void resetSettings() {
   cfgHijriAdj = 0;   prefs.putInt("hadj", cfgHijriAdj);
   cfgNetHome = NET_BT; prefs.putInt("net", cfgNetHome);
   cfgPGuard = false; prefs.putBool("guard", cfgPGuard);
-  cfgQuiet = false;  prefs.putBool("quiet", cfgQuiet);
+  cfgQuiet = true;   prefs.putBool("quiet", cfgQuiet);   // 7.15: quiet, daily clock
+  cfgBtMode = BTM_SMART; prefs.putInt("btmode", cfgBtMode);
   cfgWakeIdx = 2;    prefs.putInt("wakeh", cfgWakeIdx);
   cfgBike = false;   prefs.putBool("bike", cfgBike);
   cfgBikeTpl = 0;    prefs.putInt("btpl", cfgBikeTpl);
@@ -8442,7 +8507,18 @@ static void goDeep() {
   // nothing. Waking should be something you did on purpose.
   if (deepOff) return;
   awayFlush(true);
-  bool checking = deepAuto && cfgNet == NET_BT && NimBLEDevice::getNumBonds() > 0;
+  // Waking every three minutes to look for the phone, which is what
+  // Auto away wants and nothing else does.
+  //
+  // 7.14 and before asked only whether a phone had ever been bonded,
+  // not whether Auto away was switched on and not whether the radio
+  // was even meant to be running. Every ordinary idle power down came
+  // through here, so the robot woke every three minutes all day, ran
+  // the whole of setup() and started Bluetooth, for a feature that may
+  // well have been off. With notifications off there is nothing to
+  // look for in the first place: the radio is meant to be down.
+  bool checking = deepAuto && cfgAutoAway && cfgBtMode == BTM_ALWAYS &&
+                  cfgNet == NET_BT && btUp && bondsKnown() > 0;
   Serial.println(checking ? "switching off, checking for the phone" : "switching off until touched");
   if (!checking) { sleepCard(); rtcAwaySince = 0; }
 
@@ -8474,6 +8550,14 @@ static void goDeep() {
     long ne = secsToNightEnd();
     if (ne > 0 && (secs <= 0 || ne < secs)) secs = ne;
     nightDeep = false;
+  }
+  // 7.15: the day's clock, and the only timer the quiet robot sets for
+  // itself. It wakes with the screen dark, takes the time, and is gone.
+  rtcWakeClock = 0;
+  if (cfgNet == NET_BT && cfgBtMode == BTM_SMART && timeOk && smartNextS) {
+    long d = (long)(smartNextS - time(nullptr));
+    if (d < 1) d = 1;
+    if (secs <= 0 || d < secs) { secs = d; rtcWakeClock = 1; rtcWakeCheck = 0; }
   }
   rtcAlarmAt = (secs > 0 && timeOk) ? (uint32_t)time(nullptr) + (uint32_t)secs : 0;
   if (secs > 0)
@@ -14022,15 +14106,31 @@ void setup() {
   cfgBlogV = constrain(prefs.getInt("blogv", 1), 0, 3);
   cfgCap   = constrain(prefs.getInt("cap", 350), 50, 5000);
   blogBoot(fromDeep);                  // 7.8
-  cfgQuiet   = prefs.getBool("quiet", false);
+  cfgQuiet   = prefs.getBool("quiet", true);     // 7.15: quiet unless asked
   // 7.14: notifications own the radio. A robot coming up from 7.13
   // could have the two disagreeing, because they were two settings.
   // Whatever was asked for in words wins over whatever the radio was
   // last told.
+  //
+  // 7.15 goes once further. A robot coming up from any earlier version
+  // has a radio that was never off for longer than one wake, so it is
+  // put into the quiet mode once, here, whatever it had. Turning
+  // notifications back on is one row in Settings and sticks.
+  if (!prefs.getBool("rad715", false)) {
+    prefs.putBool("rad715", true);
+    cfgQuiet = true; prefs.putBool("quiet", true);
+    cfgBtMode = BTM_SMART; prefs.putInt("btmode", cfgBtMode);
+    cfgCpu = CPU_AUTO; prefs.putInt("cpu", cfgCpu);    // 160 MHz, and said so
+    Serial.println("7.15: the radio is off unless the clock is due");
+  }
   {
     int want = cfgQuiet ? BTM_SMART : BTM_ALWAYS;
     if (cfgBtMode != want) { cfgBtMode = want; prefs.putInt("btmode", cfgBtMode); }
   }
+  // pmInit ran before any of this was read, so it applied the built in
+  // default rather than the saved setting. Until 7.15 the saved one
+  // only ever took effect if something changed it afterwards.
+  applyCpu();
   lastSyncAt = prefs.getUInt("lsync", 0);
   cfgWakeIdx  = constrain(prefs.getInt("wakeh", 2), 0, WAKE_N - 1);
   cfgBike     = prefs.getBool("bike", false);
@@ -14238,8 +14338,20 @@ void setup() {
     WiFi.mode(WIFI_OFF);
     netUsing = -1; netTrying = 0;
     if (cfgNet == NET_BT) {
-      bleOn();
-      Serial.println("bluetooth mode: the aerial belongs to the phone");
+      // 7.15: the radio comes up at boot because the clock wants it,
+      // not because it is boot. A power on has empty RTC memory and so
+      // is always owed a clock; a wake out of deep sleep is not, and
+      // the radio stays exactly where it was: off.
+      // Keyring mode is the exception that has to be made: "home"
+      // from Shortcuts is its only exit that does not need your hands
+      // on it, and a radio that is down cannot hear one.
+      if (cfgBtMode == BTM_SMART && !keyringNow() && !smartDue()) {
+        smartSettled = true;
+        Serial.println("bluetooth: clock is not due, the radio stays off");
+      } else {
+        bleOn();
+        Serial.println("bluetooth mode: the aerial belongs to the phone");
+      }
     } else {
       btStop();                      // nothing uses it; make sure nothing can
       Serial.println("offline by choice: both radios stay down");
@@ -14323,6 +14435,10 @@ void setup() {
   if (fromDeep) {
     wokeForAlarm = (woke_ == ESP_SLEEP_WAKEUP_TIMER);
     wokeBy = wokeForAlarm ? "prayer" : "picked up";
+    if (wokeForAlarm && rtcWakeClock) {      // only here for the day's clock
+      wokeForAlarm = false; wokeBy = "clock";
+      clockWake = true;
+    }
     if ((wokeForAlarm && rtcWakeCheck) || awayCheckBoot) {   // only looking for the phone
       wokeForAlarm = false; wokeBy = "check";
       checkWake = true;
@@ -14331,6 +14447,7 @@ void setup() {
   }
   if (!fromDeep) rtcAwaySince = 0;
   rtcWakeCheck = 0;
+  rtcWakeClock = 0;
   awayOn   = prefs.getBool("away", false);
   awayText = prefs.getString("awayt", "");
   if (awayOn && !checkWake) {
@@ -14343,12 +14460,13 @@ void setup() {
     tlogAdd("Away: restarted");
     Serial.println("away: restarted, listening for two minutes");
   }
-  if (checkWake) {
-    // Dark, listening, for twenty seconds. The loop decides: the phone
-    // came back and it stays linked, or it is off again.
+  if (checkWake || clockWake) {
+    // Dark, listening. The loop decides: for a check, whether the
+    // phone came back; for the clock, whether the time landed. Either
+    // way nothing is drawn and nobody is told.
     asleep = true; sleptAt = millis();
     screenPower(false);
-    checkUntil = millis() + CHECK_WINDOW_MS;
+    checkUntil = millis() + (clockWake ? SMART_WINDOW_MS + 15000UL : CHECK_WINDOW_MS);
   } else {
     drawHome();                        // on screen before anything can block
   }
@@ -14444,6 +14562,13 @@ void loop() {
   awayFlush(false);
   if (awayOn && awayListenUntil && (int32_t)(now - awayListenUntil) > 0) awayDeepGo();
   if (phoneHeld()) rtcAwaySince = 0;   // the phone is here: the checking schedule starts over
+  // The day's clock, and nothing else. smartTick has the radio; this
+  // only waits for it to have finished and puts the robot back down.
+  if (clockWake && ((smartSettled && !btUp) || (int32_t)(now - checkUntil) > 0)) {
+    clockWake = false;
+    Serial.println("clock: done with, back to sleep");
+    deepAuto = true; goDeep();
+  }
   if (checkWake) {
     if (phoneHeld() || anyLinked()) { checkWake = false; Serial.println("check: phone is back, staying linked"); }
     else if (now > checkUntil) {

@@ -390,6 +390,26 @@ notification, a left-behind alarm on the phone (link lost 20 s or weak signal
   (fixed to `hold:deny` in 7.8.1).
 - **The panel's title bar** fits about 20 characters; `bar()` drops the clock
   for long titles.
+- **Anything that has to survive deep sleep belongs in `RTC_DATA_ATTR`, and
+  has to be counted on the wall clock, not `millis()`.** A deep sleep wake
+  re-runs `setup()`: ordinary globals go back to their initialisers and
+  `millis()` starts again at nought. This has now been the same bug twice.
+  Keyring mode's latch was a plain global, so every wake handed out another
+  window (7.14). Smart mode's "the clock is next due at" was a plain global
+  holding a `millis()` reading, so every wake believed the clock had never
+  been fetched and opened a 45 second radio window: the radio was never off
+  for longer than one wake (7.15). Both are modelled in `test_rafiq.cpp` by
+  wiping exactly what RAM loses and keeping exactly what RTC memory keeps,
+  and both mutate back to the original fault if the state is moved out of
+  RTC memory.
+- **NimBLE can only answer `getNumBonds()` while its host is running.** With
+  the radio now routinely down, `drawHome` was asking it on every frame
+  against a deinitialised stack. Use `bondsKnown()`, which takes the answer
+  while the radio is up and keeps it in RTC memory (7.15).
+- **A feature's wake schedule has to be gated on that feature.** Auto away's
+  three minute phone check was armed by every ordinary idle power down,
+  whether or not Auto away was switched on and whether or not the radio was
+  meant to be running (fixed 7.15).
 - **Mac app ASCII bug (open, see section 12):** `RobotLink.ascii()` drops the
   0x1F separator, so `!mute`, `!vip`, `!bike` and `!net add` arrive glued
   together and do nothing.
